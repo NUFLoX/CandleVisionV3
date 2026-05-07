@@ -33,6 +33,7 @@ from scout.strategies.squeeze import strategy_squeeze
 from agents.sentinel_sentiment import SentimentAgent
 from agents.sentinel_telegram import TelegramScout
 from agents.sentinel_tape import TapeReader
+from config.settings import BYBIT_TESTNET
 
 async def main():
     print("🚀 Запуск HFT-ядра CandleVision (Full Stack: DB + WS + Async)...")
@@ -101,7 +102,7 @@ async def main():
             brain_task = asyncio.create_task(brain.run_loop(scout))
 
             # --- ЗАПУСК МАКРО-ТРЕКЕРА ---
-            api_client = BybitClient(testnet=True) # Создаем клиент для скачивания истории свечей
+            api_client = BybitClient(testnet=BYBIT_TESTNET) # Создаем клиент для скачивания истории свечей
             macro_tracker = SmartMoneyTracker(api_client=api_client, scan_interval_hours=2)
             macro_task = asyncio.create_task(macro_tracker.run_loop(all_symbols, ws_stream, executor.notifier))
 

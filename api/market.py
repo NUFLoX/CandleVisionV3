@@ -5,13 +5,13 @@ import logging
 import asyncio
 import ta
 
-from config.settings import API_RETRY_COUNT, API_TIMEOUT
+from config.settings import API_RETRY_COUNT, API_TIMEOUT, BYBIT_REST_BASE_URL
 
 logger = logging.getLogger("CandleVision.API")
 
 async def fetch_ohlcv_bybit_async(symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
     """Асинхронное скачивание с жесткими таймаутами сокетов."""
-    url = "https://api.bybit.com/v5/market/kline"
+    url = f"{BYBIT_REST_BASE_URL}/v5/market/kline"
 
     bybit_interval = interval
     if bybit_interval.endswith('m'):
@@ -142,7 +142,7 @@ async def fetch_ohlcv_bybit_async(symbol: str, interval: str, limit: int = 100) 
 
 async def fetch_all_usdt_pairs_async(min_turnover_usdt=15000000) -> list:
     """Получает список ликвидных пар. Тоже с жестким таймаутом."""
-    url = "https://api.bybit.com/v5/market/tickers"
+    url = f"{BYBIT_REST_BASE_URL}/v5/market/tickers"
     params = {"category": "linear"}
     
     timeout = aiohttp.ClientTimeout(total=API_TIMEOUT, sock_connect=10, sock_read=10)

@@ -9,3 +9,5 @@ pybit>=5.8.0
 rich==13.7.1
 
 numpy>=1.26,<3
+requests>=2.31.0
+telethon>=1.34.0

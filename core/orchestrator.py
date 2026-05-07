@@ -74,31 +74,31 @@ class Orchestrator:
 
     async def start(self):
         self.is_running = True
-        
-        
-        # ЗАТЕМ запускаем все процессы, передавая этот список в WebSocket
-        await asyncio.gather(
-            self.ws_stream.connect(self.scout.symbols), # <-- Передали монеты сюда!
-            self.run_scout_loop(),
-            self.run_executor_loop(),
-            self.run_watchlist_refiner(),
-            self.run_position_monitor() 
-        )
+        tasks = [
+            asyncio.create_task(self.ws_stream.connect(self.scout.symbols), name="ws_stream"),
+            asyncio.create_task(self.run_scout_loop(), name="scout_loop"),
+            asyncio.create_task(self.run_executor_loop(), name="executor_loop"),
+            asyncio.create_task(self.run_watchlist_refiner(), name="watchlist_refiner"),
+            asyncio.create_task(self.run_position_monitor(), name="position_monitor"),
+        ]
 
-        # Если Telegram-агент подключен, запускаем его фоновую прослушку
         if getattr(self.scout, 'tg_agent', None):
-            tasks.append(self.scout.tg_agent.start_listening(self.scout.symbols))
-
-        await asyncio.gather(*tasks)
+            tasks.append(asyncio.create_task(self.scout.tg_agent.start_listening(self.scout.symbols), name="telegram_scout"))
 
         if getattr(self.scout, 'sentiment_agent', None):
-            tasks.append(self.scout.sentiment_agent.start_polling(self.scout.symbols))
+            tasks.append(asyncio.create_task(self.scout.sentiment_agent.start_polling(self.scout.symbols), name="sentiment_agent"))
 
-        # Запуск прослушки ленты сделок (Киты)
         if getattr(self.scout, 'tape_agent', None):
-            tasks.append(self.scout.tape_agent.connect(self.scout.symbols))
+            tasks.append(asyncio.create_task(self.scout.tape_agent.connect(self.scout.symbols), name="tape_agent"))
 
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            self.is_running = False
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def stop(self):
         self.is_running = False

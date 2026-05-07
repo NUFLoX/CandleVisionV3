@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import logging
 import time
+from config.settings import BYBIT_REST_BASE_URL
 
 class VolumeSonar:
     def __init__(self, notifier, min_24h_vol=1000000, rvol_threshold=5.0):
@@ -11,7 +12,7 @@ class VolumeSonar:
         self.min_24h_vol = min_24h_vol      # Отсекаем мусор < $1M
         self.rvol_threshold = rvol_threshold # Порог суеты: 5.0x (500% всплеск)
         self.history = {} # Память для снимков: {symbol: {volume, timestamp}}
-        self.api_url = "https://api-testnet.bybit.com/v5/market/tickers?category=linear"
+        self.api_url = f"{BYBIT_REST_BASE_URL}/v5/market/tickers?category=linear"
 
     async def fetch_tickers(self):
         try:

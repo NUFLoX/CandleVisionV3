@@ -9,6 +9,7 @@ from agents.notifier import TelegramNotifier
 from api.telegram import TelegramReporter
 from api.charting import generate_setup_chart
 from api.bybit_client import BybitClient
+from config.settings import TOKEN, CHAT_ID, BYBIT_TESTNET
 
 def calculate_position_size(balance, risk, entry, sl):
     """Рассчитывает объем позиции."""
@@ -34,14 +35,12 @@ class Executor:
         self.warmup_seconds = 180            # Прогрев 3 минуты
         self.tp1_ratio = 0.5                 # Закрываем 50% на первом тейке
 
-        # --- НАШ НОВЫЙ TELEGRAM NOTIFIER ---
-        BOT_TOKEN = "8484244730:AAFTNM_XjI6nFGtZoDcOKiwzb83p609ks5A" 
-        CHAT_ID = "395353141"
-        self.notifier = TelegramNotifier(bot_token=BOT_TOKEN, chat_id=CHAT_ID)
+        # --- TELEGRAM NOTIFIER ---
+        self.notifier = TelegramNotifier(bot_token=TOKEN, chat_id=CHAT_ID)
         # -----------------------------------
 
         self.tg = TelegramReporter()
-        self.exchange = BybitClient(testnet=True)
+        self.exchange = BybitClient(testnet=BYBIT_TESTNET)
 
         self.active_trades = self.db.load_open_trades()
         if self.active_trades:
@@ -109,8 +108,9 @@ class Executor:
         sl = signal_data.get('sl')
         tp = signal_data.get('tp')
 
-        # Защита от пустых данных: если ключей нет, просто игнорим сигнал
-        if not sl or not tp or df is None or entry is None:
+        # Защита от пустых данных: если ключей нет, просто игнорим сигнал.
+        # df опционален для быстрых WS-сигналов, где график недоступен.
+        if not sl or not tp or entry is None:
             return False
 
         if symbol in self.watchlist:
@@ -137,10 +137,6 @@ class Executor:
             "reasons": reasons_str # <--- ПЕРЕДАЕМ ИХ В БАЗУ ДАННЫХ
         }
 
-        trade_id = self.db.add_trade(trade)
-        trade["id"] = trade_id
-        self.active_trades.append(trade)
-
         log_decimals = 7 if entry < 0.01 else 4
         risk_amount = size * abs(entry - sl)
         sl_pct = abs(entry - sl) / entry * 100
@@ -154,25 +150,44 @@ class Executor:
             f"Size: {trade['size']:.4f} | Risk: {risk_amount:.2f}$"
         )
 
-        trade_success = False
-        if self.exchange.session:
-            trade_success = self._place_limit_order(
-                symbol=symbol, side=side, qty=size, entry_price=entry, sl_price=sl, tp_price=tp
-            )
-            if not trade_success:
-                self.logger.error(f"❌ Ордер {symbol} не исполнен. Удаляем из БД.")
-                self.db.cursor.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
-                self.db.conn.commit()
-                self.active_trades.remove(trade)
+        if not self.exchange.session:
+            self.logger.info(f"📡 {symbol}: signal-only режим — биржевой ордер не отправлялся.")
+            asyncio.create_task(self._send_execution_report(trade, score, df))
+            return True
+
+        trade_id = self.db.add_trade(trade)
+        trade["id"] = trade_id
+        self.active_trades.append(trade)
+
+        trade_success = self._place_limit_order(
+            symbol=symbol, side=side, qty=size, entry_price=entry, sl_price=sl, tp_price=tp
+        )
+        if not trade_success:
+            self.logger.error(f"❌ Ордер {symbol} не исполнен. Удаляем из БД.")
+            self.db.cursor.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
+            self.db.conn.commit()
+            self.active_trades.remove(trade)
+            return False
 
         asyncio.create_task(self._send_execution_report(trade, score, df))
-        return trade_success
+        return True
+
+    def _format_qty(self, qty: float, entry_price: float) -> float:
+        """Fallback-форматирование qty, пока нет instrument-info cache."""
+        if qty <= 0:
+            return 0.0
+        if entry_price < 10:
+            return max(int(qty), 1)
+        if entry_price < 1000:
+            return round(qty, 2)
+        return round(qty, 3)
 
     def _place_limit_order(self, symbol, side, qty, entry_price, sl_price, tp_price):
         try:
-            if entry_price < 10: formatted_qty = int(qty)
-            elif entry_price < 1000: formatted_qty = round(qty, 2)
-            else: formatted_qty = round(qty, 3)
+            formatted_qty = self._format_qty(qty, entry_price)
+            if formatted_qty <= 0:
+                self.logger.error(f"❌ Некорректный размер позиции {symbol}: {qty}")
+                return False
 
             # Для Short цена лимитки должна быть чуть ниже текущей, для Long - чуть выше
             limit_offset = 0.999 if side == "Sell" else 1.001
@@ -190,6 +205,10 @@ class Executor:
                 positionIdx=0,
                 timeInForce="GTC"
             )
+            if order_response.get("retCode") != 0:
+                self.logger.error(f"❌ Bybit отклонил ордер {symbol}: {order_response}")
+                return False
+
             order_id = order_response.get('result', {}).get('orderId', 'N/A')
             self.logger.info(f"📝 Ордер {symbol} ({side}) размещён (ID: {order_id})")
             return True
@@ -214,9 +233,10 @@ class Executor:
 
             if hit_tp1 and trade['remaining_size'] > trade['size'] * 0.5:
                 close_qty = trade['tp1_qty']
-                if trade['entry'] < 10: close_qty_fmt = int(close_qty)
-                elif trade['entry'] < 1000: close_qty_fmt = round(close_qty, 2)
-                else: close_qty_fmt = round(close_qty, 3)
+                close_qty_fmt = self._format_qty(close_qty, trade['entry'])
+                if close_qty_fmt <= 0:
+                    self.logger.warning(f"⚠️ {symbol}: TP1 quantity became zero after formatting; skip partial close.")
+                    continue
 
                 try:
                     if self.exchange.session:
@@ -273,6 +293,10 @@ class Executor:
                 f"🛑 <b>SL:</b> {trade['sl']} | 🟢 <b>TP:</b> {trade['tp']}"
             )
             
+            if df is None:
+                await self.notifier.send_message(msg)
+                return
+
             # 2. Генерируем график
             filename = f"setup_{trade['symbol']}.png"
             photo_path = await asyncio.to_thread(
