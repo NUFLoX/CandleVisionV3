@@ -1,0 +1,89 @@
+[33mcommit a01ea5f3cf712ceb0c127cbe9945deeb42b5331e[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Mon Apr 27 01:17:43 2026 +0500
+
+    fix: добавлен расчет MOMENTUM для стратегии Squeeze, фикс падения сканера
+
+[33mcommit af162f1318a55dbd9bb3abc97cc7b0b3f64e968a[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sun Apr 26 23:20:40 2026 +0500
+
+    feat: добавлен боевой клиент Bybit, умный трейлинг-стоп и лимиты риск-менеджмента
+
+[33mcommit 3f8e2caa28c876ef09af25af218871e126e378b4[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sun Apr 26 22:41:32 2026 +0500
+
+    core: добавлен ta-lib, .env защита и WAL режим базы данных
+
+[33mcommit 98b85287b2738ff024531c43d0f69dee40166b85[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sun Apr 26 22:23:18 2026 +0500
+
+    core: завершен аудит архитектуры, добавлен settings.py, фикс графиков и Graceful Shutdown
+
+[33mcommit 34515f548378f907bb475006394cb5a8eb46fa25[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sun Apr 26 04:21:19 2026 +0500
+
+    Add Telegram reporting and fix token formatting
+
+[33mcommit 8fec01d6023949dbac8cbc44f936a43ae131f8e5[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sun Apr 26 03:53:36 2026 +0500
+
+    Initial commit: Async Core with DB and WebSockets
+
+[33mcommit 1fb09638f5cf9c65f2c21489aa1318bc8f3a2f47[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sun Apr 26 00:05:16 2026 +0500
+
+    feat: complete core architecture with live market scan, risk management, and telegram charting
+
+[33mcommit 8713bb9eec56eb98a0aeeae829bfc4eab005055b[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sat Apr 25 23:25:46 2026 +0500
+
+    feat: dynamic Bybit symbol fetching for full market scan
+
+[33mcommit bbd220376d1b095259d32da487e06c59c4978237[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sat Apr 25 22:42:02 2026 +0500
+
+    feat: added Telegram notification system
+
+[33mcommit 781901993d5b0e69b39e83e22b309455aa6363d6[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sat Apr 25 22:35:27 2026 +0500
+
+    feat: connected live Bybit market API
+
+[33mcommit 435719035406d70c9ce829620101af9debf4d9ac[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sat Apr 25 22:30:34 2026 +0500
+
+    feat: added main orchestrator and multi-threading
+
+[33mcommit 5f8b9dd3edc5d461d003e3f6989e50b501667c03[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sat Apr 25 22:28:22 2026 +0500
+
+    feat: added Classic and Pump strategies to Scout
+
+[33mcommit a08b1af0e398438b32dbf96755b2d09b2dfdcb94[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sat Apr 25 22:20:29 2026 +0500
+
+    feat: added Scout scanner and Brain message queue
+
+[33mcommit e13f7791b38eee9847905c12a808b96659debf29[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sat Apr 25 22:17:20 2026 +0500
+
+    feat: added Risk Manager and Executor core logic
+
+[33mcommit 3958e20fb9a2337bd754832340d8be0e04893888[m
+Author: NUFLoX <zapkaz@gmail@gmail.com>
+Date:   Sat Apr 25 22:11:25 2026 +0500
+
+    First commit: Project structure

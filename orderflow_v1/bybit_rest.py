@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import aiohttp
+import pandas as pd
+
+logger = logging.getLogger("OrderFlow.BybitREST")
+
+
+class BybitRestClient:
+    def __init__(self, base_url: str, timeout_seconds: int = 15):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        self._session: aiohttp.ClientSession | None = None
+
+    async def __aenter__(self) -> "BybitRestClient":
+        self._session = aiohttp.ClientSession(timeout=self.timeout, headers={"User-Agent": "CandleVision-OrderFlow/1.0"})
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._session:
+            await self._session.close()
+
+    async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        if not self._session:
+            raise RuntimeError("BybitRestClient session is not started")
+        url = f"{self.base_url}{path}"
+        async with self._session.get(url, params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+            if data.get("retCode") != 0:
+                raise RuntimeError(f"Bybit API error: {data}")
+            return data.get("result", {})
+
+    async def fetch_linear_symbols(self, quote_coin: str = "USDT") -> list[dict[str, Any]]:
+        result = await self._get(
+            "/v5/market/instruments-info",
+            {"category": "linear", "limit": 1000, "status": "Trading"},
+        )
+        rows = result.get("list", [])
+        return [row for row in rows if row.get("quoteCoin") == quote_coin and row.get("status") == "Trading"]
+
+    async def fetch_tickers(self) -> list[dict[str, Any]]:
+        result = await self._get("/v5/market/tickers", {"category": "linear"})
+        return result.get("list", [])
+
+    async def fetch_klines(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        result = await self._get(
+            "/v5/market/kline",
+            {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit},
+        )
+        rows = result.get("list", [])
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows, columns=["start", "open", "high", "low", "close", "volume", "turnover"])
+        df = df.iloc[::-1].reset_index(drop=True)
+        for col in ["open", "high", "low", "close", "volume", "turnover"]:
+            df[col] = df[col].astype(float)
+        df["start"] = pd.to_numeric(df["start"], errors="coerce").astype("Int64")
+        return df
+
+    async def fetch_best_symbols(
+        self,
+        quote_coin: str,
+        limit: int,
+        min_notional_24h: float,
+        min_last_price: float,
+        allowlist: list[str] | None = None,
+        blocklist: list[str] | None = None,
+    ) -> list[str]:
+        allow = set(allowlist or [])
+        block = set(blocklist or [])
+        tickers = await self.fetch_tickers()
+        symbols: list[tuple[str, float]] = []
+        for row in tickers:
+            symbol = row.get("symbol", "")
+            if not symbol.endswith(quote_coin):
+                continue
+            if allow and symbol not in allow:
+                continue
+            if symbol in block:
+                continue
+            try:
+                turnover = float(row.get("turnover24h") or 0.0)
+                last_price = float(row.get("lastPrice") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if turnover < min_notional_24h or last_price < min_last_price:
+                continue
+            symbols.append((symbol, turnover))
+        symbols.sort(key=lambda item: item[1], reverse=True)
+        selected = [symbol for symbol, _ in symbols[:limit]]
+        logger.info("Selected %s symbols for scan", len(selected))
+        return selected

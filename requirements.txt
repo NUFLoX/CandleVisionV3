@@ -1,0 +1,11 @@
+aiohttp==3.10.0
+websockets==14.1
+pandas==2.2.0
+mplfinance==0.12.10b0
+python-dotenv==1.0.0
+ta==0.10.2
+pybit>=5.8.0
+
+rich==13.7.1
+
+numpy>=1.26,<3
