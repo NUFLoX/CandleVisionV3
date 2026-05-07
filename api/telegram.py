@@ -6,10 +6,14 @@ from config.settings import TOKEN, CHAT_ID
 class TelegramReporter:
     def __init__(self):
         self.logger = logging.getLogger("CandleVision.Telegram")
+        self.enabled = bool(TOKEN and CHAT_ID)
         self.base_url = f"https://api.telegram.org/bot{TOKEN}"
 
     async def send_message_async(self, text: str):
         """Асинхронная отправка сообщения в Telegram."""
+        if not self.enabled:
+            self.logger.debug("Telegram reporter disabled: token/chat_id are empty.")
+            return
         url = f"{self.base_url}/sendMessage"
         payload = {
             "chat_id": CHAT_ID,
@@ -29,6 +33,9 @@ class TelegramReporter:
 
     async def send_photo_async(self, photo_path: str, caption: str):
         """Отправляет картинку с подписью в Telegram."""
+        if not self.enabled:
+            self.logger.debug("Telegram reporter disabled: token/chat_id are empty.")
+            return
         # parse_mode передаём как GET-параметр, НЕ в FormData!
         url = f"{self.base_url}/sendPhoto?chat_id={CHAT_ID}&parse_mode=HTML"
         try:

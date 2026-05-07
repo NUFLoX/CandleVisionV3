@@ -4,11 +4,12 @@ import logging
 import asyncio
 import websockets
 import time
+from config.settings import BYBIT_WS_PUBLIC_URL
 
 class OrderBookStream:
-    def __init__(self, testnet=True, executor=None):
+    def __init__(self, testnet=None, executor=None):
         self.logger = logging.getLogger("CandleVision.WS")
-        self.ws_url = "wss://stream-testnet.bybit.com/v5/public/linear" if testnet else "wss://stream.bybit.com/v5/public/linear"
+        self.ws_url = BYBIT_WS_PUBLIC_URL if testnet is None else ("wss://stream-testnet.bybit.com/v5/public/linear" if testnet else "wss://stream.bybit.com/v5/public/linear")
         self.ws = None
         self.symbols = []
         
@@ -128,11 +129,16 @@ class OrderBookStream:
                             self.logger.critical(f"💥 ПРОБОЙ НАКОПЛЕНИЯ {symbol}! Уровень {res_level} снесен китом (Объем: ${volume_usd:,.0f})!")
                             
                             if self.executor:
+                                risk = max(price - (res_level * 0.995), price * 0.003)
                                 signal_data = {
                                     "symbol": symbol,
                                     "side": "Buy",
-                                    "entry": price,
-                                    "reasons": ["SmartMoney Breakout", "WS Sniper"]
+                                    "entry_price": price,
+                                    "score": 3.0,
+                                    "sl": price - risk,
+                                    "tp": price + risk * 2.0,
+                                    "timeframe": "ws",
+                                    "reasons": ["SmartMoney Breakout", "WS Sniper"],
                                 }
                                 # Моментальный выстрел!
                                 asyncio.create_task(self.executor.process_signal_async(signal_data))

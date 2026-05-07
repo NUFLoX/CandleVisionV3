@@ -4,6 +4,7 @@ import asyncio
 import pandas as pd
 from scoring.scorer import calculate_score
 from api.market import fetch_ohlcv_bybit_async
+from core.risk_manager import assess_rr
 
 class Scout:
     def __init__(self, queue, strategies=None, ws_stream=None, tape_agent=None):
@@ -32,10 +33,15 @@ class Scout:
                 reasons.extend(msg)
 
         if found_any:
-            imbalance = 1.0
+            imbalance = 0.0
             if self.ws_stream:
                 await self.ws_stream.subscribe(symbol)
                 imbalance = self.ws_stream.get_imbalance(symbol)
+
+            risk = assess_rr(df, float(df['close'].iloc[-1]))
+            if not risk.get("ok"):
+                self.logger.debug(f"🧯 {symbol}: RR-фильтр отклонил сигнал ({risk.get('why')})")
+                return
 
             score = calculate_score(df, reasons, imbalance)
 
@@ -52,9 +58,13 @@ class Scout:
                 signal_data = {
                     "symbol": symbol,
                     "timeframe": tf,
-                    "entry_price": float(df['close'].iloc[-1]),
+                    "entry_price": risk["entry"],
                     "score": score,
-                    "reasons": reasons,
+                    "side": "Buy",
+                    "sl": risk["sl"],
+                    "tp": risk["tp"],
+                    "rr": risk["rr"],
+                    "reasons": reasons + [f"RR={risk['rr']:.2f}", f"SL={risk['sl_pct']:.2f}%", f"TP={risk['tp_pct']:.2f}%"],
                     "imbalance": imbalance,
                     "df": df.tail(100) 
                 }

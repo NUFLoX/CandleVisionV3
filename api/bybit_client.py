@@ -1,19 +1,16 @@
 # -*- coding: utf-8 -*-
-import os
 import logging
 import asyncio  # <--- ДОБАВИЛИ ИМПОРТ ДЛЯ АСИНХРОННОСТИ
-from pybit.unified_trading import HTTP
-from dotenv import load_dotenv
-
-# Загружаем ключи из .env
-load_dotenv()
+from config.settings import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET
 
 class BybitClient:
-    def __init__(self, testnet=True): # По умолчанию включаем Testnet
+    def __init__(self, testnet=None):
         self.logger = logging.getLogger("CandleVision.Bybit")
         
-        api_key = os.getenv("BYBIT_API_KEY")
-        api_secret = os.getenv("BYBIT_API_SECRET")
+        if testnet is None:
+            testnet = BYBIT_TESTNET
+        api_key = BYBIT_API_KEY
+        api_secret = BYBIT_API_SECRET
 
         if not api_key or not api_secret:
             self.logger.warning(
@@ -22,6 +19,8 @@ class BybitClient:
             )
             self.session = None
             return
+
+        from pybit.unified_trading import HTTP
 
         try:
             # Классическое подключение. testnet=True направит нас на testnet.bybit.com

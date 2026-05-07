@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
 
-def calculate_score(df: pd.DataFrame, reasons: list, imbalance: float = 1.0) -> float:
+def calculate_score(df: pd.DataFrame, reasons: list, imbalance: float = 0.0) -> float:
     """Оценка качества сигнала с учетом стакана ордеров."""
     score = 0.0
     last = df.iloc[-1]
@@ -23,11 +23,12 @@ def calculate_score(df: pd.DataFrame, reasons: list, imbalance: float = 1.0) -> 
         elif 40 < rsi_val < 65: score += 0.5 
 
     # 🔥 АНАЛИЗ СТАКАНА (Order Book)
-    if imbalance >= 3.0:
-        score += 1.5 # Жесткий перевес покупателей (Плита на покупку)
-    elif imbalance >= 1.5:
+    # get_imbalance() возвращает нормализованное значение [-1.0, 1.0].
+    if imbalance >= 0.25:
+        score += 1.5 # Жесткий перевес покупателей (плита на bid)
+    elif imbalance >= 0.10:
         score += 0.5 # Локальный перевес покупателей
-    elif imbalance < 0.5:
-        score -= 1.5 # Огромная плита на продажу (опасно!)
+    elif imbalance <= -0.25:
+        score -= 1.5 # Существенное давление asks
 
     return round(max(0, score), 2)
