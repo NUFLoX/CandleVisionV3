@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .schemas import BotLog, MarketState, Signal
+from .schemas import BotLog, Heartbeat, MarketState, Signal, Trade, WatchlistItem
 from .store import DashboardStore
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -46,6 +47,17 @@ def _jsonable(payload: object) -> object:
     return jsonable_encoder(payload)
 
 
+async def _live_refresh_loop(store: DashboardStore, hub: WebSocketHub) -> None:
+    while True:
+        try:
+            await store.refresh_live_data()
+            await hub.broadcast("snapshot", await store.snapshot())
+        except Exception as exc:
+            await store.add_log(BotLog(message=f"Live refresh failed: {exc}", source="dashboard", severity="error"))
+            await hub.broadcast("snapshot", await store.snapshot())
+        await asyncio.sleep(60)
+
+
 def create_app() -> FastAPI:
     store = DashboardStore()
     hub = WebSocketHub()
@@ -65,6 +77,17 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.on_event("startup")
+    async def startup() -> None:
+        app.state.refresh_task = asyncio.create_task(_live_refresh_loop(store, hub))
+
+    @app.on_event("shutdown")
+    async def shutdown() -> None:
+        task = app.state.refresh_task
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -103,9 +126,24 @@ def create_app() -> FastAPI:
     async def trades():
         return (await store.snapshot()).trades
 
+    @app.get("/api/health")
+    async def health():
+        snapshot = await store.snapshot()
+        return {"status": snapshot.status, "heartbeats": snapshot.heartbeats}
+
     @app.get("/api/coin/{symbol}")
     async def coin(symbol: str):
-        return await store.coin(symbol)
+        try:
+            return await store.coin(symbol)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Live coin data unavailable: {exc}") from exc
+
+    @app.post("/api/refresh")
+    async def refresh():
+        await store.refresh_live_data()
+        snapshot = await store.snapshot()
+        await hub.broadcast("snapshot", snapshot)
+        return snapshot
 
     @app.get("/api/snapshot")
     async def snapshot():
@@ -121,6 +159,24 @@ def create_app() -> FastAPI:
     async def ingest_signal(signal: Signal):
         saved = await store.add_signal(signal)
         await hub.broadcast("signal", saved)
+        return saved
+
+    @app.post("/api/ingest/watchlist")
+    async def ingest_watchlist(item: WatchlistItem):
+        saved = await store.add_watchlist_item(item)
+        await hub.broadcast("watchlist", saved)
+        return saved
+
+    @app.post("/api/ingest/trade")
+    async def ingest_trade(trade: Trade):
+        saved = await store.add_trade(trade)
+        await hub.broadcast("trade", saved)
+        return saved
+
+    @app.post("/api/ingest/heartbeat")
+    async def ingest_heartbeat(heartbeat: Heartbeat):
+        saved = await store.add_heartbeat(heartbeat)
+        await hub.broadcast("heartbeat", saved)
         return saved
 
     @app.post("/api/ingest/market-state")

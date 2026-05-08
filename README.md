@@ -66,6 +66,10 @@ React + Tailwind Dashboard
 
 MVP использует in-memory `DashboardStore`, чтобы панель можно было запустить сразу. API уже отделён от UI, поэтому хранилище можно заменить на PostgreSQL/Redis без изменения frontend-контракта.
 
+По умолчанию dashboard больше не заполняется демо-сигналами/сделками. При старте он подтягивает реальные публичные данные Bybit (tickers, klines, orderbook) и CoinGecko global для market pressure; сигналы, watchlist и сделки появляются только после ingest от бота. Принудительно обновить live-снимок можно через `POST /api/refresh`. Состояние ingest-событий сохраняется в JSON-файл `data/dashboard_state.json` или путь из `DASHBOARD_STATE_PATH`.
+
+Чтобы `orderflow_v1` и `orderflow_accum` отправляли реальные сигналы/heartbeat в dashboard, запустите dashboard и задайте переменную окружения `DASHBOARD_API_URL`, например `http://localhost:8000`. Если переменная пустая, ingest-клиент отключён и не блокирует торговые циклы.
+
 ### Запуск
 
 ```bash
@@ -88,6 +92,7 @@ http://localhost:8000/docs
 ### Основные API
 
 - `GET /api/status` — здоровье scanner/executor/API/DB/Redis.
+- `GET /api/health` — здоровье компонентов плюс heartbeat scanner/executor.
 - `GET /api/signals` — список сигналов с query-фильтрами `strength`, `signal_type`, `exchange`, `timeframe`.
 - `GET /api/market-state` — главный market filter.
 - `GET /api/coin/{symbol}` — аналитика монеты, например `API3`, `SOL`, `BTC`.
@@ -96,6 +101,7 @@ http://localhost:8000/docs
 - `GET /api/dominance` — BTC.D / USDT.D / TOTAL3 pressure strips.
 - `GET /api/trades` — открытые и закрытые сделки.
 - `GET /api/snapshot` — полный снимок dashboard.
+- `POST /api/refresh` — принудительный live-refresh Bybit/CoinGecko/health.
 - `WS /ws` — live-обновления без перезагрузки.
 
 ### Интеграция бота с dashboard
@@ -112,4 +118,22 @@ curl -X POST http://localhost:8000/api/ingest/log \
 curl -X POST http://localhost:8000/api/ingest/signal \
   -H 'Content-Type: application/json' \
   -d '{"id":"api3-1h-001","symbol":"API3USDT","exchange":"Bybit","timeframe":"1h","score":8.7,"strength":"Strong","signal_type":"Confirmed","entry":0.912,"stop_loss":0.848,"take_profit_1":1.04,"reason":"EMA20 up + VSpike q95 + breakout","status":"ACTIVE"}'
+```
+
+```bash
+curl -X POST http://localhost:8000/api/ingest/watchlist \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"SOLUSDT","exchange":"Bybit","timeframe":"4h","score":6.9,"reason":"Compression below resistance","expires_in_hours":24}'
+```
+
+```bash
+curl -X POST http://localhost:8000/api/ingest/trade \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"BTCUSDT","timeframe":"1h","entry":100000,"stop_loss":98500,"take_profit":104000,"status":"open","pnl_pct":0}'
+```
+
+```bash
+curl -X POST http://localhost:8000/api/ingest/heartbeat \
+  -H 'Content-Type: application/json' \
+  -d '{"component":"scanner","status":"online","meta":{"runner":"orderflow_v1"}}'
 ```

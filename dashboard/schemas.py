@@ -118,7 +118,7 @@ class CoinMetrics(BaseModel):
 
 
 class Trade(BaseModel):
-    id: int
+    id: int | None = None
     symbol: str
     timeframe: str
     entry: float
@@ -126,6 +126,13 @@ class Trade(BaseModel):
     take_profit: float
     status: str
     pnl_pct: float
+
+
+class Heartbeat(BaseModel):
+    component: str
+    status: str = "online"
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class DashboardSnapshot(BaseModel):
@@ -136,4 +143,5 @@ class DashboardSnapshot(BaseModel):
     logs: list[BotLog]
     watchlist: list[WatchlistItem]
     trades: list[Trade]
+    heartbeats: dict[str, Heartbeat] = Field(default_factory=dict)
     meta: dict[str, Any] = Field(default_factory=dict)
