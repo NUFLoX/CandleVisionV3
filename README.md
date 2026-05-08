@@ -39,3 +39,77 @@ chmod +x run_orderflow_v1.sh
 ```bash
 python orderflow_v1_main.py
 ```
+
+## CandleVision Dashboard MVP
+
+В репозиторий добавлен стартовый dashboard для панели управления и наблюдения CandleVision.
+
+### Что входит
+- **Консоль бота:** live-логи сканера, API, rate-limit, Telegram/X, executor и сделок.
+- **Состояние рынка:** `BTC Filter`, `Altcoin Mode`, `Liquidity`, `Market Regime`.
+- **Окно сигналов:** карточки сигналов с фильтрами `Strong / Medium / Weak`, `Watchlist / Confirmed / Aggressive`, `Binance / Bybit`, `1h / 4h / 1d`.
+- **Market Pressure Strips:** полосы BTC cap, BTC dominance, USDT dominance и TOTAL3.
+- **Поиск монеты:** метрики inflow, CEX netflow, whale activity, accumulation score, orderbook imbalance, RSI, ATR%, EMA, support/resistance и Bot Verdict.
+- **Bot Health:** scanner, executor, Telegram, X, Bybit/Binance API, database, Redis, rate-limit.
+
+### Архитектура
+
+```text
+CandleVision Bot
+     ↓
+Dashboard Data Hub / future PostgreSQL / future Redis
+     ↓
+FastAPI Backend + WebSocket
+     ↓
+React + Tailwind Dashboard
+```
+
+MVP использует in-memory `DashboardStore`, чтобы панель можно было запустить сразу. API уже отделён от UI, поэтому хранилище можно заменить на PostgreSQL/Redis без изменения frontend-контракта.
+
+### Запуск
+
+```bash
+pip install -r requirements.txt
+uvicorn dashboard.server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+После запуска откройте:
+
+```text
+http://localhost:8000
+```
+
+Swagger/OpenAPI доступен здесь:
+
+```text
+http://localhost:8000/docs
+```
+
+### Основные API
+
+- `GET /api/status` — здоровье scanner/executor/API/DB/Redis.
+- `GET /api/signals` — список сигналов с query-фильтрами `strength`, `signal_type`, `exchange`, `timeframe`.
+- `GET /api/market-state` — главный market filter.
+- `GET /api/coin/{symbol}` — аналитика монеты, например `API3`, `SOL`, `BTC`.
+- `GET /api/logs` — live-логи.
+- `GET /api/watchlist` — почти-сигналы 24–48 часов.
+- `GET /api/dominance` — BTC.D / USDT.D / TOTAL3 pressure strips.
+- `GET /api/trades` — открытые и закрытые сделки.
+- `GET /api/snapshot` — полный снимок dashboard.
+- `WS /ws` — live-обновления без перезагрузки.
+
+### Интеграция бота с dashboard
+
+Бот может отправлять события напрямую в ingest endpoints:
+
+```bash
+curl -X POST http://localhost:8000/api/ingest/log \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Bybit rate-limit protection: OK","source":"gateway","severity":"info"}'
+```
+
+```bash
+curl -X POST http://localhost:8000/api/ingest/signal \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"api3-1h-001","symbol":"API3USDT","exchange":"Bybit","timeframe":"1h","score":8.7,"strength":"Strong","signal_type":"Confirmed","entry":0.912,"stop_loss":0.848,"take_profit_1":1.04,"reason":"EMA20 up + VSpike q95 + breakout","status":"ACTIVE"}'
+```
