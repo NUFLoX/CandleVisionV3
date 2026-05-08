@@ -19,7 +19,7 @@
     <div id="root"></div>
     <script type="text/babel">
       const { useEffect, useMemo, useState } = React;
-      const api = (path) => fetch(path).then((r) => r.json());
+      const api = async (path, options = {}) => { const r = await fetch(path, options); const data = await r.json(); if (!r.ok) throw new Error(data.detail || 'API error'); return data; };
       const fmtUsd = (value) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', notation: 'compact', maximumFractionDigits: 2 }).format(value || 0);
 
       function Badge({ children, tone = 'slate' }) {
@@ -46,10 +46,12 @@
       function App() {
         const [snapshot, setSnapshot] = useState(null);
         const [filters, setFilters] = useState({ strength: '', signal_type: '', exchange: '', timeframe: '' });
-        const [coinQuery, setCoinQuery] = useState('API3');
+        const [coinQuery, setCoinQuery] = useState('BTC');
         const [coin, setCoin] = useState(null);
+        const [coinError, setCoinError] = useState('');
 
         const load = async () => setSnapshot(await api('/api/snapshot'));
+        const refreshLive = async () => setSnapshot(await api('/api/refresh', { method: 'POST' }));
         useEffect(() => {
           load();
           const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -59,7 +61,7 @@
           return () => { clearInterval(timer); ws.close(); };
         }, []);
 
-        useEffect(() => { api(`/api/coin/${coinQuery || 'API3'}`).then(setCoin); }, [coinQuery]);
+        useEffect(() => { setCoinError(''); api(`/api/coin/${coinQuery || 'BTC'}`).then(setCoin).catch((e) => { setCoin(null); setCoinError(e.message); }); }, [coinQuery]);
 
         const filteredSignals = useMemo(() => {
           const signals = snapshot?.signals || [];
@@ -80,12 +82,13 @@
             <div>
               <p className="text-sm font-semibold uppercase tracking-[.35em] text-cyan-300">CandleVision V3</p>
               <h1 className="mt-2 text-4xl font-black tracking-tight">Control Center</h1>
-              <p className="mt-2 max-w-3xl text-slate-400">Панель наблюдения: live-логи, фильтр рынка, сигналы, dominance pressure strips, watchlist и глубокий поиск монеты.</p>
+              <p className="mt-2 max-w-3xl text-slate-400">Панель наблюдения без демо-заглушек: реальные публичные данные Bybit/CoinGecko, live-логи, фильтр рынка, сигналы из ingest API и глубокий поиск монеты.</p>
             </div>
             <div className="flex flex-wrap gap-2">
               <Badge tone="green">Scanner: {status.scanner}</Badge>
               <Badge tone="green">Executor: {status.executor}</Badge>
               <Badge tone="blue">Last scan: {status.last_scan_seconds}s</Badge>
+              <button onClick={refreshLive} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh live</button>
             </div>
           </header>
 
@@ -99,6 +102,7 @@
           <section className="grid gap-6 xl:grid-cols-[1.05fr_.95fr]">
             <Card title="Консоль бота" action={<Badge tone="green">live</Badge>}>
               <div className="h-80 space-y-3 overflow-auto rounded-xl bg-black/30 p-4 font-mono text-sm">
+                {snapshot.logs.length === 0 && <p className="text-slate-500">Логов пока нет.</p>}
                 {snapshot.logs.map((log, index) => <div key={index} className="flex gap-3 text-slate-300">
                   <span className="text-cyan-300">[{new Date(log.timestamp).toLocaleTimeString()}]</span>
                   <span className={log.severity === 'error' ? 'text-red-300' : log.severity === 'success' ? 'text-emerald-300' : ''}>{log.message}</span>
@@ -107,6 +111,7 @@
             </Card>
             <Card title="Market Pressure Strips">
               <div className="space-y-4">
+                {snapshot.pressure_strips.length === 0 && <p className="text-sm text-slate-500">Live dominance ещё загружается.</p>}
                 {snapshot.pressure_strips.map((strip) => <div key={strip.key}>
                   <div className="mb-1 flex items-center justify-between text-sm">
                     <span className="font-semibold text-slate-200">{strip.label}</span>
@@ -123,12 +128,14 @@
 
           <Card title="Окно сигналов" action={<SignalFilters filters={filters} setFilters={setFilters} />}>
             <div className="grid gap-4 lg:grid-cols-3">
+              {filteredSignals.length === 0 && <p className="text-sm text-slate-500">Реальных сигналов пока нет. Отправьте сигнал через /api/ingest/signal или дождитесь сканера.</p>}
               {filteredSignals.map((signal) => <SignalCard key={signal.id} signal={signal} />)}
             </div>
           </Card>
 
           <section className="grid gap-6 xl:grid-cols-[.9fr_1.1fr]">
-            <Card title="Поиск монеты" action={<input className="w-32 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-cyan-400" value={coinQuery} onChange={(e) => setCoinQuery(e.target.value)} placeholder="API3" />}>
+            <Card title="Поиск монеты" action={<input className="w-32 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-cyan-400" value={coinQuery} onChange={(e) => setCoinQuery(e.target.value)} placeholder="BTC" />}>
+              {coinError && <p className="rounded-xl border border-red-400/20 bg-red-400/10 p-3 text-sm text-red-200">{coinError}</p>}
               {coin && <CoinAnalytics coin={coin} />}
             </Card>
             <Card title="Bot Health / Trades / Watchlist">
@@ -136,6 +143,7 @@
                 <Health status={status} />
                 <div className="space-y-3">
                   <h3 className="font-semibold">Watchlist 24–48h</h3>
+                  {snapshot.watchlist.length === 0 && <p className="text-sm text-slate-500">Watchlist пуст: демо-записи отключены, ждём ingest от бота.</p>}
                   {snapshot.watchlist.map((item) => <div key={item.symbol} className="rounded-xl bg-slate-900/70 p-3 text-sm">
                     <div className="flex justify-between"><b>{item.symbol}</b><span>{item.score}</span></div>
                     <p className="text-slate-400">{item.reason}</p>
@@ -178,7 +186,7 @@
 
       function CoinAnalytics({ coin }) {
         const rows = [
-          ['Market Cap', fmtUsd(coin.market_cap_usd)], ['24h Volume', fmtUsd(coin.volume_24h_usd)], ['Money Inflow 1h', fmtUsd(coin.money_inflow_1h_usd)], ['Money Inflow 4h', fmtUsd(coin.money_inflow_4h_usd)], ['Money Inflow 24h', fmtUsd(coin.money_inflow_24h_usd)], ['CEX Netflow', fmtUsd(coin.cex_netflow_usd)], ['Whale Activity', coin.whale_activity], ['Accumulation Score', coin.accumulation_score], ['Orderbook Imbalance', coin.orderbook_imbalance], ['RSI', coin.rsi], ['ATR%', coin.atr_pct], ['EMA20 / EMA50 / EMA200', `${coin.ema20} / ${coin.ema50} / ${coin.ema200}`], ['Volume Spike', coin.volume_spike], ['Support / Resistance', `${coin.support} / ${coin.resistance}`],
+          ['Market Cap', coin.market_cap_usd ? fmtUsd(coin.market_cap_usd) : 'N/A from Bybit'], ['24h Volume', fmtUsd(coin.volume_24h_usd)], ['Money Inflow 1h', fmtUsd(coin.money_inflow_1h_usd)], ['Money Inflow 4h', fmtUsd(coin.money_inflow_4h_usd)], ['Money Inflow 24h', fmtUsd(coin.money_inflow_24h_usd)], ['CEX Netflow', coin.cex_netflow_usd ? fmtUsd(coin.cex_netflow_usd) : 'N/A from Bybit'], ['Whale Activity', coin.whale_activity], ['Accumulation Score', coin.accumulation_score], ['Orderbook Imbalance', coin.orderbook_imbalance], ['RSI', coin.rsi], ['ATR%', coin.atr_pct], ['EMA20 / EMA50 / EMA200', `${coin.ema20} / ${coin.ema50} / ${coin.ema200}`], ['Volume Spike', coin.volume_spike], ['Support / Resistance', `${coin.support} / ${coin.resistance}`],
         ];
         return <div><h3 className="mb-3 text-2xl font-black">{coin.symbol}</h3><div className="grid gap-2 sm:grid-cols-2">{rows.map(([k, v]) => <div key={k} className="rounded-xl bg-slate-900/70 p-3"><p className="text-xs text-slate-500">{k}</p><p className="font-bold">{v}</p></div>)}</div><div className="mt-4 rounded-xl border border-cyan-400/20 bg-cyan-400/10 p-4"><p className="text-xs uppercase tracking-widest text-cyan-300">Bot Verdict</p><p className="mt-1 text-slate-200">{coin.bot_verdict}</p></div></div>;
       }

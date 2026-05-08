@@ -66,6 +66,8 @@ React + Tailwind Dashboard
 
 MVP использует in-memory `DashboardStore`, чтобы панель можно было запустить сразу. API уже отделён от UI, поэтому хранилище можно заменить на PostgreSQL/Redis без изменения frontend-контракта.
 
+По умолчанию dashboard больше не заполняется демо-сигналами/сделками. При старте он подтягивает реальные публичные данные Bybit (tickers, klines, orderbook) и CoinGecko global для market pressure; сигналы, watchlist и сделки появляются только после ingest от бота. Принудительно обновить live-снимок можно через `POST /api/refresh`.
+
 ### Запуск
 
 ```bash
