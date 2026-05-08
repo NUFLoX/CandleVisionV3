@@ -3,6 +3,7 @@ import asyncio
 import logging
 
 from config.settings import SCAN_INTERVAL, WATCHLIST_INTERVAL, DANGER_PAUSE
+from dashboard.ingest_client import DashboardIngestClient
 
 class Orchestrator:
     def __init__(self, scout, executor, sentinel, ws_stream):
@@ -12,10 +13,12 @@ class Orchestrator:
         self.ws_stream = ws_stream
         self.is_running = False
         self.logger = logging.getLogger("CandleVision.Orchestrator")
+        self.dashboard = DashboardIngestClient()
 
     async def run_scout_loop(self):
         self.logger.info("🔭 Запуск асинхронного Сканера...")
         while self.is_running:
+            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orchestrator", "loop": "scout"})
             regime = await self.sentinel.get_market_regime_async()
 
             if regime == "DANGER":
@@ -29,7 +32,11 @@ class Orchestrator:
     async def run_executor_loop(self):
         self.logger.info("⚡ Запуск асинхронного Экзекутора...")
         while self.is_running:
-            signal = await self.executor.queue.get()
+            await self.dashboard.post_heartbeat("executor", meta={"runner": "orchestrator", "loop": "executor", "open_trades": len(getattr(self.executor, 'active_trades', []))})
+            try:
+                signal = await asyncio.wait_for(self.executor.queue.get(), timeout=5)
+            except asyncio.TimeoutError:
+                continue
             if signal:
                 await self.executor.process_signal_async(signal)
             await asyncio.sleep(0.1)
@@ -38,6 +45,7 @@ class Orchestrator:
         """Цикл 'Дожима': перепроверяет Watchlist."""
         self.logger.info("🎯 Запуск цикла 'Дожима' (Watchlist Refiner)...")
         while self.is_running:
+            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orchestrator", "loop": "watchlist_refiner", "watchlist_size": len(self.executor.watchlist)})
             targets = list(self.executor.watchlist)
             if targets:
                 await self.scout.recheck_watchlist_async(targets)
@@ -51,6 +59,7 @@ class Orchestrator:
         self.logger.info("🛡️ Запуск монитора позиций (TP1/Синхронизация)...")
         await asyncio.sleep(10)  # Ждём прогрева стаканов
         while self.is_running:
+            await self.dashboard.post_heartbeat("executor", meta={"runner": "orchestrator", "loop": "position_monitor", "open_trades": len(getattr(self.executor, 'active_trades', []))})
             try:
                 price_updates = {}
                 for trade in self.executor.active_trades:

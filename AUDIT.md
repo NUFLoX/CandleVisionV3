@@ -22,12 +22,16 @@ Date: 2026-05-08
 - Added a live data loader that pulls public Bybit tickers, klines and orderbook data for coin analytics.
 - Added CoinGecko global market data for dominance/pressure strips, with a Bybit-derived fallback.
 - Added periodic dashboard refresh and a manual `/api/refresh` endpoint.
+- Connected `orderflow_v1` and `orderflow_accum` runners to dashboard ingest through `DASHBOARD_API_URL` so real emitted signals and scanner heartbeats can appear in the UI.
+- Added `watchlist`, `trade` and `heartbeat` ingest endpoints.
+- Added JSON persistence for dashboard ingest state.
+- Added mocked tests for Bybit/CoinGecko parsing and dashboard persistence.
 - Updated the frontend copy and empty states so users can see when signals/watchlist/trades are absent instead of seeing demo entries.
 
 ## Remaining recommendations
 
-- Persist ingested events in PostgreSQL/Redis so dashboard state survives process restarts.
-- Add explicit health checks for Telegram bot delivery, executor loop, database and Redis rather than relying on config labels.
+- Replace JSON persistence with PostgreSQL/Redis for multi-process production deployments.
+- Feed executor heartbeats from the real execution loop when live trading is enabled.
 - Add a dedicated provider for market cap, exchange netflow and whale activity if these metrics are required.
 - Add authentication to ingest and dashboard endpoints before exposing this service outside a trusted network.
-- Add automated tests with mocked Bybit/CoinGecko responses to prevent regressions in live-data parsing.
+- Run live Bybit/CoinGecko integration checks from an environment without outbound proxy blocks.

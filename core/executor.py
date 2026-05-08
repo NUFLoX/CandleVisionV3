@@ -10,6 +10,7 @@ from api.telegram import TelegramReporter
 from api.charting import generate_setup_chart
 from api.bybit_client import BybitClient
 from config.settings import TOKEN, CHAT_ID, BYBIT_TESTNET
+from dashboard.ingest_client import DashboardIngestClient
 
 def calculate_position_size(balance, risk, entry, sl):
     """Рассчитывает объем позиции."""
@@ -41,6 +42,7 @@ class Executor:
 
         self.tg = TelegramReporter()
         self.exchange = BybitClient(testnet=BYBIT_TESTNET)
+        self.dashboard = DashboardIngestClient()
 
         self.active_trades = self.db.load_open_trades()
         if self.active_trades:
@@ -99,6 +101,14 @@ class Executor:
                     self.watchlist.pop()
                 self.logger.info(f"⏳ {symbol} в Watchlist (Score: {score})")
                 self.watchlist.add(symbol)
+                asyncio.create_task(
+                    self.dashboard.post_watchlist(
+                        symbol,
+                        timeframe=signal_data.get('timeframe', '1m'),
+                        score=float(score),
+                        reason=", ".join(signal_data.get('reasons', ['scanner watchlist'])) if isinstance(signal_data.get('reasons'), list) else str(signal_data.get('reasons', 'scanner watchlist')),
+                    )
+                )
             return False
 
         # ЕСЛИ СИГНАЛ ПРОШЕЛ (Score >= 2.5) — ДОСТАЕМ ОСТАЛЬНЫЕ ДАННЫЕ
@@ -152,12 +162,20 @@ class Executor:
 
         if not self.exchange.session:
             self.logger.info(f"📡 {symbol}: signal-only режим — биржевой ордер не отправлялся.")
+            asyncio.create_task(
+                self.dashboard.post_log(
+                    f"{symbol}: signal-only mode, exchange order was not sent",
+                    source="executor",
+                    severity="info",
+                )
+            )
             asyncio.create_task(self._send_execution_report(trade, score, df))
             return True
 
         trade_id = self.db.add_trade(trade)
         trade["id"] = trade_id
         self.active_trades.append(trade)
+        asyncio.create_task(self.dashboard.post_trade(trade))
 
         trade_success = self._place_limit_order(
             symbol=symbol, side=side, qty=size, entry_price=entry, sl_price=sl, tp_price=tp
@@ -281,6 +299,7 @@ class Executor:
 
         emoji = "🔴" if reason == "STOP LOSS" else "🟢"
         self.logger.info(f"{emoji} {reason}: {trade['symbol']} закрыт | P&L: {pnl_pct:.2f}% | Баланс: {self.balance:.2f}$")
+        asyncio.create_task(self.dashboard.post_trade(trade))
 
     async def _send_execution_report(self, trade, score, df):
         try:

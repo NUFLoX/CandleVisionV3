@@ -4,6 +4,8 @@ import asyncio
 import logging
 import time
 
+from dashboard.ingest_client import DashboardIngestClient
+
 from .bybit_rest import BybitRestClient
 from .console_ui import ConsoleUI
 from .config import Settings
@@ -25,6 +27,7 @@ class OrderFlowRunner:
         self.realtime_engine = RealtimeOrderFlowEngine(settings)
         self.macro_engine = MacroFlowEngine(settings)
         self.csv_logger = SignalCsvLogger("signal_stats.csv")
+        self.dashboard = DashboardIngestClient()
         self._cooldowns: dict[str, float] = {}
 
     async def run(self) -> None:
@@ -70,6 +73,7 @@ class OrderFlowRunner:
     async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[str]) -> None:
         self.logger.info("Realtime scan loop started for %s symbols", len(symbols))
         while True:
+            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_v1", "loop": "realtime", "symbols": len(symbols)})
             for symbol in symbols:
                 try:
                     df = await rest.fetch_klines(symbol, interval="1", limit=180)
@@ -86,6 +90,7 @@ class OrderFlowRunner:
         self.logger.info("Macro scan loop started for %s symbols", len(symbols))
         intervals = {"60": 48, "240": 42, "D": 40}
         while True:
+            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_v1", "loop": "macro", "symbols": len(symbols)})
             for symbol in symbols:
                 try:
                     frames = {}
@@ -125,6 +130,7 @@ class OrderFlowRunner:
             self.orderflow_logger.info(log_line)
         self.csv_logger.append(signal)
         self.ui.print_signal(signal)
+        await self.dashboard.post_signal(signal)
         await self.telegram.send_message(message)
 
     def _format_signal(self, signal) -> str:

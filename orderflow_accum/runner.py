@@ -6,6 +6,8 @@ import fnmatch
 import logging
 import time
 
+from dashboard.ingest_client import DashboardIngestClient
+
 from .bybit_rest import BybitRestClient
 from .config import Settings
 from .console_ui import ConsoleUI
@@ -29,6 +31,7 @@ class AccumulationRunner:
         self.macro_engine = MacroAccumulationEngine(settings)
         self.csv_logger = SignalCsvLogger("accumulation_signals.csv")
         self.rejection_logger = RejectionCsvLogger("rejection_reasons.csv")
+        self.dashboard = DashboardIngestClient()
         self._cooldowns: dict[str, float] = {}
         self._counts = {"macro": 0, "orderflow": 0}
 
@@ -92,6 +95,18 @@ class AccumulationRunner:
 
     async def _run_status(self, stream: MarketStream, realtime_count: int, macro_count: int) -> None:
         while True:
+            await self.dashboard.post_heartbeat(
+                "scanner",
+                meta={
+                    "runner": "orderflow_accum",
+                    "loop": "status",
+                    "ws_status": stream.status,
+                    "realtime_symbols": realtime_count,
+                    "macro_symbols": macro_count,
+                    "macro_signals": self._counts["macro"],
+                    "orderflow_signals": self._counts["orderflow"],
+                },
+            )
             self.ui.update_session(ws_status=stream.status, macro=self._counts["macro"], orderflow=self._counts["orderflow"])
             self.ui.print_session(realtime_count, macro_count)
             await asyncio.sleep(30)
@@ -99,6 +114,7 @@ class AccumulationRunner:
     async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[str]) -> None:
         self.logger.info("Realtime accumulation loop started for %s symbols", len(symbols))
         while True:
+            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "realtime", "symbols": len(symbols)})
             for symbol in symbols:
                 try:
                     df = await rest.fetch_klines(symbol, interval="1", limit=180)
@@ -118,6 +134,7 @@ class AccumulationRunner:
         self.logger.info("Macro base scan loop started for %s symbols", len(symbols))
         intervals = {"60": 60, "240": 50, "D": 45}
         while True:
+            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "macro", "symbols": len(symbols)})
             for symbol in symbols:
                 try:
                     frames = {}
@@ -197,6 +214,7 @@ class AccumulationRunner:
         self.csv_logger.append(signal)
         self.ui.update_session(macro=self._counts["macro"], orderflow=self._counts["orderflow"])
         self.ui.print_signal(signal)
+        await self.dashboard.post_signal(signal)
         chart_path = await self._build_chart_for_signal(rest, signal)
         try:
             await self.telegram.send_signal(
