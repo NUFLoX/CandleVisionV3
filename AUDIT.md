@@ -55,3 +55,25 @@ Date: 2026-05-11
 - Consider storing raw candle windows or refresh metadata for auditability of historical outcome decisions.
 - Decide a product policy for ambiguous same-candle outcomes; this branch uses a conservative neutral `0R` classification.
 - Require `DASHBOARD_INGEST_TOKEN` in deployment manifests and avoid exposing write endpoints without HTTPS.
+codex/conduct-deep-repository-audit-and-implement-changes-kyu74x
+
+## 2026-05-11 live-trading safety follow-up
+
+Implemented without changing the signal discovery/scoring path:
+
+- `SIGNALS_ONLY` is now a hard Executor guard: when enabled, the Executor can still report a valid signal but will not place an exchange order or write an active trade.
+- WebSocket sniper no longer calls `Executor.process_signal_async()` directly; it queues a signal candidate for the existing orchestrator/executor queue path.
+- Tape Reader now uses the shared `BYBIT_WS_PUBLIC_URL` setting instead of a hardcoded testnet WebSocket URL.
+- Exchange execution now creates `orderLinkId`, checks local/exchange duplicates, fetches instrument rules, normalizes qty/price to Bybit filters, enforces min qty/min notional, and verifies order/position status before persisting a trade as `pending_order` or `open`.
+- Startup now reconciles locally active trades with Bybit positions/open orders when live execution is enabled.
+- `/api/signal-outcomes/refresh` now uses the same bearer-token dependency as ingest when `DASHBOARD_INGEST_TOKEN` is configured.
+
+Still recommended for separate follow-up PRs:
+
+- Shared process-wide Bybit REST session, rate limiter, and circuit breaker.
+- Full dashboard auth/CORS policy for non-local deployments.
+- Moving tracked historical CSV/PNG artifacts out of the repository history/index.
+- Legacy cleanup for unused scanner/executor modules.
+- P2 signal-quality telemetry (A/B/C labels, rr_fallback stats, rejection stats, MFE/MAE/time-to-*), initially in observe-only mode.
+=======
+main
