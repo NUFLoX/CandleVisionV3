@@ -19,6 +19,7 @@ class DashboardIngestClient:
     def __init__(self, base_url: str | None = None, timeout_seconds: float | None = None) -> None:
         self.base_url = (base_url if base_url is not None else os.getenv("DASHBOARD_API_URL", "")).strip().rstrip("/")
         self.timeout_seconds = float(timeout_seconds or os.getenv("DASHBOARD_INGEST_TIMEOUT", "2.5"))
+        self.ingest_token = os.getenv("DASHBOARD_INGEST_TOKEN", "").strip()
         self.enabled = bool(self.base_url)
 
     async def post_signal(self, signal: Any, *, exchange: str = "Bybit", timeframe: str = "live") -> None:
@@ -102,10 +103,13 @@ class DashboardIngestClient:
 
     def _post_sync(self, path: str, payload: dict[str, Any]) -> None:
         url = urljoin(f"{self.base_url}/", path.lstrip("/"))
+        headers = {"Content-Type": "application/json", "User-Agent": "CandleVisionDashboardIngest/1.0"}
+        if self.ingest_token:
+            headers["Authorization"] = f"Bearer {self.ingest_token}"
         request = Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": "CandleVisionDashboardIngest/1.0"},
+            headers=headers,
             method="POST",
         )
         with urlopen(request, timeout=self.timeout_seconds) as response:

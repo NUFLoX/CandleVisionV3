@@ -1,6 +1,10 @@
 .env
+.venv/
 venv/
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.db
 *.db-shm
 *.db-wal
@@ -9,3 +13,12 @@ __pycache__/
 *.session-journal
 accum_charts/
 setup_*.png
+
+data/dashboard_state.json
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*outcome*.json
+data/*outcome*.csv
+data/*runtime*.json
+runtime/

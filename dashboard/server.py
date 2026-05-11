@@ -3,16 +3,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .schemas import BotLog, Heartbeat, MarketState, Signal, Trade, WatchlistItem
+from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -41,6 +43,19 @@ class WebSocketHub:
                 await client.send_text(message)
             except RuntimeError:
                 await self.disconnect(client)
+
+
+def _dashboard_ingest_token() -> str:
+    return os.getenv("DASHBOARD_INGEST_TOKEN", "").strip()
+
+
+def verify_ingest_auth(authorization: str | None = Header(default=None)) -> None:
+    token = _dashboard_ingest_token()
+    if not token:
+        return
+    expected = f"Bearer {token}"
+    if authorization != expected:
+        raise HTTPException(status_code=401, detail="Missing or invalid ingest bearer token")
 
 
 def _jsonable(payload: object) -> object:
@@ -150,40 +165,57 @@ def create_app() -> FastAPI:
         return await store.snapshot()
 
     @app.post("/api/ingest/log")
-    async def ingest_log(log: BotLog):
+    async def ingest_log(log: BotLog, _: None = Depends(verify_ingest_auth)):
         saved = await store.add_log(log)
         await hub.broadcast("log", saved)
         return saved
 
     @app.post("/api/ingest/signal")
-    async def ingest_signal(signal: Signal):
+    async def ingest_signal(signal: Signal, _: None = Depends(verify_ingest_auth)):
         saved = await store.add_signal(signal)
         await hub.broadcast("signal", saved)
         return saved
 
     @app.post("/api/ingest/watchlist")
-    async def ingest_watchlist(item: WatchlistItem):
+    async def ingest_watchlist(item: WatchlistItem, _: None = Depends(verify_ingest_auth)):
         saved = await store.add_watchlist_item(item)
         await hub.broadcast("watchlist", saved)
         return saved
 
     @app.post("/api/ingest/trade")
-    async def ingest_trade(trade: Trade):
+    async def ingest_trade(trade: Trade, _: None = Depends(verify_ingest_auth)):
         saved = await store.add_trade(trade)
         await hub.broadcast("trade", saved)
         return saved
 
     @app.post("/api/ingest/heartbeat")
-    async def ingest_heartbeat(heartbeat: Heartbeat):
+    async def ingest_heartbeat(heartbeat: Heartbeat, _: None = Depends(verify_ingest_auth)):
         saved = await store.add_heartbeat(heartbeat)
         await hub.broadcast("heartbeat", saved)
         return saved
 
     @app.post("/api/ingest/market-state")
-    async def ingest_market_state(state: MarketState):
+    async def ingest_market_state(state: MarketState, _: None = Depends(verify_ingest_auth)):
         saved = await store.update_market_state(state)
         await hub.broadcast("market-state", saved)
         return saved
+
+
+    @app.get("/api/signal-outcomes")
+    async def signal_outcomes(limit: Annotated[int, Query(ge=1, le=1000)] = 500):
+        return SignalOutcomeStore().list_outcomes(limit=limit)
+
+    @app.get("/api/signal-stats")
+    async def signal_stats():
+        return SignalOutcomeStore().stats()
+
+    @app.post("/api/signal-outcomes/refresh")
+    async def refresh_signal_stats():
+        snapshot = await store.snapshot()
+        outcomes = await refresh_signal_outcomes(snapshot.signals)
+        stats = SignalOutcomeStore().stats()
+        await hub.broadcast("signal-stats", stats)
+        return {"refreshed": len(outcomes), "stats": stats}
 
     @app.websocket("/ws")
     async def websocket(websocket: WebSocket):
