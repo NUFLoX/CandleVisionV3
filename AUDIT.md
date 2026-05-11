@@ -55,6 +55,7 @@ Date: 2026-05-11
 - Consider storing raw candle windows or refresh metadata for auditability of historical outcome decisions.
 - Decide a product policy for ambiguous same-candle outcomes; this branch uses a conservative neutral `0R` classification.
 - Require `DASHBOARD_INGEST_TOKEN` in deployment manifests and avoid exposing write endpoints without HTTPS.
+codex/conduct-deep-repository-audit-and-implement-changes-kyu74x
 
 ## 2026-05-11 live-trading safety follow-up
 
@@ -74,3 +75,5 @@ Still recommended for separate follow-up PRs:
 - Moving tracked historical CSV/PNG artifacts out of the repository history/index.
 - Legacy cleanup for unused scanner/executor modules.
 - P2 signal-quality telemetry (A/B/C labels, rr_fallback stats, rejection stats, MFE/MAE/time-to-*), initially in observe-only mode.
+=======
+main
