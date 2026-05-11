@@ -40,7 +40,7 @@ class BybitClient:
     # =================================================================
     # НОВЫЙ МЕТОД ДЛЯ МАКРО-ТРЕКЕРА (СКАЧИВАНИЕ СВЕЧЕЙ)
     # =================================================================
-    async def get_kline(self, symbol: str, interval: str, limit: int = 50, start: int = None):
+    async def get_kline(self, symbol: str, interval: str, limit: int = 50, start: int = None, end: int = None):
         """Асинхронная обертка для получения свечей через pybit v5"""
         if not self.session:
             self.logger.warning("⚠️ Session не инициализирован. Не могу получить свечи.")
@@ -59,6 +59,8 @@ class BybitClient:
             }
             if start is not None:
                 kwargs["start"] = start
+            if end is not None:
+                kwargs["end"] = end
 
             response = await loop.run_in_executor(
                 None, 
