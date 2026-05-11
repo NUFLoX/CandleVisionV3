@@ -5,6 +5,8 @@ import logging
 import time
 import websockets
 
+from config.settings import BYBIT_WS_PUBLIC_URL
+
 class TapeReader:
     def __init__(self, volume_threshold=50000):
         self.logger = logging.getLogger("CandleVision.Tape")
@@ -13,7 +15,7 @@ class TapeReader:
         self.ws = None
 
     async def connect(self, symbols):
-        url = "wss://stream-testnet.bybit.com/v5/public/linear"
+        url = BYBIT_WS_PUBLIC_URL
         
         try:
             async with websockets.connect(url) as ws:

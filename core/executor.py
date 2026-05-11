@@ -4,12 +4,14 @@ import logging
 import os
 import time
 import math
+import uuid
+from decimal import Decimal, ROUND_DOWN
 
 from agents.notifier import TelegramNotifier
 from api.telegram import TelegramReporter
 from api.charting import generate_setup_chart
 from api.bybit_client import BybitClient
-from config.settings import TOKEN, CHAT_ID, BYBIT_TESTNET
+from config.settings import TOKEN, CHAT_ID, BYBIT_TESTNET, SIGNALS_ONLY
 from dashboard.ingest_client import DashboardIngestClient
 
 def calculate_position_size(balance, risk, entry, sl):
@@ -43,12 +45,20 @@ class Executor:
         self.tg = TelegramReporter()
         self.exchange = BybitClient(testnet=BYBIT_TESTNET)
         self.dashboard = DashboardIngestClient()
+        self.signals_only = SIGNALS_ONLY
+        self.instrument_rules: dict[str, dict] = {}
+        self.order_link_ids: set[str] = set()
 
         self.active_trades = self.db.load_open_trades()
         if self.active_trades:
             self.logger.info(f"💾 Восстановлено {len(self.active_trades)} открытых позиций.")
 
-        real_balance = self._get_real_balance()
+        if not self.signals_only:
+            self._sync_exchange_state()
+        else:
+            self.logger.warning("🛡️ SIGNALS_ONLY=true: биржевые ордера жестко отключены в Executor.")
+
+        real_balance = self._get_real_balance() if not self.signals_only else None
         self.balance = real_balance if real_balance is not None else initial_balance
 
     def _get_real_balance(self):
@@ -82,7 +92,7 @@ class Executor:
             self.logger.warning("⛔️ Достигнут лимит убытков на день!")
             return False
 
-        active_count = len([t for t in self.active_trades if t['status'] == 'open'])
+        active_count = len([t for t in self.active_trades if t.get('status') in {'open', 'pending_order'}])
         if active_count >= self.max_positions:
             self.logger.debug(f"🛑 Максимум позиций ({self.max_positions}). Ждём свободный слот.")
             return False
@@ -91,7 +101,8 @@ class Executor:
         symbol = signal_data['symbol']
         score = signal_data['score']
 
-        if any(t['symbol'] == symbol and t['status'] == 'open' for t in self.active_trades):
+        if self._has_local_active_trade(symbol) or self._has_exchange_duplicate(symbol):
+            self.logger.info(f"🔁 {symbol}: активная сделка/ордер уже существует, дубль пропущен.")
             return False
 
         # СНАЧАЛА ПРОВЕРЯЕМ WATCHLIST
@@ -143,7 +154,7 @@ class Executor:
             "symbol": symbol, "side": side, "entry": entry, "sl": sl, "tp": tp,
             "tp1_price": tp1_price, "tp1_qty": tp1_qty,
             "size": size, "remaining_size": size,
-            "status": "open", "pnl_pct": 0.0, "timeframe": signal_data.get('timeframe', '1m'),
+            "status": "signal_only" if self.signals_only else "pending_order", "pnl_pct": 0.0, "timeframe": signal_data.get('timeframe', '1m'),
             "reasons": reasons_str # <--- ПЕРЕДАЕМ ИХ В БАЗУ ДАННЫХ
         }
 
@@ -160,8 +171,9 @@ class Executor:
             f"Size: {trade['size']:.4f} | Risk: {risk_amount:.2f}$"
         )
 
-        if not self.exchange.session:
-            self.logger.info(f"📡 {symbol}: signal-only режим — биржевой ордер не отправлялся.")
+        if self.signals_only or not self.exchange.session:
+            mode = "SIGNALS_ONLY=true" if self.signals_only else "нет биржевой сессии"
+            self.logger.info(f"📡 {symbol}: signal-only режим ({mode}) — биржевой ордер не отправлялся.")
             asyncio.create_task(
                 self.dashboard.post_log(
                     f"{symbol}: signal-only mode, exchange order was not sent",
@@ -172,44 +184,129 @@ class Executor:
             asyncio.create_task(self._send_execution_report(trade, score, df))
             return True
 
+        order_result = self._place_limit_order(
+            symbol=symbol, side=side, qty=size, entry_price=entry, sl_price=sl, tp_price=tp,
+            timeframe=signal_data.get('timeframe', '1m'),
+        )
+        if not order_result:
+            self.logger.error(f"❌ Ордер {symbol} не подтвержден биржей. Сделка не записана как активная.")
+            return False
+
+        trade.update(order_result)
         trade_id = self.db.add_trade(trade)
         trade["id"] = trade_id
         self.active_trades.append(trade)
+        self.order_link_ids.add(trade.get("order_link_id", ""))
         asyncio.create_task(self.dashboard.post_trade(trade))
-
-        trade_success = self._place_limit_order(
-            symbol=symbol, side=side, qty=size, entry_price=entry, sl_price=sl, tp_price=tp
-        )
-        if not trade_success:
-            self.logger.error(f"❌ Ордер {symbol} не исполнен. Удаляем из БД.")
-            self.db.cursor.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
-            self.db.conn.commit()
-            self.active_trades.remove(trade)
-            return False
-
         asyncio.create_task(self._send_execution_report(trade, score, df))
         return True
 
-    def _format_qty(self, qty: float, entry_price: float) -> float:
-        """Fallback-форматирование qty, пока нет instrument-info cache."""
+    def _sync_exchange_state(self) -> None:
+        """Reconcile local active trades with real Bybit positions/orders before trading."""
+        if not self.exchange.session:
+            return
+        try:
+            positions = self.exchange.get_positions()
+            open_orders = self.exchange.get_open_orders()
+            exchange_symbols = {
+                item.get("symbol") for item in open_orders if item.get("symbol")
+            }
+            exchange_symbols.update(
+                item.get("symbol") for item in positions if item.get("symbol") and _safe_float(item.get("size")) > 0
+            )
+            self.order_link_ids.update(
+                item.get("orderLinkId") for item in open_orders if item.get("orderLinkId")
+            )
+            reconciled = []
+            for trade in self.active_trades:
+                symbol = trade.get("symbol")
+                if symbol in exchange_symbols:
+                    reconciled.append(trade)
+                    continue
+                self.logger.warning(f"⚠️ {symbol}: локальная активная сделка не найдена на Bybit; помечаем как reconcile_required.")
+                if trade.get("id") is not None:
+                    self.db.update_trade_status(trade["id"], "reconcile_required", trade.get("pnl_pct", 0.0) or 0.0)
+            self.active_trades = reconciled
+            self.logger.info(
+                f"🔄 Bybit sync завершен: positions={len(positions)}, open_orders={len(open_orders)}, local_active={len(self.active_trades)}"
+            )
+        except Exception as exc:
+            self.logger.error(f"❌ Не удалось синхронизировать Bybit positions/orders: {exc}")
+
+    def _has_local_active_trade(self, symbol: str) -> bool:
+        return any(
+            t.get('symbol') == symbol and t.get('status') in {'open', 'pending_order'}
+            for t in self.active_trades
+        )
+
+    def _has_exchange_duplicate(self, symbol: str) -> bool:
+        if self.signals_only or not self.exchange.session:
+            return False
+        if self.exchange.has_open_position(symbol):
+            return True
+        return bool(self.exchange.get_open_orders(symbol=symbol))
+
+    def _instrument_rules(self, symbol: str) -> dict | None:
+        if symbol not in self.instrument_rules:
+            rules = self.exchange.get_instrument_rules(symbol)
+            if not rules:
+                return None
+            self.instrument_rules[symbol] = rules
+        return self.instrument_rules[symbol]
+
+    def _floor_to_step(self, value: float, step: str) -> float:
+        decimal_step = Decimal(str(step or "0"))
+        if decimal_step <= 0:
+            return float(value)
+        decimal_value = Decimal(str(value))
+        return float((decimal_value / decimal_step).to_integral_value(rounding=ROUND_DOWN) * decimal_step)
+
+    def _format_price(self, price: float, rules: dict) -> float:
+        return self._floor_to_step(price, rules.get("tick_size", "0"))
+
+    def _format_qty(self, qty: float, entry_price: float, rules: dict | None = None) -> float:
         if qty <= 0:
             return 0.0
+        if rules:
+            return self._floor_to_step(qty, rules.get("qty_step", "0"))
         if entry_price < 10:
             return max(int(qty), 1)
         if entry_price < 1000:
             return round(qty, 2)
         return round(qty, 3)
 
-    def _place_limit_order(self, symbol, side, qty, entry_price, sl_price, tp_price):
+    def _make_order_link_id(self, symbol: str, timeframe: str) -> str:
+        return f"cv3-{symbol}-{timeframe}-{uuid.uuid4().hex[:18]}"[:36]
+
+    def _place_limit_order(self, symbol, side, qty, entry_price, sl_price, tp_price, timeframe="1m"):
         try:
-            formatted_qty = self._format_qty(qty, entry_price)
-            if formatted_qty <= 0:
-                self.logger.error(f"❌ Некорректный размер позиции {symbol}: {qty}")
-                return False
+            rules = self._instrument_rules(symbol)
+            if not rules:
+                self.logger.error(f"❌ {symbol}: нет instrument rules, ордер запрещен.")
+                return None
+
+            formatted_qty = self._format_qty(qty, entry_price, rules)
+            min_qty = float(rules.get("min_qty") or 0.0)
+            if formatted_qty < min_qty or formatted_qty <= 0:
+                self.logger.error(f"❌ {symbol}: qty {formatted_qty} меньше min_qty {min_qty}")
+                return None
 
             # Для Short цена лимитки должна быть чуть ниже текущей, для Long - чуть выше
             limit_offset = 0.999 if side == "Sell" else 1.001
-            limit_price = round(entry_price * limit_offset, 7 if entry_price < 0.01 else 4)
+            limit_price = self._format_price(entry_price * limit_offset, rules)
+            stop_loss = self._format_price(sl_price, rules)
+            take_profit = self._format_price(tp_price, rules)
+
+            min_notional = float(rules.get("min_notional") or 0.0)
+            notional = formatted_qty * limit_price
+            if min_notional and notional < min_notional:
+                self.logger.error(f"❌ {symbol}: notional {notional:.4f} меньше min_notional {min_notional}")
+                return None
+
+            order_link_id = self._make_order_link_id(symbol, timeframe)
+            if order_link_id in self.order_link_ids:
+                self.logger.error(f"❌ Дубликат orderLinkId {order_link_id}")
+                return None
 
             order_response = self.exchange.session.place_order(
                 category="linear",
@@ -218,22 +315,42 @@ class Executor:
                 orderType="Limit",
                 qty=str(formatted_qty),
                 price=str(limit_price),
-                stopLoss=str(sl_price),
-                takeProfit=str(tp_price),
+                stopLoss=str(stop_loss),
+                takeProfit=str(take_profit),
                 positionIdx=0,
-                timeInForce="GTC"
+                timeInForce="GTC",
+                orderLinkId=order_link_id,
             )
             if order_response.get("retCode") != 0:
                 self.logger.error(f"❌ Bybit отклонил ордер {symbol}: {order_response}")
-                return False
+                return None
 
-            order_id = order_response.get('result', {}).get('orderId', 'N/A')
-            self.logger.info(f"📝 Ордер {symbol} ({side}) размещён (ID: {order_id})")
-            return True
-            
+            order_id = order_response.get('result', {}).get('orderId')
+            status_info = self.exchange.get_order_status(symbol, order_id=order_id, order_link_id=order_link_id)
+            has_position = self.exchange.has_open_position(symbol)
+            order_status = (status_info or {}).get("orderStatus", "")
+            if not has_position and order_status not in {"New", "PartiallyFilled", "Filled", "Created", "Untriggered"}:
+                self.logger.error(f"❌ {symbol}: ордер без подтвержденного статуса: {status_info}")
+                return None
+
+            local_status = "open" if has_position or order_status in {"Filled", "PartiallyFilled"} else "pending_order"
+            self.logger.info(
+                f"📝 Ордер {symbol} ({side}) подтвержден Bybit: ID={order_id}, link={order_link_id}, status={order_status or 'position'}"
+            )
+            return {
+                "order_id": order_id or "",
+                "order_link_id": order_link_id,
+                "size": formatted_qty,
+                "remaining_size": formatted_qty,
+                "entry": limit_price,
+                "sl": stop_loss,
+                "tp": take_profit,
+                "status": local_status,
+            }
+
         except Exception as e:
             self.logger.error(f"❌ Ошибка ордера {symbol}: {e}")
-            return False
+            return None
 
     async def update_positions(self, price_updates: dict):
         for trade in self.active_trades:
@@ -331,3 +448,9 @@ class Executor:
 
         except Exception as e:
             self.logger.error(f"❌ Не удалось отправить отчет с графиком: {e}")
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default

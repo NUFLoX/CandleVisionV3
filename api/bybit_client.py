@@ -37,10 +37,104 @@ class BybitClient:
             self.logger.error(f"❌ Ошибка авторизации Bybit: {e}")
             self.session = None
 
+
+    def get_instrument_rules(self, symbol: str) -> dict | None:
+        """Fetch Bybit linear instrument filters needed before order placement."""
+        if not self.session:
+            return None
+        try:
+            response = self.session.get_instruments_info(category="linear", symbol=symbol)
+            if response.get("retCode") != 0:
+                self.logger.error(f"❌ Ошибка instrument rules для {symbol}: {response}")
+                return None
+            rows = response.get("result", {}).get("list", [])
+            if not rows:
+                self.logger.error(f"❌ Bybit не вернул instrument rules для {symbol}")
+                return None
+            row = rows[0]
+            lot = row.get("lotSizeFilter", {})
+            price = row.get("priceFilter", {})
+            return {
+                "symbol": symbol,
+                "tick_size": str(price.get("tickSize") or "0"),
+                "qty_step": str(lot.get("qtyStep") or "0"),
+                "min_qty": str(lot.get("minOrderQty") or "0"),
+                "min_notional": str(lot.get("minNotionalValue") or "0"),
+            }
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка instrument rules для {symbol}: {e}")
+            return None
+
+    def get_open_orders(self, symbol: str | None = None, order_link_id: str | None = None) -> list[dict]:
+        if not self.session:
+            return []
+        try:
+            kwargs = {"category": "linear"}
+            if symbol:
+                kwargs["symbol"] = symbol
+            if order_link_id:
+                kwargs["orderLinkId"] = order_link_id
+            response = self.session.get_open_orders(**kwargs)
+            if response.get("retCode") != 0:
+                self.logger.error(f"❌ Ошибка open orders: {response}")
+                return []
+            return response.get("result", {}).get("list", []) or []
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка open orders: {e}")
+            return []
+
+    def get_positions(self, symbol: str | None = None) -> list[dict]:
+        if not self.session:
+            return []
+        try:
+            kwargs = {"category": "linear", "settleCoin": "USDT"}
+            if symbol:
+                kwargs = {"category": "linear", "symbol": symbol}
+            response = self.session.get_positions(**kwargs)
+            if response.get("retCode") != 0:
+                self.logger.error(f"❌ Ошибка positions: {response}")
+                return []
+            return response.get("result", {}).get("list", []) or []
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка positions: {e}")
+            return []
+
+    def has_open_position(self, symbol: str) -> bool:
+        for position in self.get_positions(symbol):
+            try:
+                if float(position.get("size") or 0.0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def get_order_status(self, symbol: str, order_id: str | None = None, order_link_id: str | None = None) -> dict | None:
+        orders = self.get_open_orders(symbol=symbol, order_link_id=order_link_id)
+        if order_id:
+            for order in orders:
+                if order.get("orderId") == order_id:
+                    return order
+        if orders:
+            return orders[0]
+        try:
+            kwargs = {"category": "linear", "symbol": symbol, "limit": 20}
+            if order_id:
+                kwargs["orderId"] = order_id
+            if order_link_id:
+                kwargs["orderLinkId"] = order_link_id
+            response = self.session.get_order_history(**kwargs)
+            if response.get("retCode") != 0:
+                return None
+            rows = response.get("result", {}).get("list", []) or []
+            return rows[0] if rows else None
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка order status для {symbol}: {e}")
+            return None
+
     # =================================================================
     # НОВЫЙ МЕТОД ДЛЯ МАКРО-ТРЕКЕРА (СКАЧИВАНИЕ СВЕЧЕЙ)
     # =================================================================
-    async def get_kline(self, symbol: str, interval: str, limit: int = 50, start: int = None):
+    async def get_kline(self, symbol: str, interval: str, limit: int = 50, start: int = None, end: int = None):
         """Асинхронная обертка для получения свечей через pybit v5"""
         if not self.session:
             self.logger.warning("⚠️ Session не инициализирован. Не могу получить свечи.")
@@ -59,6 +153,8 @@ class BybitClient:
             }
             if start is not None:
                 kwargs["start"] = start
+            if end is not None:
+                kwargs["end"] = end
 
             response = await loop.run_in_executor(
                 None, 
