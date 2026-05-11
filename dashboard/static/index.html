@@ -33,6 +33,12 @@
         return <span className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${tones[tone]}`}>{children}</span>;
       }
 
+      const pressureDisplayValue = (strip) => {
+        const valueKeys = new Set(['btc_d', 'usdt_d', 'total3']);
+        const value = valueKeys.has(strip.key) ? strip.value : strip.change_pct;
+        return `${value > 0 && !valueKeys.has(strip.key) ? '+' : ''}${Number(value || 0).toFixed(1)}%`;
+      };
+
       function Card({ title, children, action }) {
         return <section className="glass rounded-2xl p-5 shadow-2xl shadow-black/20">
           <div className="mb-4 flex items-center justify-between gap-3">
@@ -138,7 +144,7 @@
                 {snapshot.pressure_strips.map((strip) => <div key={strip.key}>
                   <div className="mb-1 flex items-center justify-between text-sm">
                     <span className="font-semibold text-slate-200">{strip.label}</span>
-                    <span className={strip.change_pct >= 0 ? 'text-emerald-300' : 'text-red-300'}>{strip.change_pct > 0 ? '+' : ''}{strip.change_pct}%</span>
+                    <span className={strip.change_pct >= 0 ? 'text-emerald-300' : 'text-red-300'}>{pressureDisplayValue(strip)}</span>
                   </div>
                   <div className="h-4 overflow-hidden rounded-full bg-slate-800">
                     <div className={`${strip.key === 'usdt_d' && strip.change_pct > 0 ? 'danger-strip' : 'strip'} h-full rounded-full`} style={{ width: `${strip.value}%` }} />
