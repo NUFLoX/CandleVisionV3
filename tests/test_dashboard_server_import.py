@@ -19,3 +19,11 @@ def test_dashboard_server_has_no_merge_artifacts_and_imports() -> None:
     from dashboard.server import app
 
     assert app.title == "CandleVision Dashboard API"
+
+def test_coin_search_debounces_and_normalizes_query() -> None:
+    html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
+
+    assert "trim().toUpperCase()" in html
+    assert "encodeURIComponent(normalizedQuery)" in html
+    assert "setTimeout(() =>" in html
+    assert "active = false" in html

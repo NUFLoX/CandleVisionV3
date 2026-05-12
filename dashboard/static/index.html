@@ -88,7 +88,20 @@
           return () => { clearInterval(timer); clearInterval(statsTimer); ws.close(); };
         }, []);
 
-        useEffect(() => { setCoinError(''); api(`/api/coin/${coinQuery || 'BTC'}`).then(setCoin).catch((e) => { setCoin(null); setCoinError(e.message); }); }, [coinQuery]);
+        useEffect(() => {
+          const normalizedQuery = (coinQuery || 'BTC').trim().toUpperCase();
+          if (!normalizedQuery) return;
+          let active = true;
+          const timer = setTimeout(() => {
+            setCoinError('');
+            api(`/api/coin/${encodeURIComponent(normalizedQuery)}`)
+              .then((data) => { if (active) setCoin(data); })
+              .catch((e) => { if (active) { setCoin(null); setCoinError(e.message); } });
+          }, 350);
+          return () => { active = false; clearTimeout(timer); };
+        }, [coinQuery]);
+
+        const outcomesBySignal = useMemo(() => Object.fromEntries(outcomes.map((item) => [item.signal_id, item])), [outcomes]);
 
         const outcomesBySignal = useMemo(() => Object.fromEntries(outcomes.map((item) => [item.signal_id, item])), [outcomes]);
 
