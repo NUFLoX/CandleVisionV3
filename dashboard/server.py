@@ -210,7 +210,6 @@ def create_app() -> FastAPI:
         return SignalOutcomeStore().stats()
 
     @app.post("/api/signal-outcomes/refresh")
-    async def refresh_signal_stats(_: None = Depends(verify_ingest_auth)):
         snapshot = await store.snapshot()
         outcomes = await refresh_signal_outcomes(snapshot.signals)
         stats = SignalOutcomeStore().stats()
