@@ -7,14 +7,14 @@ import time
 from config.settings import BYBIT_WS_PUBLIC_URL
 
 class OrderBookStream:
-    def __init__(self, testnet=None, executor=None):
+    def __init__(self, testnet=None, executor=None, signal_queue=None):
         self.logger = logging.getLogger("CandleVision.WS")
         self.ws_url = BYBIT_WS_PUBLIC_URL if testnet is None else ("wss://stream-testnet.bybit.com/v5/public/linear" if testnet else "wss://stream.bybit.com/v5/public/linear")
         self.ws = None
         self.symbols = []
         
-        # Ссылка на Экзекутор для отправки снайперских сигналов
-        self.executor = executor 
+        # Снайпер больше не вызывает Executor напрямую: только кладет кандидат в очередь сигналов.
+        self.signal_queue = signal_queue or getattr(executor, "queue", None)
         
         # Хранилище стаканов
         self.orderbooks = {} 
@@ -128,7 +128,7 @@ class OrderBookStream:
                         if price >= res_level and side == 'Buy' and volume_usd > 10_000:
                             self.logger.critical(f"💥 ПРОБОЙ НАКОПЛЕНИЯ {symbol}! Уровень {res_level} снесен китом (Объем: ${volume_usd:,.0f})!")
                             
-                            if self.executor:
+                            if self.signal_queue:
                                 risk = max(price - (res_level * 0.995), price * 0.003)
                                 signal_data = {
                                     "symbol": symbol,
@@ -140,10 +140,9 @@ class OrderBookStream:
                                     "timeframe": "ws",
                                     "reasons": ["SmartMoney Breakout", "WS Sniper"],
                                 }
-                                # Моментальный выстрел!
-                                asyncio.create_task(self.executor.process_signal_async(signal_data))
+                                self.signal_queue.put_nowait(signal_data)
                             else:
-                                self.logger.error("❌ Экзекутор не подключен к WS! Выстрел вхолостую.")
+                                self.logger.error("❌ Очередь сигналов не подключена к WS sniper; сигнал не отправлен.")
                             
                             # Убираем цель из памяти, чтобы не спамить ордерами
                             del self.sniper_targets[symbol]

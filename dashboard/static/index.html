@@ -33,6 +33,12 @@
         return <span className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${tones[tone]}`}>{children}</span>;
       }
 
+      const pressureDisplayValue = (strip) => {
+        const valueKeys = new Set(['btc_d', 'usdt_d', 'total3']);
+        const value = valueKeys.has(strip.key) ? strip.value : strip.change_pct;
+        return `${value > 0 && !valueKeys.has(strip.key) ? '+' : ''}${Number(value || 0).toFixed(1)}%`;
+      };
+
       function Card({ title, children, action }) {
         return <section className="glass rounded-2xl p-5 shadow-2xl shadow-black/20">
           <div className="mb-4 flex items-center justify-between gap-3">
@@ -49,19 +55,53 @@
         const [coinQuery, setCoinQuery] = useState('BTC');
         const [coin, setCoin] = useState(null);
         const [coinError, setCoinError] = useState('');
+        const [stats, setStats] = useState(null);
+        const [outcomes, setOutcomes] = useState([]);
+        const [statsError, setStatsError] = useState('');
 
         const load = async () => setSnapshot(await api('/api/snapshot'));
+        const loadStats = async () => {
+          const [summary, rows] = await Promise.all([api('/api/signal-stats'), api('/api/signal-outcomes?limit=500')]);
+          setStats(summary);
+          setOutcomes(rows);
+          setStatsError('');
+        };
         const refreshLive = async () => setSnapshot(await api('/api/refresh', { method: 'POST' }));
+        const refreshStats = async () => {
+          try {
+            const result = await api('/api/signal-outcomes/refresh', { method: 'POST' });
+            setStats(result.stats);
+            setOutcomes(await api('/api/signal-outcomes?limit=500'));
+            setStatsError('');
+          } catch (e) {
+            setStatsError(e.message);
+          }
+        };
         useEffect(() => {
           load();
+          loadStats().catch((e) => setStatsError(e.message));
           const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
           const ws = new WebSocket(`${wsProtocol}://${location.host}/ws`);
           ws.onmessage = () => load();
           const timer = setInterval(load, 15000);
-          return () => { clearInterval(timer); ws.close(); };
+          const statsTimer = setInterval(() => loadStats().catch((e) => setStatsError(e.message)), 30000);
+          return () => { clearInterval(timer); clearInterval(statsTimer); ws.close(); };
         }, []);
 
-        useEffect(() => { setCoinError(''); api(`/api/coin/${coinQuery || 'BTC'}`).then(setCoin).catch((e) => { setCoin(null); setCoinError(e.message); }); }, [coinQuery]);
+        useEffect(() => {
+          const normalizedQuery = (coinQuery || 'BTC').trim().toUpperCase();
+          if (!normalizedQuery) return;
+          let active = true;
+          const timer = setTimeout(() => {
+            setCoinError('');
+            api(`/api/coin/${encodeURIComponent(normalizedQuery)}`)
+              .then((data) => { if (active) setCoin(data); })
+              .catch((e) => { if (active) { setCoin(null); setCoinError(e.message); } });
+          }, 350);
+          return () => { active = false; clearTimeout(timer); };
+        }, [coinQuery]);
+
+        const outcomesBySignal = useMemo(() => Object.fromEntries(outcomes.map((item) => [item.signal_id, item])), [outcomes]);
 
         const filteredSignals = useMemo(() => {
           const signals = snapshot?.signals || [];
@@ -115,7 +155,7 @@
                 {snapshot.pressure_strips.map((strip) => <div key={strip.key}>
                   <div className="mb-1 flex items-center justify-between text-sm">
                     <span className="font-semibold text-slate-200">{strip.label}</span>
-                    <span className={strip.change_pct >= 0 ? 'text-emerald-300' : 'text-red-300'}>{strip.change_pct > 0 ? '+' : ''}{strip.change_pct}%</span>
+                    <span className={strip.change_pct >= 0 ? 'text-emerald-300' : 'text-red-300'}>{pressureDisplayValue(strip)}</span>
                   </div>
                   <div className="h-4 overflow-hidden rounded-full bg-slate-800">
                     <div className={`${strip.key === 'usdt_d' && strip.change_pct > 0 ? 'danger-strip' : 'strip'} h-full rounded-full`} style={{ width: `${strip.value}%` }} />
@@ -129,9 +169,12 @@
           <Card title="Окно сигналов" action={<SignalFilters filters={filters} setFilters={setFilters} />}>
             <div className="grid gap-4 lg:grid-cols-3">
               {filteredSignals.length === 0 && <p className="text-sm text-slate-500">Реальных сигналов пока нет. Отправьте сигнал через /api/ingest/signal или дождитесь сканера.</p>}
-              {filteredSignals.map((signal) => <SignalCard key={signal.id} signal={signal} />)}
+              {filteredSignals.map((signal) => <SignalCard key={signal.id} signal={signal} outcome={outcomesBySignal[signal.id]} />)}
             </div>
           </Card>
+
+
+          <SignalPerformancePanel stats={stats} outcomes={outcomes} error={statsError} onRefresh={refreshStats} />
 
           <section className="grid gap-6 xl:grid-cols-[.9fr_1.1fr]">
             <Card title="Поиск монеты" action={<input className="w-32 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-cyan-400" value={coinQuery} onChange={(e) => setCoinQuery(e.target.value)} placeholder="BTC" />}>
@@ -171,10 +214,11 @@
         </select>)}</div>;
       }
 
-      function SignalCard({ signal }) {
+      function SignalCard({ signal, outcome }) {
         const tone = signal.strength === 'Strong' ? 'green' : signal.strength === 'Medium' ? 'amber' : 'slate';
+        const outcomeTone = outcome?.outcome === 'tp' ? 'green' : outcome?.outcome === 'sl' ? 'red' : outcome?.outcome === 'ambiguous' ? 'amber' : 'slate';
         return <article className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-          <div className="mb-3 flex items-start justify-between gap-3"><div><h3 className="text-xl font-black">{signal.symbol}</h3><p className="text-sm text-slate-500">{signal.exchange} · TF: {signal.timeframe}</p></div><Badge tone={tone}>{signal.score}</Badge></div>
+          <div className="mb-3 flex items-start justify-between gap-3"><div><h3 className="text-xl font-black">{signal.symbol}</h3><p className="text-sm text-slate-500">{signal.exchange} · TF: {signal.timeframe}</p></div><div className="flex flex-col items-end gap-2"><Badge tone={tone}>{signal.score}</Badge>{outcome && <Badge tone={outcomeTone}>{outcome.outcome.toUpperCase()} · {outcome.r_multiple}R</Badge>}</div></div>
           <div className="grid grid-cols-2 gap-2 text-sm text-slate-300">
             <span>Type: <b>{signal.signal_type}</b></span><span>Status: <b>{signal.status}</b></span>
             <span>Entry: <b>{signal.entry}</b></span><span>SL: <b>{signal.stop_loss}</b></span>
@@ -182,6 +226,44 @@
           </div>
           <p className="mt-3 rounded-xl bg-slate-900 p-3 text-sm text-slate-400">{signal.reason}</p>
         </article>;
+      }
+
+
+      function SignalPerformancePanel({ stats, outcomes, error, onRefresh }) {
+        const cards = [
+          ['Signals', stats?.total ?? 0],
+          ['Win rate', `${(((stats?.win_rate ?? 0) * 100).toFixed(1))}%`],
+          ['Expectancy', `${(stats?.expectancy_r ?? 0).toFixed(2)}R`],
+          ['Total R', `${(stats?.total_r ?? 0).toFixed(2)}R`],
+        ];
+        return <Card title="Signal Performance" action={<button onClick={onRefresh} className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-400/20">Refresh stats</button>}>
+          {error && <p className="mb-4 rounded-xl border border-red-400/20 bg-red-400/10 p-3 text-sm text-red-200">{error}</p>}
+          <div className="grid gap-3 md:grid-cols-4">{cards.map(([label, value]) => <div key={label} className="rounded-xl bg-slate-950/70 p-4"><p className="text-xs uppercase tracking-widest text-slate-500">{label}</p><p className="mt-1 text-2xl font-black">{value}</p></div>)}</div>
+          <div className="mt-5 grid gap-4 lg:grid-cols-2">
+            <BreakdownTable title="By symbol" rows={stats?.by_symbol || []} labelKey="symbol" />
+            <BreakdownTable title="By timeframe" rows={stats?.by_timeframe || []} labelKey="timeframe" />
+            <BreakdownTable title="By signal type" rows={stats?.by_signal_type || []} labelKey="signal_type" />
+            <BreakdownTable title="By outcome" rows={stats?.by_outcome || []} labelKey="outcome" />
+          </div>
+          <div className="mt-5 overflow-auto rounded-xl border border-slate-800">
+            <table className="min-w-full text-left text-sm">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Signal</th><th className="px-3 py-2">Outcome</th><th className="px-3 py-2">R</th><th className="px-3 py-2">Bars</th></tr></thead>
+              <tbody>{outcomes.slice(0, 8).map((item) => <tr key={item.signal_id} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{item.symbol} · {item.timeframe}</td><td className="px-3 py-2">{item.outcome}</td><td className="px-3 py-2">{item.r_multiple}</td><td className="px-3 py-2">{item.bars_checked}</td></tr>)}</tbody>
+            </table>
+            {outcomes.length === 0 && <p className="p-4 text-sm text-slate-500">Нет рассчитанных исходов. Нажмите Refresh stats после появления сигналов.</p>}
+          </div>
+        </Card>;
+      }
+
+      function BreakdownTable({ title, rows, labelKey }) {
+        return <div className="overflow-auto rounded-xl border border-slate-800">
+          <div className="bg-slate-900 px-3 py-2 text-sm font-bold">{title}</div>
+          <table className="min-w-full text-left text-xs">
+            <thead className="text-slate-500"><tr><th className="px-3 py-2">Name</th><th className="px-3 py-2">N</th><th className="px-3 py-2">WR</th><th className="px-3 py-2">Avg R</th></tr></thead>
+            <tbody>{rows.slice(0, 8).map((row) => <tr key={row[labelKey]} className="border-t border-slate-800"><td className="px-3 py-2">{row[labelKey]}</td><td className="px-3 py-2">{row.total}</td><td className="px-3 py-2">{((row.win_rate || 0) * 100).toFixed(1)}%</td><td className="px-3 py-2">{row.avg_r}</td></tr>)}</tbody>
+          </table>
+          {rows.length === 0 && <p className="p-3 text-xs text-slate-500">No data</p>}
+        </div>;
       }
 
       function CoinAnalytics({ coin }) {
