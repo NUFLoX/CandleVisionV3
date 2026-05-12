@@ -210,11 +210,6 @@ def create_app() -> FastAPI:
         return SignalOutcomeStore().stats()
 
     @app.post("/api/signal-outcomes/refresh")
-    codex/conduct-deep-repository-audit-and-implement-changes-kyu74x
-    async def refresh_signal_stats(_: None = Depends(verify_ingest_auth)):
-=======
-    async def refresh_signal_stats():
-        main
         snapshot = await store.snapshot()
         outcomes = await refresh_signal_outcomes(snapshot.signals)
         stats = SignalOutcomeStore().stats()
