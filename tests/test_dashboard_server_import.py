@@ -20,7 +20,6 @@ def test_dashboard_server_has_no_merge_artifacts_and_imports() -> None:
 
     assert app.title == "CandleVision Dashboard API"
 
-
 def test_coin_search_debounces_and_normalizes_query() -> None:
     html = Path("dashboard/static/index.html").read_text(encoding="utf-8")
 
