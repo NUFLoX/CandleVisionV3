@@ -47,10 +47,22 @@ class BybitRestClient:
         result = await self._get("/v5/market/tickers", {"category": "linear"})
         return result.get("list", [])
 
-    async def fetch_klines(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    async def fetch_klines(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = 200,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> pd.DataFrame:
+        params: dict[str, Any] = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
+        if start is not None:
+            params["start"] = start
+        if end is not None:
+            params["end"] = end
         result = await self._get(
             "/v5/market/kline",
-            {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit},
+            params,
         )
         rows = result.get("list", [])
         if not rows:
