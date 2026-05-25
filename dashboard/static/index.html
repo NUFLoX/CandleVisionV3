@@ -102,9 +102,7 @@
         }, [coinQuery]);
 
         const outcomesBySignal = useMemo(() => Object.fromEntries(outcomes.map((item) => [item.signal_id, item])), [outcomes]);
-
-        const outcomesBySignal = useMemo(() => Object.fromEntries(outcomes.map((item) => [item.signal_id, item])), [outcomes]);
-
+        
         const filteredSignals = useMemo(() => {
           const signals = snapshot?.signals || [];
           return signals.filter((s) =>
