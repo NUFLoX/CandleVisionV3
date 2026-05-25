@@ -56,6 +56,7 @@ class AccumulationRunner:
                 limit=self.settings.realtime_symbols_limit,
                 min_notional_24h=self.settings.min_notional_24h,
                 min_last_price=self.settings.min_last_price,
+                market_categories=self.settings.market_categories,
                 allowlist=self.settings.symbols_allowlist,
                 blocklist=self.settings.symbols_blocklist,
             )
@@ -64,6 +65,7 @@ class AccumulationRunner:
                 limit=self.settings.macro_symbols_limit,
                 min_notional_24h=self.settings.min_notional_24h,
                 min_last_price=self.settings.min_last_price,
+                market_categories=self.settings.market_categories,
                 allowlist=self.settings.symbols_allowlist,
                 blocklist=self.settings.symbols_blocklist,
             )

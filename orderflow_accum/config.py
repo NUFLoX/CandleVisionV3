@@ -29,6 +29,9 @@ class Settings:
     macro_symbols_limit: int = int(os.getenv("ACC_MACRO_SYMBOLS_LIMIT", "50"))
     realtime_scan_every_seconds: int = int(os.getenv("ACC_SCAN_EVERY_SECONDS", "12"))
     realtime_intervals: list[str] = field(default_factory=lambda: _csv_env("ACC_REALTIME_INTERVALS", "1,5,15"))
+    market_categories: list[str] = field(default_factory=lambda: _csv_env("ACC_MARKET_CATEGORIES", "LINEAR"))
+
+
     macro_every_seconds: int = int(os.getenv("ACC_MACRO_EVERY_SECONDS", "1800"))
     book_depth: int = int(os.getenv("ACC_BOOK_DEPTH", "20"))
 
