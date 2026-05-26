@@ -188,6 +188,8 @@ def create_app() -> FastAPI:
         try:
             rows = conn.execute(
                 "SELECT reasons_last, score_last, timeframe, kind, source, status, max_gain_pct, max_drawdown_pct FROM signals"
+
+
             ).fetchall()
         finally:
             conn.close()
