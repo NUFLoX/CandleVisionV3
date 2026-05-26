@@ -437,6 +437,8 @@ class RealtimeAccumulationEngine:
         # Separate score from trade-ready logic: this block identifies quiet accumulation
         # before a breakout, without requiring breakout confirmation.
         range_width_pct = range_compression_ratio
+        range_width_pct = range_compression_ratio
+        range_width_pct = (resistance - support) / max(mid, 1e-12) * 100.0
         body_last_20 = float(pd.to_numeric((df.tail(20)["close"] - df.tail(20)["open"]).abs(), errors="coerce").mean())
         body_prev_20 = float(pd.to_numeric((df.tail(40).head(20)["close"] - df.tail(40).head(20)["open"]).abs(), errors="coerce").mean())
         body_compression_ratio = body_last_20 / max(body_prev_20, 1e-12)
@@ -472,6 +474,12 @@ class RealtimeAccumulationEngine:
         if range_duration_minutes >= 120:
             pre_score += 1.0
             pre_reasons.append(f"range_duration_minutes={range_duration_minutes}")
+        if sell_notional >= self.settings.effective_min_sell_pressure_notional and delta_notional > -sell_notional * 0.6:
+            pre_score += 2.0
+            pre_reasons.append("sell_pressure_absorbed")
+        if support_holds >= 4:
+            pre_score += 1.0
+            pre_reasons.append(f"support_defended={support_holds}")
         if float(last["close_pos"]) >= 0.56:
             pre_score += 1.0
             pre_reasons.append("close_in_upper_half")
@@ -546,6 +554,8 @@ class RealtimeAccumulationEngine:
                         "wick_to_body_ratio": round(wick_to_body_ratio, 4),
                         "atr_compression": round(atr_compression, 4),
                         "turnover_displacement_ratio": round(turnover_displacement_ratio, 4),
+                        "body_compression_ratio": round(body_compression_ratio, 4),
+                        "atr_compression": round(atr_compression, 4),
                         "delta_notional": round(delta_notional, 2),
                         "buy_notional": round(buy_notional, 2),
                         "sell_notional": round(sell_notional, 2),
