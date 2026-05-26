@@ -98,3 +98,4 @@ class Scout:
             for tf in SCOUT_SCAN_TIMEFRAMES:
                 await self.run_scan_async(symbol, tf)
                 await asyncio.sleep(0.2)
+            self.logger.info("✅ Цикл сканирования завершен.")
