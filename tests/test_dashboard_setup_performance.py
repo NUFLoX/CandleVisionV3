@@ -11,6 +11,7 @@ def test_setup_performance_endpoint_declared_and_returns_groups() -> None:
     tree = ast.parse(source)
 
 
+
     has_route = '"/api/setup-performance"' in source
     assert has_route
 

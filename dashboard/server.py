@@ -191,6 +191,7 @@ def create_app() -> FastAPI:
                 "SELECT reasons_last, score_last, timeframe, kind, source, status, max_gain_pct, max_drawdown_pct FROM signals"
 
                 "SELECT reasons_last, score_last, timeframe, status, max_gain_pct, max_drawdown_pct FROM signals"
+
             ).fetchall()
         finally:
             conn.close()
@@ -252,6 +253,7 @@ def create_app() -> FastAPI:
             for group in (score_stats[score_b], tf_stats[tf], kind_stats[kind], source_stats[source]):
 
             for group in (score_stats[score_b], tf_stats[tf]):
+
 
 
                 group["total"] += 1
