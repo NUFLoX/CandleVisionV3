@@ -100,11 +100,13 @@ class SignalStore:
 
 
 
+
                 status TEXT NOT NULL
             )
             """
         )
         
+
 
 
 
