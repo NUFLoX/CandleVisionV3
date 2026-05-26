@@ -11,6 +11,7 @@ from orderflow_accum.config import Settings
 from orderflow_accum.signal_store import SignalStore
 
 
+
 ACTIVE_STATUSES = {"WATCHING", "ACCUMULATION", "PRE_IMPULSE", "BREAKOUT_PRESSURE", "PENDING"}
 
 
@@ -111,7 +112,6 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                     )
 
                 conn.execute("UPDATE signals SET status='EXPIRED', outcome='EXPIRED', outcome_checked_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), row["id"]))
-
                 updated += 1
                 continue
 

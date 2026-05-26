@@ -94,7 +94,7 @@
           const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [] })), 30000);
           return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(perfTimer); ws.close(); };
           return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); ws.close(); };
-         
+
         }, []);
 
         useEffect(() => {
