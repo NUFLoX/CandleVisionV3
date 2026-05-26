@@ -60,9 +60,6 @@
         const [statsError, setStatsError] = useState('');
         const [activeSetups, setActiveSetups] = useState([]);
         const [setupPerf, setSetupPerf] = useState({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [] });
-        const [setupPerf, setSetupPerf] = useState({ by_reason: [], by_score_bucket: [], by_timeframe: [] });
-
-
         const load = async () => setSnapshot(await api('/api/snapshot'));
         const loadStats = async () => {
           const [summary, rows] = await Promise.all([api('/api/signal-stats'), api('/api/signal-outcomes?limit=500')]);
@@ -88,7 +85,6 @@
           loadStats().catch((e) => setStatsError(e.message));
           loadActiveSetups().catch(() => setActiveSetups([]));
           loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [] }));
-          loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [] }));
           const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
           const ws = new WebSocket(`${wsProtocol}://${location.host}/ws`);
           ws.onmessage = () => load();
@@ -97,9 +93,6 @@
           const setupsTimer = setInterval(() => loadActiveSetups().catch(() => setActiveSetups([])), 30000);
           const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [] })), 30000);
           return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(perfTimer); ws.close(); };
-          const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [] })), 30000);
-          return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(perfTimer); ws.close(); };
-          return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); ws.close(); };
         }, []);
 
         useEffect(() => {

@@ -280,6 +280,9 @@ class Executor:
 
     def _place_limit_order(self, symbol, side, qty, entry_price, sl_price, tp_price, timeframe="1m"):
         try:
+            if not trading_enabled():
+                self.logger.warning(f"🛡️ trading_enabled=false. Пропускаем _place_limit_order для {symbol}")
+                return None
             rules = self._instrument_rules(symbol)
             if not rules:
                 self.logger.error(f"❌ {symbol}: нет instrument rules, ордер запрещен.")

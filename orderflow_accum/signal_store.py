@@ -144,12 +144,6 @@ class SignalStore:
                 _utc_now(),
             ),
         )
-                status TEXT NOT NULL
-            )
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_tf ON signals(symbol, timeframe)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
         self.conn.commit()
 
     def upsert_signal(self, signal: Any, *, market: str = "linear") -> UpsertResult:

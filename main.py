@@ -123,7 +123,7 @@ async def main():
                 if hasattr(ws_stream, 'ws') and ws_stream.ws:
                     try:
                         await ws_stream.ws.close()
-                    except:
+                    except Exception:
                         pass
                         
                 await asyncio.sleep(10) # Пауза перед новой попыткой подключения

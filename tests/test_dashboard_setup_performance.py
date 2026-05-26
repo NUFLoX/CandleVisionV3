@@ -8,7 +8,6 @@ def test_setup_performance_endpoint_declared_and_returns_groups() -> None:
     src_path = Path(__file__).resolve().parents[1] / "dashboard" / "server.py"
     source = src_path.read_text(encoding="utf-8")
     ast.parse(source)
-    tree = ast.parse(source)
 
     has_route = '"/api/setup-performance"' in source
     assert has_route

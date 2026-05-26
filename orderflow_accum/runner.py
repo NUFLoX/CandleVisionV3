@@ -238,9 +238,10 @@ class AccumulationRunner:
         self.csv_logger.append(signal)
         self.ui.update_session(macro=self._counts["macro"], orderflow=self._counts["orderflow"])
         self.ui.print_signal(signal)
-        await self.dashboard.post_signal(signal)
         if not upsert.should_notify:
             return
+        await self.dashboard.post_signal(signal)
+       
         if upsert.status_changed:
             await self.dashboard.post_log(
                 f"{signal.symbol} {signal.meta.get('tf', 'na')}: stage {upsert.from_status or 'NEW'} -> {upsert.to_status}",
