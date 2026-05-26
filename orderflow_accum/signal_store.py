@@ -71,6 +71,7 @@ class SignalStore:
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL,
                 repeat_count INTEGER NOT NULL,
+
                 status TEXT NOT NULL,
                 outcome TEXT,
                 outcome_checked_at TEXT,
@@ -95,6 +96,21 @@ class SignalStore:
                 cur.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
             except sqlite3.OperationalError:
                 pass
+
+
+
+
+
+                status TEXT NOT NULL
+            )
+            """
+        )
+        
+
+
+
+
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_tf ON signals(symbol, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
         self.conn.commit()
