@@ -34,6 +34,12 @@ class AccumulationRunner:
         self.dashboard = DashboardIngestClient()
         self._cooldowns: dict[str, float] = {}
         self._counts = {"macro": 0, "orderflow": 0}
+        self._preimpulse_kinds = {
+            "ACCUMULATION_WATCH",
+            "ABSORPTION_ZONE",
+            "PRE_IMPULSE_ZONE",
+            "BREAKOUT_PRESSURE",
+        }
 
     def _filter_symbols(self, symbols: list[str]) -> list[str]:
         out: list[str] = []
@@ -56,6 +62,7 @@ class AccumulationRunner:
                 limit=self.settings.realtime_symbols_limit,
                 min_notional_24h=self.settings.min_notional_24h,
                 min_last_price=self.settings.min_last_price,
+                market_categories=self.settings.market_categories,
                 allowlist=self.settings.symbols_allowlist,
                 blocklist=self.settings.symbols_blocklist,
             )
@@ -64,6 +71,7 @@ class AccumulationRunner:
                 limit=self.settings.macro_symbols_limit,
                 min_notional_24h=self.settings.min_notional_24h,
                 min_last_price=self.settings.min_last_price,
+                market_categories=self.settings.market_categories,
                 allowlist=self.settings.symbols_allowlist,
                 blocklist=self.settings.symbols_blocklist,
             )
@@ -113,18 +121,30 @@ class AccumulationRunner:
 
     async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[str]) -> None:
         self.logger.info("Realtime accumulation loop started for %s symbols", len(symbols))
+        preimpulse_intervals = {value.upper() for value in self.settings.preimpulse_intervals}
+        realtime_intervals = {value.upper() for value in self.settings.realtime_intervals}
         while True:
             await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "realtime", "symbols": len(symbols)})
             for symbol in symbols:
                 try:
-                    df = await rest.fetch_klines(symbol, interval="1", limit=180)
-                    state = stream.get_state(symbol)
-                    signals = self.realtime_engine.analyze(symbol, df, state)
-                    if not signals:
-                        reason, score, metrics = self.realtime_engine.diagnose(symbol, df, state)
-                        self.rejection_logger.append("orderflow", symbol, reason, score, metrics)
-                    for signal in signals:
-                        await self._emit_signal(rest, signal)
+                    for interval in self.settings.realtime_intervals:
+                        df = await rest.fetch_klines(symbol, interval=interval, limit=180)
+                        state = stream.get_state(symbol)
+                        signals = self.realtime_engine.analyze(symbol, df, state)
+                        if not signals:
+                            reason, score, metrics = self.realtime_engine.diagnose(symbol, df, state)
+                            metrics = dict(metrics or {})
+                            metrics["tf"] = interval
+                            self.rejection_logger.append("orderflow", symbol, reason, score, metrics)
+                        for signal in signals:
+                            interval_u = str(interval).upper()
+                            is_preimpulse = signal.kind in self._preimpulse_kinds
+                            if is_preimpulse and interval_u not in preimpulse_intervals:
+                                continue
+                            if not is_preimpulse and interval_u not in realtime_intervals:
+                                continue
+                            signal.meta["tf"] = interval
+                            await self._emit_signal(rest, signal)
                 except Exception as exc:
                     self.logger.warning("Realtime scan failed for %s: %r", symbol, exc)
                 await asyncio.sleep(0.05)
@@ -161,7 +181,7 @@ class AccumulationRunner:
                 interval = str(signal.meta.get("tf") or "240")
                 bars = self.settings.chart_bars_macro
             else:
-                interval = "1"
+                interval = str(signal.meta.get("tf") or "1")
                 bars = self.settings.chart_bars_realtime
             df = await rest.fetch_klines(signal.symbol, interval=interval, limit=bars)
             if df.empty:
@@ -192,7 +212,7 @@ class AccumulationRunner:
     async def _emit_signal(self, rest: BybitRestClient, signal) -> None:
         now = time.time()
         cooldown = self._cooldown_seconds(signal)
-        cooldown_key = signal.dedupe_key()
+        cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
         last_sent = self._cooldowns.get(cooldown_key, 0.0)
         if now - last_sent < cooldown:
             return
@@ -227,6 +247,7 @@ class AccumulationRunner:
                 signal.reasons,
                 photo_path=chart_path,
                 title=signal.kind,
+                timeframe=str(signal.meta.get("tf", "")),
             )
         except Exception as exc:
             self.logger.warning("Signal notify failed for %s: %r", signal.symbol, exc)

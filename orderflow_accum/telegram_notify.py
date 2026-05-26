@@ -74,18 +74,37 @@ class TelegramNotifier:
         reasons: list[str] | tuple[str, ...] | None = None,
         photo_path: str | None = None,
         title: str | None = None,
+        timeframe: str | None = None,
     ) -> None:
         reasons_text = ", ".join(reasons or []) or "n/a"
         header = title or "Accumulation signal"
-        text = (
-            f"📡 <b>{header}</b>\n"
-            f"<b>{symbol}</b> | <b>{side}</b>\n"
-            f"Entry: <code>{entry:.8f}</code>\n"
-            f"SL: <code>{stop_loss:.8f}</code>\n"
-            f"TP1: <code>{take_profit_1:.8f}</code>\n"
-            f"TP2: <code>{take_profit_2:.8f}</code>\n"
-            f"Reasons: {reasons_text}"
-        )
+        tf_text = str(timeframe or "").strip().lower()
+        preimpulse_headers = {
+            "ACCUMULATION_WATCH",
+            "ABSORPTION_ZONE",
+            "PRE_IMPULSE_ZONE",
+            "BREAKOUT_PRESSURE",
+        }
+        if (title or "").upper() in preimpulse_headers:
+            text = (
+                f"🟡 <b>{header}</b>\n"
+                f"Symbol: <b>{symbol}</b>\n"
+                f"TF: <b>{tf_text or 'n/a'}</b>\n"
+                f"Status: Compression + Absorption\n\n"
+                f"Reasons: {reasons_text}\n\n"
+                f"Next trigger: break above range high with volume"
+            )
+        else:
+            text = (
+                f"📡 <b>{header}</b>\n"
+                f"<b>{symbol}</b> | <b>{side}</b>\n"
+                f"TF: <b>{tf_text or 'n/a'}</b>\n"
+                f"Entry: <code>{entry:.8f}</code>\n"
+                f"SL: <code>{stop_loss:.8f}</code>\n"
+                f"TP1: <code>{take_profit_1:.8f}</code>\n"
+                f"TP2: <code>{take_profit_2:.8f}</code>\n"
+                f"Reasons: {reasons_text}"
+            )
         if photo_path:
             await self.send_photo(photo_path, text)
         else:
