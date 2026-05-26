@@ -71,6 +71,79 @@ class SignalStore:
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL,
                 repeat_count INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                outcome TEXT,
+                outcome_checked_at TEXT,
+                time_to_tp1_minutes REAL,
+                time_to_tp2_minutes REAL,
+                time_to_sl_minutes REAL,
+                max_gain_pct REAL,
+                max_drawdown_pct REAL
+            )
+            """
+        )
+        for col, typ in (
+            ("outcome", "TEXT"),
+            ("outcome_checked_at", "TEXT"),
+            ("time_to_tp1_minutes", "REAL"),
+            ("time_to_tp2_minutes", "REAL"),
+            ("time_to_sl_minutes", "REAL"),
+            ("max_gain_pct", "REAL"),
+            ("max_drawdown_pct", "REAL"),
+        ):
+            try:
+                cur.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_tf ON signals(symbol, timeframe)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_key TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                score_last REAL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_events_key ON signal_events(signal_key, created_at)")
+        self.conn.commit()
+
+    def add_event(
+        self,
+        *,
+        signal_key: str,
+        symbol: str,
+        timeframe: str,
+        event_type: str,
+        from_status: str | None,
+        to_status: str | None,
+        score_last: float | None = None,
+    ) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO signal_events (
+                signal_key, symbol, timeframe, event_type, from_status, to_status, score_last, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal_key,
+                symbol,
+                timeframe,
+                event_type,
+                from_status,
+                to_status,
+                score_last,
+                _utc_now(),
+            ),
+        )
                 status TEXT NOT NULL
             )
             """
