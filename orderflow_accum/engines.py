@@ -437,11 +437,8 @@ class RealtimeAccumulationEngine:
         # Separate score from trade-ready logic: this block identifies quiet accumulation
         # before a breakout, without requiring breakout confirmation.
         range_width_pct = range_compression_ratio
-
-
         range_width_pct = range_compression_ratio
         range_width_pct = (resistance - support) / max(mid, 1e-12) * 100.0
-
         body_last_20 = float(pd.to_numeric((df.tail(20)["close"] - df.tail(20)["open"]).abs(), errors="coerce").mean())
         body_prev_20 = float(pd.to_numeric((df.tail(40).head(20)["close"] - df.tail(40).head(20)["open"]).abs(), errors="coerce").mean())
         body_compression_ratio = body_last_20 / max(body_prev_20, 1e-12)
