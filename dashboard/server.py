@@ -182,12 +182,17 @@ def create_app() -> FastAPI:
     async def setup_performance():
         if not SIGNALS_DB_PATH.exists():
             return {"by_reason": [], "by_score_bucket": [], "by_timeframe": [], "by_kind": [], "by_source": []}
+            return {"by_reason": [], "by_score_bucket": [], "by_timeframe": []}
+
 
         conn = sqlite3.connect(str(SIGNALS_DB_PATH))
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
                 "SELECT reasons_last, score_last, timeframe, kind, source, status, max_gain_pct, max_drawdown_pct FROM signals"
+
+                "SELECT reasons_last, score_last, timeframe, status, max_gain_pct, max_drawdown_pct FROM signals"
+
             ).fetchall()
         finally:
             conn.close()
@@ -217,6 +222,7 @@ def create_app() -> FastAPI:
         kind_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
         source_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
 
+
         for row in rows:
             outcome = wl(str(row["status"] or ""))
             score = float(row["score_last"] or 0.0)
@@ -243,7 +249,11 @@ def create_app() -> FastAPI:
                 elif outcome == "SL":
                     entry["sl"] += 1
 
+
             for group in (score_stats[score_b], tf_stats[tf], kind_stats[kind], source_stats[source]):
+
+            for group in (score_stats[score_b], tf_stats[tf]):
+
                 group["total"] += 1
                 group["mfe"] += mfe
                 group["mae"] += mae
