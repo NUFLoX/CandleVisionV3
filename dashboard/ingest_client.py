@@ -151,6 +151,10 @@ def _strength_from_score(score: float) -> str:
 
 def _signal_type_from_signal(source: str, kind: str) -> str:
     text = f"{source} {kind}".upper()
+    if any(phase in text for phase in ("ACCUMULATION_WATCH", "ABSORPTION_ZONE", "PRE_IMPULSE_ZONE")):
+        return "Watchlist"
+    if "BREAKOUT_PRESSURE" in text:
+        return "Confirmed"
     if "EARLY" in text or "BASE" in text:
         return "Watchlist"
     if "BREAKOUT" in text or "READY" in text or "CONFIRMED" in text:

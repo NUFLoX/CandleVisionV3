@@ -214,9 +214,7 @@ class AccumulationRunner:
     async def _emit_signal(self, rest: BybitRestClient, signal) -> None:
         now = time.time()
         cooldown = self._cooldown_seconds(signal)
-
-        cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
-
+        
         cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
 
         last_sent = self._cooldowns.get(cooldown_key, 0.0)
@@ -253,6 +251,7 @@ class AccumulationRunner:
                 signal.reasons,
                 photo_path=chart_path,
                 title=signal.kind,
+                timeframe=str(signal.meta.get("tf", "")),
             )
         except Exception as exc:
             self.logger.warning("Signal notify failed for %s: %r", signal.symbol, exc)
