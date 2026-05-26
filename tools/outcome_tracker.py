@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+from orderflow_accum.bybit_rest import BybitRestClient
+from orderflow_accum.config import Settings
+
+ACTIVE_STATUSES = {"WATCHING", "ACCUMULATION", "PRE_IMPULSE", "BREAKOUT_PRESSURE", "PENDING"}
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _interval_to_minutes(tf: str) -> int:
+    t = (tf or "1").strip().upper()
+    mapping = {"1": 1, "3": 3, "5": 5, "15": 15, "30": 30, "60": 60, "120": 120, "240": 240, "D": 1440}
+    return mapping.get(t, 1)
+
+
+@dataclass(slots=True)
+class Outcome:
+    status: str
+    bars_checked: int
+    time_to_tp1_minutes: float | None
+    time_to_tp2_minutes: float | None
+    time_to_sl_minutes: float | None
+    max_gain_pct: float
+    max_drawdown_pct: float
+
+
+def evaluate_outcome(entry: float, sl: float, tp1: float, tp2: float, rows: list[dict], interval_min: int) -> Outcome:
+    max_gain = float("-inf")
+    max_dd = float("inf")
+    t_tp1 = None
+    t_tp2 = None
+    t_sl = None
+
+    for idx, candle in enumerate(rows):
+        high = float(candle["high"])
+        low = float(candle["low"])
+        gain = (high - entry) / max(entry, 1e-12) * 100.0
+        dd = (low - entry) / max(entry, 1e-12) * 100.0
+        max_gain = max(max_gain, gain)
+        max_dd = min(max_dd, dd)
+
+        hit_tp1 = high >= tp1
+        hit_tp2 = high >= tp2
+        hit_sl = low <= sl
+
+        if hit_tp1 and t_tp1 is None:
+            t_tp1 = (idx + 1) * interval_min
+        if hit_tp2 and t_tp2 is None:
+            t_tp2 = (idx + 1) * interval_min
+        if hit_sl and t_sl is None:
+            t_sl = (idx + 1) * interval_min
+
+        if hit_tp2 and hit_sl:
+            return Outcome("AMBIGUOUS", idx + 1, t_tp1, t_tp2, t_sl, max_gain, max_dd)
+        if hit_sl and not hit_tp1:
+            return Outcome("SL", idx + 1, t_tp1, t_tp2, t_sl, max_gain, max_dd)
+        if hit_tp2:
+            return Outcome("TP2", idx + 1, t_tp1, t_tp2, t_sl, max_gain, max_dd)
+
+    if t_tp1 is not None:
+        return Outcome("TP1", len(rows), t_tp1, t_tp2, t_sl, max_gain if max_gain != float("-inf") else 0.0, max_dd if max_dd != float("inf") else 0.0)
+    return Outcome("PENDING", len(rows), t_tp1, t_tp2, t_sl, max_gain if max_gain != float("-inf") else 0.0, max_dd if max_dd != float("inf") else 0.0)
+
+
+async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int:
+    settings = Settings()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM signals WHERE status IN (%s)" % ",".join("?" * len(ACTIVE_STATUSES)), tuple(ACTIVE_STATUSES)).fetchall()
+    updated = 0
+
+    async with BybitRestClient(settings.rest_base_url, timeout_seconds=settings.rest_timeout_seconds, retries=settings.rest_retries) as client:
+        for row in rows:
+            tf = str(row["timeframe"] or "1")
+            interval_min = _interval_to_minutes(tf)
+            created = _parse_time(row["first_seen"]) or datetime.now(timezone.utc)
+            age_min = (datetime.now(timezone.utc) - created).total_seconds() / 60.0
+            if age_min > expires_hours * 60:
+                conn.execute("UPDATE signals SET status='EXPIRED', outcome='EXPIRED', outcome_checked_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), row["id"]))
+                updated += 1
+                continue
+
+            category = str(row["market"] or "linear").lower()
+            df = await client.fetch_klines(str(row["symbol"]), interval=tf, limit=lookahead_bars, category=category)
+            if df.empty:
+                continue
+            candles = df.to_dict("records")
+            outcome = evaluate_outcome(float(row["entry"]), float(row["stop_loss"]), float(row["take_profit_1"]), float(row["take_profit_2"]), candles, interval_min)
+
+            status = row["status"]
+            if outcome.status in {"TP1", "TP2", "SL", "AMBIGUOUS"}:
+                status = outcome.status
+
+            conn.execute(
+                """
+                UPDATE signals SET
+                  status=?, outcome=?, outcome_checked_at=?,
+                  time_to_tp1_minutes=?, time_to_tp2_minutes=?, time_to_sl_minutes=?,
+                  max_gain_pct=?, max_drawdown_pct=?
+                WHERE id=?
+                """,
+                (
+                    status,
+                    outcome.status,
+                    datetime.now(timezone.utc).isoformat(),
+                    outcome.time_to_tp1_minutes,
+                    outcome.time_to_tp2_minutes,
+                    outcome.time_to_sl_minutes,
+                    outcome.max_gain_pct,
+                    outcome.max_drawdown_pct,
+                    row["id"],
+                ),
+            )
+            updated += 1
+
+    conn.commit()
+    conn.close()
+    return updated
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="Track outcomes for active signals in signals.db")
+    parser.add_argument("--db", default="data/signals.db")
+    parser.add_argument("--lookahead-bars", type=int, default=180)
+    parser.add_argument("--expires-hours", type=int, default=48)
+    args = parser.parse_args()
+
+    count = await run_once(args.db, args.lookahead_bars, args.expires_hours)
+    print(f"updated={count}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
