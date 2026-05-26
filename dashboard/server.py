@@ -184,7 +184,6 @@ def create_app() -> FastAPI:
             return {"by_reason": [], "by_score_bucket": [], "by_timeframe": [], "by_kind": [], "by_source": []}
             return {"by_reason": [], "by_score_bucket": [], "by_timeframe": []}
 
-
         conn = sqlite3.connect(str(SIGNALS_DB_PATH))
         conn.row_factory = sqlite3.Row
         try:
