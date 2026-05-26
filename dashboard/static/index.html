@@ -94,6 +94,7 @@
           const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [] })), 30000);
           return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(perfTimer); ws.close(); };
           return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); ws.close(); };
+         
         }, []);
 
         useEffect(() => {
@@ -336,6 +337,7 @@
           {rows.length === 0 && <p className="p-3 text-xs text-slate-500">No performance rows yet.</p>}
         </div>;
       }
+
       function BreakdownTable({ title, rows, labelKey }) {
         return <div className="overflow-auto rounded-xl border border-slate-800">
           <div className="bg-slate-900 px-3 py-2 text-sm font-bold">{title}</div>

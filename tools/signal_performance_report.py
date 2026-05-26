@@ -89,8 +89,8 @@ def main() -> None:
                 st["pending"] += 1
 
         for st in (score_stats[bucket], tf_stats[tf], kind_stats[kind], source_stats[source]):
-
         for st in (score_stats[bucket], tf_stats[tf]):
+
 
             st["total"] += 1
             st["mfe"] += mfe
