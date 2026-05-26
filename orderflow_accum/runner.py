@@ -56,6 +56,7 @@ class AccumulationRunner:
                 limit=self.settings.realtime_symbols_limit,
                 min_notional_24h=self.settings.min_notional_24h,
                 min_last_price=self.settings.min_last_price,
+                market_categories=self.settings.market_categories,
                 allowlist=self.settings.symbols_allowlist,
                 blocklist=self.settings.symbols_blocklist,
             )
@@ -64,6 +65,7 @@ class AccumulationRunner:
                 limit=self.settings.macro_symbols_limit,
                 min_notional_24h=self.settings.min_notional_24h,
                 min_last_price=self.settings.min_last_price,
+                market_categories=self.settings.market_categories,
                 allowlist=self.settings.symbols_allowlist,
                 blocklist=self.settings.symbols_blocklist,
             )
@@ -117,14 +119,18 @@ class AccumulationRunner:
             await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "realtime", "symbols": len(symbols)})
             for symbol in symbols:
                 try:
-                    df = await rest.fetch_klines(symbol, interval="1", limit=180)
-                    state = stream.get_state(symbol)
-                    signals = self.realtime_engine.analyze(symbol, df, state)
-                    if not signals:
-                        reason, score, metrics = self.realtime_engine.diagnose(symbol, df, state)
-                        self.rejection_logger.append("orderflow", symbol, reason, score, metrics)
-                    for signal in signals:
-                        await self._emit_signal(rest, signal)
+                    for interval in self.settings.realtime_intervals:
+                        df = await rest.fetch_klines(symbol, interval=interval, limit=180)
+                        state = stream.get_state(symbol)
+                        signals = self.realtime_engine.analyze(symbol, df, state)
+                        if not signals:
+                            reason, score, metrics = self.realtime_engine.diagnose(symbol, df, state)
+                            metrics = dict(metrics or {})
+                            metrics["tf"] = interval
+                            self.rejection_logger.append("orderflow", symbol, reason, score, metrics)
+                        for signal in signals:
+                            signal.meta["tf"] = interval
+                            await self._emit_signal(rest, signal)
                 except Exception as exc:
                     self.logger.warning("Realtime scan failed for %s: %r", symbol, exc)
                 await asyncio.sleep(0.05)
@@ -161,7 +167,7 @@ class AccumulationRunner:
                 interval = str(signal.meta.get("tf") or "240")
                 bars = self.settings.chart_bars_macro
             else:
-                interval = "1"
+                interval = str(signal.meta.get("tf") or "1")
                 bars = self.settings.chart_bars_realtime
             df = await rest.fetch_klines(signal.symbol, interval=interval, limit=bars)
             if df.empty:
@@ -192,7 +198,7 @@ class AccumulationRunner:
     async def _emit_signal(self, rest: BybitRestClient, signal) -> None:
         now = time.time()
         cooldown = self._cooldown_seconds(signal)
-        cooldown_key = signal.dedupe_key()
+        cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
         last_sent = self._cooldowns.get(cooldown_key, 0.0)
         if now - last_sent < cooldown:
             return
