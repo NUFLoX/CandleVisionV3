@@ -138,10 +138,25 @@ async def main() -> None:
     parser.add_argument("--db", default="data/signals.db")
     parser.add_argument("--lookahead-bars", type=int, default=180)
     parser.add_argument("--expires-hours", type=int, default=48)
+    parser.add_argument("--loop", action="store_true", help="Run continuously")
+    parser.add_argument("--interval-minutes", type=int, default=10, help="Loop interval in minutes when --loop is set")
+    args = parser.parse_args()
+
+    if not args.loop:
+        count = await run_once(args.db, args.lookahead_bars, args.expires_hours)
+        print(f"updated={count}")
+        return
+
+    interval_seconds = max(args.interval_minutes, 1) * 60
+    while True:
+        count = await run_once(args.db, args.lookahead_bars, args.expires_hours)
+        print(f"updated={count}")
+        await asyncio.sleep(interval_seconds)
     args = parser.parse_args()
 
     count = await run_once(args.db, args.lookahead_bars, args.expires_hours)
     print(f"updated={count}")
+
 
 
 if __name__ == "__main__":
