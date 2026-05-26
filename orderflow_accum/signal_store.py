@@ -97,11 +97,13 @@ class SignalStore:
             except sqlite3.OperationalError:
                 pass
 
+
                 status TEXT NOT NULL
             )
             """
         )
         
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_tf ON signals(symbol, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
         self.conn.commit()
