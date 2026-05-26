@@ -74,3 +74,171 @@ Still recommended for separate follow-up PRs:
 - Moving tracked historical CSV/PNG artifacts out of the repository history/index.
 - Legacy cleanup for unused scanner/executor modules.
 - P2 signal-quality telemetry (A/B/C labels, rr_fallback stats, rejection stats, MFE/MAE/time-to-*), initially in observe-only mode.
+
+## 2026-05-25 full file-by-file audit pass
+
+- Scope: reviewed repository file inventory end-to-end (127 files total), including source code, configs, scripts, tests, docs, CSV data, and PNG artifacts.
+- Automated checks run across all Python modules: AST parse, `bare except` detection, and risky `eval/exec` scan.
+- Result: no Python syntax errors; two `bare except` usages found (see findings).
+
+### Findings (current)
+1. `api/ws_stream.py:74` uses `except:`; this can suppress unexpected runtime failures and complicate incident debugging.
+2. `main.py:132` uses `except:` in the order-placement path; failures may be swallowed without type-specific handling.
+
+### File inventory by extension
+- `.bat`: 2
+- `.csv`: 2
+- `.example`: 2
+- `.html`: 1
+- `.md`: 2
+- `.png`: 21
+- `.py`: 92
+- `.sh`: 2
+- `.txt`: 2
+- `<noext>`: 1
+
+### File inventory by top-level area
+- `.`: 20
+- `accum_charts`: 21
+- `agents`: 10
+- `api`: 7
+- `brain`: 4
+- `config`: 3
+- `core`: 11
+- `dashboard`: 10
+- `monitor`: 3
+- `orderflow_accum`: 13
+- `orderflow_v1`: 12
+- `scoring`: 2
+- `scout`: 6
+- `tests`: 4
+- `watchlist`: 1
+
+### Complete reviewed file list
+- `.env.example`
+- `.gitignore`
+- `AUDIT.md`
+- `README.md`
+- `VERSION.txt`
+- `accum_charts/ADAUSDT_00cfb0c331.png`
+- `accum_charts/BTCUSDT_14e0bb4140.png`
+- `accum_charts/BTCUSDT_63ef35299b.png`
+- `accum_charts/BTCUSDT_cbabf8d760.png`
+- `accum_charts/DOGEUSDT_4e9d541fbb.png`
+- `accum_charts/DOGEUSDT_8ce2a19a2c.png`
+- `accum_charts/ENAUSDT_2a3ad37153.png`
+- `accum_charts/ETHUSDT_6d064fbff7.png`
+- `accum_charts/ETHUSDT_aae1a5956c.png`
+- `accum_charts/ICPUSDT_600d6ce419.png`
+- `accum_charts/NEARUSDT_cfa0db85de.png`
+- `accum_charts/SOLUSDT_0a18cf9659.png`
+- `accum_charts/SOLUSDT_1977bac98d.png`
+- `accum_charts/SOLUSDT_a1a779fe40.png`
+- `accum_charts/SUIUSDT_71bf0039c4.png`
+- `accum_charts/SUIUSDT_de1726f57e.png`
+- `accum_charts/XRPUSDT_459b9c7742.png`
+- `accum_charts/XRPUSDT_528f23f7b1.png`
+- `accum_charts/XRPUSDT_67d8f7246f.png`
+- `accum_charts/XRPUSDT_a0e5732316.png`
+- `accum_charts/XRPUSDT_ff25eed044.png`
+- `accumulation_signals.csv`
+- `agents/__init__.py`
+- `agents/brain.py`
+- `agents/macro.py`
+- `agents/notifier.py`
+- `agents/sentinel_btc.py`
+- `agents/sentinel_onchain.py`
+- `agents/sentinel_sentiment.py`
+- `agents/sentinel_tape.py`
+- `agents/sentinel_telegram.py`
+- `agents/sonar.py`
+- `analyzer.py`
+- `api/__init__.py`
+- `api/bybit_client.py`
+- `api/charting.py`
+- `api/exchange_gateway.py`
+- `api/market.py`
+- `api/telegram.py`
+- `api/ws_stream.py`
+- `backtester.py`
+- `brain/__init__.py`
+- `brain/db.py`
+- `brain/models.py`
+- `brain/queue.py`
+- `check_prices.py`
+- `config/.env.example`
+- `config/__init__.py`
+- `config/settings.py`
+- `core/__init__.py`
+- `core/database.py`
+- `core/execution/safe_executor.py`
+- `core/executor.py`
+- `core/indicators.py`
+- `core/orchestrator.py`
+- `core/order_manager.py`
+- `core/risk_manager.py`
+- `core/scout.py`
+- `core/sentinel.py`
+- `core/triup.py`
+- `dashboard/__init__.py`
+- `dashboard/health.py`
+- `dashboard/ingest_client.py`
+- `dashboard/live_data.py`
+- `dashboard/persistence.py`
+- `dashboard/schemas.py`
+- `dashboard/server.py`
+- `dashboard/signal_outcomes.py`
+- `dashboard/static/index.html`
+- `dashboard/store.py`
+- `main.py`
+- `monitor/__init__.py`
+- `monitor/logger.py`
+- `monitor/stats.py`
+- `orderflow_accum/__init__.py`
+- `orderflow_accum/bookflow.py`
+- `orderflow_accum/bybit_rest.py`
+- `orderflow_accum/chart_render.py`
+- `orderflow_accum/config.py`
+- `orderflow_accum/console_ui.py`
+- `orderflow_accum/engines.py`
+- `orderflow_accum/indicators.py`
+- `orderflow_accum/models.py`
+- `orderflow_accum/runner.py`
+- `orderflow_accum/signal_logger.py`
+- `orderflow_accum/telegram_notify.py`
+- `orderflow_accum/ws_clients.py`
+- `orderflow_accum_main.py`
+- `orderflow_v1/__init__.py`
+- `orderflow_v1/bookflow.py`
+- `orderflow_v1/bybit_rest.py`
+- `orderflow_v1/config.py`
+- `orderflow_v1/console_ui.py`
+- `orderflow_v1/engines.py`
+- `orderflow_v1/indicators.py`
+- `orderflow_v1/models.py`
+- `orderflow_v1/runner.py`
+- `orderflow_v1/signal_logger.py`
+- `orderflow_v1/telegram_notify.py`
+- `orderflow_v1/ws_clients.py`
+- `orderflow_v1_main.py`
+- `rejection_reasons.csv`
+- `requirements.txt`
+- `run_accumulation_v1.bat`
+- `run_accumulation_v1.sh`
+- `run_orderflow_v1.bat`
+- `run_orderflow_v1.sh`
+- `scoring/__init__.py`
+- `scoring/scorer.py`
+- `scout/__init__.py`
+- `scout/scanner.py`
+- `scout/strategies/__init__.py`
+- `scout/strategies/classic.py`
+- `scout/strategies/pump.py`
+- `scout/strategies/squeeze.py`
+- `test_api.py`
+- `test_bybit_correct.py`
+- `tests/test_dashboard_live_data.py`
+- `tests/test_dashboard_server_import.py`
+- `tests/test_execution_safety.py`
+- `tests/test_signal_outcomes.py`
+- `watchlist/watchlist_manager.py`
