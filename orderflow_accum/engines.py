@@ -415,8 +415,19 @@ class RealtimeAccumulationEngine:
         base_range_short = rolling_range_pct(df, 14)
         base_range_long = rolling_range_pct(df, 48)
         compression_ratio = base_range_short / max(base_range_long, 1e-9)
+        range_duration_bars = int(min(len(df), 48))
+        tf_minutes = {"1": 1, "3": 3, "5": 5, "15": 15, "30": 30, "60": 60, "120": 120, "240": 240}.get(
+            str(state.interval or "1"), 1
+        ) if hasattr(state, "interval") else 1
+        range_duration_minutes = range_duration_bars * tf_minutes
         turnover_build = float(pd.to_numeric(df.tail(12)["turnover"], errors="coerce").sum())
         displacement_pct = abs(float(pd.to_numeric(df.tail(12)["return_1"], errors="coerce").sum() * 100.0))
+        turnover_displacement_ratio = turnover_build / max(displacement_pct, 0.05)
+        recent = df.tail(20).copy()
+        bodies = (recent["close"] - recent["open"]).abs()
+        wicks = (recent["high"] - recent["low"]).abs() - bodies
+        wick_to_body_ratio = float(pd.to_numeric((wicks / (bodies + 1e-12)).clip(lower=0), errors="coerce").mean())
+        range_compression_ratio = range_width_pct = (resistance - support) / max(mid, 1e-12) * 100.0
         pullback_depth_pct = _recent_pullback_depth(df, 8)
 
         signals: list[Signal] = []
@@ -425,6 +436,8 @@ class RealtimeAccumulationEngine:
         # --- Pre-Impulse Accumulation Compression detector (observe/watch phase) ---
         # Separate score from trade-ready logic: this block identifies quiet accumulation
         # before a breakout, without requiring breakout confirmation.
+
+        range_width_pct = range_compression_ratio
         range_width_pct = (resistance - support) / max(mid, 1e-12) * 100.0
         body_last_20 = float(pd.to_numeric((df.tail(20)["close"] - df.tail(20)["open"]).abs(), errors="coerce").mean())
         body_prev_20 = float(pd.to_numeric((df.tail(40).head(20)["close"] - df.tail(40).head(20)["open"]).abs(), errors="coerce").mean())
@@ -442,18 +455,41 @@ class RealtimeAccumulationEngine:
         if turnover_build > self.settings.effective_min_trade_notional * 3.0 and displacement_pct <= 1.3:
             pre_score += 2.0
             pre_reasons.append("high_turnover_low_displacement")
+        if turnover_displacement_ratio >= 2.0:
+            pre_score += 1.0
+            pre_reasons.append(f"turnover_displacement_ratio={turnover_displacement_ratio:.2f}")
+        if sell_notional >= self.settings.effective_min_sell_pressure_notional and delta_notional > -sell_notional * 0.6:
+            pre_score += 2.0
+            pre_reasons.append("sell_pressure_absorbed")
+        if (
+            sell_notional >= self.settings.effective_min_sell_pressure_notional * 1.1
+            and displacement_pct <= 1.0
+            and float(last["close_pos"]) >= 0.52
+        ):
+            pre_score += 1.0
+            pre_reasons.append("sell_pressure_absorbed_v2")
+        if support_holds >= 4:
+            pre_score += 1.0
+            pre_reasons.append(f"support_defended={support_holds}")
+        if range_duration_minutes >= 120:
+            pre_score += 1.0
+            pre_reasons.append(f"range_duration_minutes={range_duration_minutes}")
         if sell_notional >= self.settings.effective_min_sell_pressure_notional and delta_notional > -sell_notional * 0.6:
             pre_score += 2.0
             pre_reasons.append("sell_pressure_absorbed")
         if support_holds >= 4:
             pre_score += 1.0
             pre_reasons.append(f"support_defended={support_holds}")
+
         if float(last["close_pos"]) >= 0.56:
             pre_score += 1.0
             pre_reasons.append("close_in_upper_half")
         if atr_compression <= 0.92:
             pre_score += 1.0
             pre_reasons.append(f"atr_compression={atr_compression:.2f}")
+        if wick_to_body_ratio >= 1.2:
+            pre_score += 1.0
+            pre_reasons.append(f"wick_to_body_ratio={wick_to_body_ratio:.2f}")
         if tape_total >= self.settings.effective_min_trade_notional * 1.15:
             pre_score += 1.0
             pre_reasons.append("volume_not_dead")
@@ -512,6 +548,13 @@ class RealtimeAccumulationEngine:
                         "support": round(support, 8),
                         "resistance": round(resistance, 8),
                         "range_width_pct": round(range_width_pct, 4),
+                        "range_compression_ratio": round(range_compression_ratio, 4),
+                        "range_duration_minutes": int(range_duration_minutes),
+                        "range_duration_bars": int(range_duration_bars),
+                        "body_compression_ratio": round(body_compression_ratio, 4),
+                        "wick_to_body_ratio": round(wick_to_body_ratio, 4),
+                        "atr_compression": round(atr_compression, 4),
+                        "turnover_displacement_ratio": round(turnover_displacement_ratio, 4),
                         "body_compression_ratio": round(body_compression_ratio, 4),
                         "atr_compression": round(atr_compression, 4),
                         "delta_notional": round(delta_notional, 2),
