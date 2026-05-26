@@ -241,6 +241,7 @@ class AccumulationRunner:
         await self.dashboard.post_signal(signal)
         if not upsert.should_notify:
             return
+         
         if upsert.status_changed:
             await self.dashboard.post_log(
                 f"{signal.symbol} {signal.meta.get('tf', 'na')}: stage {upsert.from_status or 'NEW'} -> {upsert.to_status}",
