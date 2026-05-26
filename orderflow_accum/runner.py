@@ -14,6 +14,7 @@ from .console_ui import ConsoleUI
 from .engines import MacroAccumulationEngine, RealtimeAccumulationEngine
 from .chart_render import render_signal_chart
 from .signal_logger import RejectionCsvLogger, SignalCsvLogger
+from .signal_store import SignalStore
 from .telegram_notify import TelegramNotifier
 from .ws_clients import MarketStream
 
@@ -31,6 +32,7 @@ class AccumulationRunner:
         self.macro_engine = MacroAccumulationEngine(settings)
         self.csv_logger = SignalCsvLogger("accumulation_signals.csv")
         self.rejection_logger = RejectionCsvLogger("rejection_reasons.csv")
+        self.signal_store = SignalStore()
         self.dashboard = DashboardIngestClient()
         self._cooldowns: dict[str, float] = {}
         self._counts = {"macro": 0, "orderflow": 0}
@@ -144,7 +146,6 @@ class AccumulationRunner:
                                 continue
                             if not is_preimpulse and interval_u not in realtime_intervals:
                                 continue
-
                             signal.meta["tf"] = interval
                             await self._emit_signal(rest, signal)
                 except Exception as exc:
@@ -212,9 +213,11 @@ class AccumulationRunner:
         return self.settings.signal_cooldown_seconds
 
     async def _emit_signal(self, rest: BybitRestClient, signal) -> None:
+        market = str(signal.meta.get("market", self.settings.market_categories[0].lower() if self.settings.market_categories else "linear"))
+        upsert = self.signal_store.upsert_signal(signal, market=market)
         now = time.time()
         cooldown = self._cooldown_seconds(signal)
-        
+
         cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
 
         last_sent = self._cooldowns.get(cooldown_key, 0.0)
@@ -239,6 +242,8 @@ class AccumulationRunner:
         self.ui.update_session(macro=self._counts["macro"], orderflow=self._counts["orderflow"])
         self.ui.print_signal(signal)
         await self.dashboard.post_signal(signal)
+        if not upsert.should_notify:
+            return
         chart_path = await self._build_chart_for_signal(rest, signal)
         try:
             await self.telegram.send_signal(

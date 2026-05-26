@@ -39,6 +39,7 @@ class Settings:
 
 
 
+
     macro_every_seconds: int = int(os.getenv("ACC_MACRO_EVERY_SECONDS", "1800"))
     book_depth: int = int(os.getenv("ACC_BOOK_DEPTH", "20"))
 
