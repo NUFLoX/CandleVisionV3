@@ -241,6 +241,19 @@ class AccumulationRunner:
         await self.dashboard.post_signal(signal)
         if not upsert.should_notify:
             return
+
+        if upsert.status_changed:
+            await self.dashboard.post_log(
+                f"{signal.symbol} {signal.meta.get('tf', 'na')}: stage {upsert.from_status or 'NEW'} -> {upsert.to_status}",
+                source="signal_store",
+                severity="success",
+            )
+        elif upsert.score_jump:
+            await self.dashboard.post_log(
+                f"{signal.symbol} {signal.meta.get('tf', 'na')}: score jump detected ({signal.score:.2f})",
+                source="signal_store",
+                severity="info",
+            )
         chart_path = await self._build_chart_for_signal(rest, signal)
         try:
             await self.telegram.send_signal(
