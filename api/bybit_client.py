@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import logging
 import asyncio  # <--- ДОБАВИЛИ ИМПОРТ ДЛЯ АСИНХРОННОСТИ
-from config.settings import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET
+from config.settings import BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, trading_enabled
 
 class BybitClient:
     def __init__(self, testnet=None):
@@ -177,6 +177,9 @@ class BybitClient:
         tp_price: float
     ):
         """Открывает сделку с защитой SL/TP и трейлинг-стопом."""
+        if not trading_enabled():
+            self.logger.warning(f"🛡️ trading_enabled=false. Пропускаем execute_long_trade для {symbol}")
+            return False
         if not self.session:
             self.logger.warning(f"⚠️ Session не инициализирован. Пропускаем ордер {symbol}")
             return False
