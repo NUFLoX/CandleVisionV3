@@ -46,9 +46,11 @@ def main() -> None:
         print("No signals found.")
         return
 
-    reason_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "mfe": 0.0, "mae": 0.0})
+    reason_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
     score_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
     tf_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
+    kind_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
+    source_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
 
     for r in rows:
         status = (r["status"] or "PENDING").upper()
@@ -56,6 +58,8 @@ def main() -> None:
         score_last = float(r["score_last"] or 0.0)
         bucket = _bucket(score_last)
         tf = str(r["timeframe"] or "1")
+        kind = str(r["kind"] or "UNKNOWN")
+        source = str(r["source"] or "UNKNOWN")
         mfe = float(r["max_gain_pct"] or 0.0)
         mae = float(r["max_drawdown_pct"] or 0.0)
 
@@ -78,8 +82,10 @@ def main() -> None:
                 st["tp"] += 1
             elif winloss == "SL":
                 st["sl"] += 1
+            else:
+                st["pending"] += 1
 
-        for st in (score_stats[bucket], tf_stats[tf]):
+        for st in (score_stats[bucket], tf_stats[tf], kind_stats[kind], source_stats[source]):
             st["total"] += 1
             st["mfe"] += mfe
             st["mae"] += mae
@@ -111,6 +117,20 @@ def main() -> None:
         total = st["total"] or 1
         win_rate = (st["tp"] / max(st["tp"] + st["sl"], 1)) * 100.0
         print(f"{tf}\t{int(st['total'])}\t{int(st['tp'])}\t{int(st['sl'])}\t{int(st['pending'])}\t{win_rate:.2f}%\t{st['mfe']/total:.3f}\t{st['mae']/total:.3f}")
+
+    print("\n=== KIND REPORT ===")
+    print("kind\ttotal\ttp\tsl\tpending\twin_rate\tavg_mfe\tavg_mae")
+    for kind, st in sorted(kind_stats.items(), key=lambda x: x[1]["total"], reverse=True):
+        total = st["total"] or 1
+        win_rate = (st["tp"] / max(st["tp"] + st["sl"], 1)) * 100.0
+        print(f"{kind}\t{int(st['total'])}\t{int(st['tp'])}\t{int(st['sl'])}\t{int(st['pending'])}\t{win_rate:.2f}%\t{st['mfe']/total:.3f}\t{st['mae']/total:.3f}")
+
+    print("\n=== SOURCE REPORT ===")
+    print("source\ttotal\ttp\tsl\tpending\twin_rate\tavg_mfe\tavg_mae")
+    for source, st in sorted(source_stats.items(), key=lambda x: x[1]["total"], reverse=True):
+        total = st["total"] or 1
+        win_rate = (st["tp"] / max(st["tp"] + st["sl"], 1)) * 100.0
+        print(f"{source}\t{int(st['total'])}\t{int(st['tp'])}\t{int(st['sl'])}\t{int(st['pending'])}\t{win_rate:.2f}%\t{st['mfe']/total:.3f}\t{st['mae']/total:.3f}")
 
 
 if __name__ == "__main__":
