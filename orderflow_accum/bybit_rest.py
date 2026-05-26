@@ -53,8 +53,8 @@ class BybitRestClient:
         rows = result.get("list", [])
         return [row for row in rows if row.get("quoteCoin") == quote_coin and row.get("status") == "Trading"]
 
-    async def fetch_tickers(self) -> list[dict[str, Any]]:
-        result = await self._get("/v5/market/tickers", {"category": "linear"})
+    async def fetch_tickers(self, category: str = "linear") -> list[dict[str, Any]]:
+        result = await self._get("/v5/market/tickers", {"category": category})
         return result.get("list", [])
 
     async def fetch_klines(
@@ -64,8 +64,9 @@ class BybitRestClient:
         limit: int = 200,
         start: int | None = None,
         end: int | None = None,
+        category: str = "linear",
     ) -> pd.DataFrame:
-        params: dict[str, Any] = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
+        params: dict[str, Any] = {"category": category, "symbol": symbol, "interval": interval, "limit": limit}
         if start is not None:
             params["start"] = start
         if end is not None:
@@ -90,12 +91,20 @@ class BybitRestClient:
         limit: int,
         min_notional_24h: float,
         min_last_price: float,
+        market_categories: list[str] | None = None,
         allowlist: list[str] | None = None,
         blocklist: list[str] | None = None,
     ) -> list[str]:
         allow = set(allowlist or [])
         block = set(blocklist or [])
-        tickers = await self.fetch_tickers()
+        categories = [c.lower() for c in (market_categories or ["linear"]) if c]
+        tickers: list[dict[str, Any]] = []
+        for category in categories:
+            rows = await self.fetch_tickers(category=category)
+            for row in rows:
+                row = dict(row)
+                row["_category"] = category
+                tickers.append(row)
         symbols: list[tuple[str, float]] = []
         for row in tickers:
             symbol = row.get("symbol", "")
