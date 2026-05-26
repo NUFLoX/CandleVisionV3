@@ -422,6 +422,109 @@ class RealtimeAccumulationEngine:
         signals: list[Signal] = []
         atr = max(float(last["atr_14"]), close * 0.0028)
 
+        # --- Pre-Impulse Accumulation Compression detector (observe/watch phase) ---
+        # Separate score from trade-ready logic: this block identifies quiet accumulation
+        # before a breakout, without requiring breakout confirmation.
+        range_width_pct = (resistance - support) / max(mid, 1e-12) * 100.0
+        body_last_20 = float(pd.to_numeric((df.tail(20)["close"] - df.tail(20)["open"]).abs(), errors="coerce").mean())
+        body_prev_20 = float(pd.to_numeric((df.tail(40).head(20)["close"] - df.tail(40).head(20)["open"]).abs(), errors="coerce").mean())
+        body_compression_ratio = body_last_20 / max(body_prev_20, 1e-12)
+        atr_compression = float(last.get("atr_ratio_20", 1.0))
+        pre_score = 0.0
+        pre_reasons: list[str] = []
+
+        if range_width_pct <= 3.2:
+            pre_score += 2.0
+            pre_reasons.append(f"long_sideways_range={range_width_pct:.2f}%")
+        if body_compression_ratio <= 0.7:
+            pre_score += 2.0
+            pre_reasons.append(f"candle_body_compression={body_compression_ratio:.2f}")
+        if turnover_build > self.settings.effective_min_trade_notional * 3.0 and displacement_pct <= 1.3:
+            pre_score += 2.0
+            pre_reasons.append("high_turnover_low_displacement")
+        if sell_notional >= self.settings.effective_min_sell_pressure_notional and delta_notional > -sell_notional * 0.6:
+            pre_score += 2.0
+            pre_reasons.append("sell_pressure_absorbed")
+        if support_holds >= 4:
+            pre_score += 1.0
+            pre_reasons.append(f"support_defended={support_holds}")
+        if float(last["close_pos"]) >= 0.56:
+            pre_score += 1.0
+            pre_reasons.append("close_in_upper_half")
+        if atr_compression <= 0.92:
+            pre_score += 1.0
+            pre_reasons.append(f"atr_compression={atr_compression:.2f}")
+        if tape_total >= self.settings.effective_min_trade_notional * 1.15:
+            pre_score += 1.0
+            pre_reasons.append("volume_not_dead")
+        if resistance_dist <= self.settings.effective_breakout_ready_bps * 1.2:
+            pre_score += 2.0
+            pre_reasons.append(f"price_near_range_high={resistance_dist:.1f}bps")
+        if buy_notional >= sell_notional * 1.05:
+            pre_score += 1.0
+            pre_reasons.append("buyers_regaining_tape")
+        if range_width_pct > 5.5:
+            pre_score -= 2.0
+            pre_reasons.append("range_too_wide")
+        if tape_total < self.settings.effective_min_trade_notional * 0.8:
+            pre_score -= 2.0
+            pre_reasons.append("dead_volume")
+        if ask_near_persistence >= 0.42:
+            pre_score -= 2.0
+            pre_reasons.append("heavy_ask_wall")
+
+        pre_kind: str | None = None
+        if pre_score >= 13:
+            pre_kind = "BREAKOUT_PRESSURE"
+        elif pre_score >= 10:
+            pre_kind = "PRE_IMPULSE_ZONE"
+        elif pre_score >= 7:
+            pre_kind = "ABSORPTION_ZONE"
+        elif pre_score >= 4:
+            pre_kind = "ACCUMULATION_WATCH"
+
+        if pre_kind:
+            entry = best_ask
+            stop = min(support - atr * 0.25, entry - atr * self.settings.atr_stop_mult)
+            risk = max(entry - stop, atr * 0.45)
+            tp1, tp2, tp_reasons, tp_meta = _find_structural_resistances(
+                df=df,
+                state=state,
+                entry=entry,
+                fallback_risk=risk,
+                base_resistance=resistance,
+                settings=self.settings,
+            )
+            pre_final_reasons = pre_reasons + tp_reasons
+            signals.append(
+                Signal(
+                    symbol=symbol,
+                    side="Buy",
+                    kind=pre_kind,  # phase/status signal, not a breakout confirmation
+                    source="orderflow",
+                    score=round(pre_score, 2),
+                    entry=entry,
+                    stop_loss=stop,
+                    take_profit_1=tp1,
+                    take_profit_2=tp2,
+                    reasons=pre_final_reasons,
+                    meta={
+                        "support": round(support, 8),
+                        "resistance": round(resistance, 8),
+                        "range_width_pct": round(range_width_pct, 4),
+                        "body_compression_ratio": round(body_compression_ratio, 4),
+                        "atr_compression": round(atr_compression, 4),
+                        "delta_notional": round(delta_notional, 2),
+                        "buy_notional": round(buy_notional, 2),
+                        "sell_notional": round(sell_notional, 2),
+                        "compression_ratio": round(compression_ratio, 3),
+                        "signal_mode": self.settings.signal_mode,
+                        "phase": "pre_impulse_absorption",
+                        **tp_meta,
+                    },
+                )
+            )
+
         early_score = 0.0
         reasons: list[str] = []
         if support_dist <= self.settings.support_tolerance_bps:
