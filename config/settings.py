@@ -78,3 +78,5 @@ SCOUT_SCAN_TIMEFRAMES = _env_csv("SCOUT_SCAN_TIMEFRAMES", "1m,5m,15m,30m")
 
 def trading_enabled() -> bool:
     return (not SIGNALS_ONLY) and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
+
+
