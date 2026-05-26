@@ -192,6 +192,7 @@ def create_app() -> FastAPI:
 
                 "SELECT reasons_last, score_last, timeframe, status, max_gain_pct, max_drawdown_pct FROM signals"
 
+
             ).fetchall()
         finally:
             conn.close()
