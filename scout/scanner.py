@@ -15,6 +15,7 @@ class Scout:
         self.symbols = []
         self.ws_stream = ws_stream
         self.tape_agent = tape_agent  # <--- Добавили агента китов
+        self.dashboard = DashboardIngestClient()
 
     def load_symbols(self, symbols_list: list):
         self.symbols = symbols_list
@@ -70,10 +71,17 @@ class Scout:
                     "df": df.tail(100) 
                 }
                 await self.queue.put(signal_data) 
+                await self.dashboard.post_watchlist(
+                    symbol,
+                    timeframe=tf,
+                    score=score,
+                    reason="; ".join(reasons[:4]) if reasons else "scout_signal",
+                )
 
     async def recheck_watchlist_async(self, watchlist_symbols: list):
         """Метод 'Спецназа': быстрая проверка избранных монет."""
         if not watchlist_symbols: return
+        await self.dashboard.post_heartbeat("scanner", meta={"runner": "scout", "mode": "watchlist", "symbols": len(watchlist_symbols)})
         self.logger.info(f"🔎 Перепроверка Watchlist ({len(watchlist_symbols)} пар)...")
         for symbol in watchlist_symbols:
             for tf in SCOUT_SCAN_TIMEFRAMES:
@@ -82,6 +90,7 @@ class Scout:
 
     # ДОБАВИЛИ ПАРАМЕТР regime
     async def run_full_market_scan_async(self, regime: str = "FLAT"):
+        await self.dashboard.post_heartbeat("scanner", meta={"runner": "scout", "mode": "full", "symbols": len(self.symbols), "regime": regime})
         self.logger.info(f"🔄 Сканирование ({len(self.symbols)} пар) | Тактика: {regime}")
         for symbol in self.symbols:
             # В будущем мы передадим regime внутрь run_scan_async,
@@ -89,4 +98,3 @@ class Scout:
             for tf in SCOUT_SCAN_TIMEFRAMES:
                 await self.run_scan_async(symbol, tf)
                 await asyncio.sleep(0.2)
-        self.logger.info("✅ Цикл сканирования завершен.")
