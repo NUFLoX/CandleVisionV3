@@ -5,6 +5,8 @@ import contextlib
 import json
 import os
 import sqlite3
+
+from collections import defaultdict
 from pathlib import Path
 from typing import Annotated
 
@@ -176,6 +178,105 @@ def create_app() -> FastAPI:
             return [dict(row) for row in rows]
         finally:
             conn.close()
+
+    @app.get("/api/setup-performance")
+    async def setup_performance():
+        if not SIGNALS_DB_PATH.exists():
+            return {"by_reason": [], "by_score_bucket": [], "by_timeframe": []}
+
+        conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT reasons_last, score_last, timeframe, status, max_gain_pct, max_drawdown_pct FROM signals"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        def bucket(score: float) -> str:
+            if score < 5:
+                return "<5"
+            if score < 7:
+                return "5-7"
+            if score < 9:
+                return "7-9"
+            if score < 11:
+                return "9-11"
+            return "11+"
+
+        def wl(status: str) -> str:
+            s = (status or "").upper()
+            if s in {"TP1", "TP2"}:
+                return "TP"
+            if s == "SL":
+                return "SL"
+            return "OTHER"
+
+        reason_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "mfe": 0.0, "mae": 0.0})
+        score_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
+        tf_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
+
+        for row in rows:
+            outcome = wl(str(row["status"] or ""))
+            score = float(row["score_last"] or 0.0)
+            tf = str(row["timeframe"] or "1")
+            score_b = bucket(score)
+            mfe = float(row["max_gain_pct"] or 0.0)
+            mae = float(row["max_drawdown_pct"] or 0.0)
+            try:
+                reasons = json.loads(row["reasons_last"] or "[]")
+                if not isinstance(reasons, list):
+                    reasons = []
+            except Exception:
+                reasons = []
+
+            for reason in reasons:
+                entry = reason_stats[str(reason)]
+                entry["total"] += 1
+                entry["mfe"] += mfe
+                entry["mae"] += mae
+                if outcome == "TP":
+                    entry["tp"] += 1
+                elif outcome == "SL":
+                    entry["sl"] += 1
+
+            for group in (score_stats[score_b], tf_stats[tf]):
+                group["total"] += 1
+                group["mfe"] += mfe
+                group["mae"] += mae
+                if outcome == "TP":
+                    group["tp"] += 1
+                elif outcome == "SL":
+                    group["sl"] += 1
+                else:
+                    group["pending"] += 1
+
+        def finalize(items: dict, label: str) -> list[dict]:
+            out = []
+            for key, value in items.items():
+                total = max(int(value["total"]), 1)
+                tp = int(value["tp"])
+                sl = int(value["sl"])
+                win_rate = (tp / max(tp + sl, 1)) * 100.0
+                out.append(
+                    {
+                        label: key,
+                        "total": int(value["total"]),
+                        "tp": tp,
+                        "sl": sl,
+                        "pending": int(value.get("pending", 0)),
+                        "win_rate": round(win_rate, 2),
+                        "avg_mfe": round(value["mfe"] / total, 4),
+                        "avg_mae": round(value["mae"] / total, 4),
+                    }
+                )
+            return sorted(out, key=lambda row: row["total"], reverse=True)
+
+        return {
+            "by_reason": finalize(reason_stats, "reason"),
+            "by_score_bucket": finalize(score_stats, "score_bucket"),
+            "by_timeframe": finalize(tf_stats, "timeframe"),
+        }
 
     @app.get("/api/watchlist")
     async def watchlist():

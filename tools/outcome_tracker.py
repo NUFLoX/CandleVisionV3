@@ -152,8 +152,6 @@ async def main() -> None:
         count = await run_once(args.db, args.lookahead_bars, args.expires_hours)
         print(f"updated={count}")
         await asyncio.sleep(interval_seconds)
-    args = parser.parse_args()
-
 
 
 if __name__ == "__main__":
