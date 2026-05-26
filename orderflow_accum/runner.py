@@ -34,6 +34,12 @@ class AccumulationRunner:
         self.dashboard = DashboardIngestClient()
         self._cooldowns: dict[str, float] = {}
         self._counts = {"macro": 0, "orderflow": 0}
+        self._preimpulse_kinds = {
+            "ACCUMULATION_WATCH",
+            "ABSORPTION_ZONE",
+            "PRE_IMPULSE_ZONE",
+            "BREAKOUT_PRESSURE",
+        }
 
     def _filter_symbols(self, symbols: list[str]) -> list[str]:
         out: list[str] = []
@@ -115,6 +121,8 @@ class AccumulationRunner:
 
     async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[str]) -> None:
         self.logger.info("Realtime accumulation loop started for %s symbols", len(symbols))
+        preimpulse_intervals = {value.upper() for value in self.settings.preimpulse_intervals}
+        realtime_intervals = {value.upper() for value in self.settings.realtime_intervals}
         while True:
             await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "realtime", "symbols": len(symbols)})
             for symbol in symbols:
@@ -129,6 +137,14 @@ class AccumulationRunner:
                             metrics["tf"] = interval
                             self.rejection_logger.append("orderflow", symbol, reason, score, metrics)
                         for signal in signals:
+
+                            interval_u = str(interval).upper()
+                            is_preimpulse = signal.kind in self._preimpulse_kinds
+                            if is_preimpulse and interval_u not in preimpulse_intervals:
+                                continue
+                            if not is_preimpulse and interval_u not in realtime_intervals:
+                                continue
+
                             signal.meta["tf"] = interval
                             await self._emit_signal(rest, signal)
                 except Exception as exc:
@@ -198,6 +214,8 @@ class AccumulationRunner:
     async def _emit_signal(self, rest: BybitRestClient, signal) -> None:
         now = time.time()
         cooldown = self._cooldown_seconds(signal)
+
+        cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
 
         cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
 
