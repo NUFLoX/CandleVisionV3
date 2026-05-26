@@ -11,6 +11,7 @@ from orderflow_accum.config import Settings
 from orderflow_accum.signal_store import SignalStore
 
 
+
 ACTIVE_STATUSES = {"WATCHING", "ACCUMULATION", "PRE_IMPULSE", "BREAKOUT_PRESSURE", "PENDING"}
 
 

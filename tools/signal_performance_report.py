@@ -55,7 +55,6 @@ def main() -> None:
     score_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
     tf_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
 
-
     for r in rows:
         status = (r["status"] or "PENDING").upper()
         winloss = _status_win_loss(status)
