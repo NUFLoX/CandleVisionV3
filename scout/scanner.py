@@ -5,6 +5,7 @@ import pandas as pd
 from scoring.scorer import calculate_score
 from api.market import fetch_ohlcv_bybit_async
 from core.risk_manager import assess_rr
+from config.settings import SCOUT_SCAN_TIMEFRAMES
 
 class Scout:
     def __init__(self, queue, strategies=None, ws_stream=None, tape_agent=None):
@@ -75,17 +76,17 @@ class Scout:
         if not watchlist_symbols: return
         self.logger.info(f"🔎 Перепроверка Watchlist ({len(watchlist_symbols)} пар)...")
         for symbol in watchlist_symbols:
-            await self.run_scan_async(symbol, "15m")
-            await asyncio.sleep(0.3) 
+            for tf in SCOUT_SCAN_TIMEFRAMES:
+                await self.run_scan_async(symbol, tf)
+                await asyncio.sleep(0.3) 
 
     # ДОБАВИЛИ ПАРАМЕТР regime
     async def run_full_market_scan_async(self, regime: str = "FLAT"):
         self.logger.info(f"🔄 Сканирование ({len(self.symbols)} пар) | Тактика: {regime}")
         for symbol in self.symbols:
-            
-            # В будущем мы передадим regime внутрь run_scan_async, 
+            # В будущем мы передадим regime внутрь run_scan_async,
             # чтобы стратегии знали, что искать (лонг или шорт).
-            await self.run_scan_async(symbol, "15m")
-            
-            await asyncio.sleep(0.2) 
+            for tf in SCOUT_SCAN_TIMEFRAMES:
+                await self.run_scan_async(symbol, tf)
+                await asyncio.sleep(0.2)
         self.logger.info("✅ Цикл сканирования завершен.")
