@@ -110,7 +110,6 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                     )
 
                 conn.execute("UPDATE signals SET status='EXPIRED', outcome='EXPIRED', outcome_checked_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), row["id"]))
-
                 updated += 1
                 continue
 

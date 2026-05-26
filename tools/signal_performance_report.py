@@ -55,7 +55,6 @@ def main() -> None:
     score_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
     tf_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
 
-
     for r in rows:
         status = (r["status"] or "PENDING").upper()
         winloss = _status_win_loss(status)
@@ -90,6 +89,7 @@ def main() -> None:
                 st["pending"] += 1
 
         for st in (score_stats[bucket], tf_stats[tf], kind_stats[kind], source_stats[source]):
+
         for st in (score_stats[bucket], tf_stats[tf]):
 
             st["total"] += 1
