@@ -58,6 +58,8 @@
         const [stats, setStats] = useState(null);
         const [outcomes, setOutcomes] = useState([]);
         const [statsError, setStatsError] = useState('');
+        const [activeSetups, setActiveSetups] = useState([]);
+        const [setupPerf, setSetupPerf] = useState({ by_reason: [], by_score_bucket: [], by_timeframe: [] });
 
         const load = async () => setSnapshot(await api('/api/snapshot'));
         const loadStats = async () => {
@@ -67,6 +69,8 @@
           setStatsError('');
         };
         const refreshLive = async () => setSnapshot(await api('/api/refresh', { method: 'POST' }));
+        const loadActiveSetups = async () => setActiveSetups(await api('/api/active-setups?limit=500'));
+        const loadSetupPerformance = async () => setSetupPerf(await api('/api/setup-performance'));
         const refreshStats = async () => {
           try {
             const result = await api('/api/signal-outcomes/refresh', { method: 'POST' });
@@ -80,12 +84,16 @@
         useEffect(() => {
           load();
           loadStats().catch((e) => setStatsError(e.message));
+          loadActiveSetups().catch(() => setActiveSetups([]));
+          loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [] }));
           const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
           const ws = new WebSocket(`${wsProtocol}://${location.host}/ws`);
           ws.onmessage = () => load();
           const timer = setInterval(load, 15000);
           const statsTimer = setInterval(() => loadStats().catch((e) => setStatsError(e.message)), 30000);
-          return () => { clearInterval(timer); clearInterval(statsTimer); ws.close(); };
+          const setupsTimer = setInterval(() => loadActiveSetups().catch(() => setActiveSetups([])), 30000);
+          const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [] })), 30000);
+          return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(perfTimer); ws.close(); };
         }, []);
 
         useEffect(() => {
@@ -100,8 +108,6 @@
           }, 350);
           return () => { active = false; clearTimeout(timer); };
         }, [coinQuery]);
-
-        const outcomesBySignal = useMemo(() => Object.fromEntries(outcomes.map((item) => [item.signal_id, item])), [outcomes]);
 
         const outcomesBySignal = useMemo(() => Object.fromEntries(outcomes.map((item) => [item.signal_id, item])), [outcomes]);
 
@@ -177,6 +183,8 @@
 
 
           <SignalPerformancePanel stats={stats} outcomes={outcomes} error={statsError} onRefresh={refreshStats} />
+          <ActiveSetupsPanel setups={activeSetups} onRefresh={loadActiveSetups} />
+          <SetupPerformancePanel perf={setupPerf} onRefresh={loadSetupPerformance} />
 
           <section className="grid gap-6 xl:grid-cols-[.9fr_1.1fr]">
             <Card title="Поиск монеты" action={<input className="w-32 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-cyan-400" value={coinQuery} onChange={(e) => setCoinQuery(e.target.value)} placeholder="BTC" />}>
@@ -255,6 +263,79 @@
             {outcomes.length === 0 && <p className="p-4 text-sm text-slate-500">Нет рассчитанных исходов. Нажмите Refresh stats после появления сигналов.</p>}
           </div>
         </Card>;
+      }
+
+      function ActiveSetupsPanel({ setups, onRefresh }) {
+        return <Card title="Active Setups" action={<button onClick={onRefresh} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh setups</button>}>
+          <div className="overflow-auto rounded-xl border border-slate-800">
+            <table className="min-w-full text-left text-sm">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500">
+                <tr>
+                  <th className="px-3 py-2">Symbol</th>
+                  <th className="px-3 py-2">TF</th>
+                  <th className="px-3 py-2">Stage</th>
+                  <th className="px-3 py-2">Score</th>
+                  <th className="px-3 py-2">Repeats</th>
+                  <th className="px-3 py-2">First seen</th>
+                  <th className="px-3 py-2">Last seen</th>
+                  <th className="px-3 py-2">Entry/SL/TP1</th>
+                  <th className="px-3 py-2">MFE/MAE</th>
+                </tr>
+              </thead>
+              <tbody>
+                {setups.slice(0, 120).map((s) => <tr key={s.signal_key} className="border-t border-slate-800">
+                  <td className="px-3 py-2 font-semibold">{s.symbol}</td>
+                  <td className="px-3 py-2">{s.timeframe}</td>
+                  <td className="px-3 py-2">{s.status}</td>
+                  <td className="px-3 py-2">{Number(s.score_last || 0).toFixed(2)} / max {Number(s.score_max || 0).toFixed(2)}</td>
+                  <td className="px-3 py-2">{s.repeat_count}</td>
+                  <td className="px-3 py-2">{s.first_seen ? new Date(s.first_seen).toLocaleString() : "-"}</td>
+                  <td className="px-3 py-2">{s.last_seen ? new Date(s.last_seen).toLocaleString() : "-"}</td>
+                  <td className="px-3 py-2">{Number(s.entry || 0).toFixed(6)} / {Number(s.stop_loss || 0).toFixed(6)} / {Number(s.take_profit_1 || 0).toFixed(6)}</td>
+                  <td className="px-3 py-2">{Number(s.max_gain_pct || 0).toFixed(2)}% / {Number(s.max_drawdown_pct || 0).toFixed(2)}%</td>
+                </tr>)}
+              </tbody>
+            </table>
+            {setups.length === 0 && <p className="p-4 text-sm text-slate-500">Нет активных setup'ов в signals.db</p>}
+          </div>
+        </Card>;
+      }
+
+      function SetupPerformancePanel({ perf, onRefresh }) {
+        return <Card title="Setup Performance (signals.db)" action={<button onClick={onRefresh} className="rounded-full border border-indigo-400/30 bg-indigo-400/10 px-3 py-1 text-xs font-semibold text-indigo-200 hover:bg-indigo-400/20">Refresh performance</button>}>
+          <div className="grid gap-4 lg:grid-cols-3">
+            <BreakdownMini title="By reason" labelKey="reason" rows={perf?.by_reason || []} />
+            <BreakdownMini title="By score bucket" labelKey="score_bucket" rows={perf?.by_score_bucket || []} />
+            <BreakdownMini title="By timeframe" labelKey="timeframe" rows={perf?.by_timeframe || []} />
+          </div>
+        </Card>;
+      }
+
+      function BreakdownMini({ title, labelKey, rows }) {
+        return <div className="overflow-auto rounded-xl border border-slate-800">
+          <div className="bg-slate-900 px-3 py-2 text-sm font-bold">{title}</div>
+          <table className="min-w-full text-left text-xs">
+            <thead className="bg-slate-900/50 text-slate-500">
+              <tr>
+                <th className="px-2 py-2">{labelKey}</th>
+                <th className="px-2 py-2">total</th>
+                <th className="px-2 py-2">TP</th>
+                <th className="px-2 py-2">SL</th>
+                <th className="px-2 py-2">win%</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.slice(0, 12).map((row, idx) => <tr key={`${row[labelKey]}-${idx}`} className="border-t border-slate-800">
+                <td className="px-2 py-2">{row[labelKey]}</td>
+                <td className="px-2 py-2">{row.total}</td>
+                <td className="px-2 py-2">{row.tp}</td>
+                <td className="px-2 py-2">{row.sl}</td>
+                <td className="px-2 py-2">{Number(row.win_rate || 0).toFixed(1)}%</td>
+              </tr>)}
+            </tbody>
+          </table>
+          {rows.length === 0 && <p className="p-3 text-xs text-slate-500">No performance rows yet.</p>}
+        </div>;
       }
 
       function BreakdownTable({ title, rows, labelKey }) {
