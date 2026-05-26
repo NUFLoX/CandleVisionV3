@@ -9,6 +9,8 @@ from pathlib import Path
 
 from orderflow_accum.bybit_rest import BybitRestClient
 from orderflow_accum.config import Settings
+from orderflow_accum.signal_store import SignalStore
+
 
 ACTIVE_STATUSES = {"WATCHING", "ACCUMULATION", "PRE_IMPULSE", "BREAKOUT_PRESSURE", "PENDING"}
 
@@ -79,6 +81,8 @@ def evaluate_outcome(entry: float, sl: float, tp1: float, tp2: float, rows: list
 
 async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int:
     settings = Settings()
+
+    store = SignalStore(db_path=db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM signals WHERE status IN (%s)" % ",".join("?" * len(ACTIVE_STATUSES)), tuple(ACTIVE_STATUSES)).fetchall()
@@ -91,6 +95,18 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
             created = _parse_time(row["first_seen"]) or datetime.now(timezone.utc)
             age_min = (datetime.now(timezone.utc) - created).total_seconds() / 60.0
             if age_min > expires_hours * 60:
+                prev_status = str(row["status"] or "PENDING")
+                conn.execute("UPDATE signals SET status='EXPIRED', outcome='EXPIRED', outcome_checked_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), row["id"]))
+                if prev_status != "EXPIRED":
+                    store.add_event(
+                        signal_key=str(row["signal_key"]),
+                        symbol=str(row["symbol"]),
+                        timeframe=str(row["timeframe"]),
+                        event_type="outcome_transition",
+                        from_status=prev_status,
+                        to_status="EXPIRED",
+                        score_last=float(row["score_last"] or 0.0),
+                    )
                 conn.execute("UPDATE signals SET status='EXPIRED', outcome='EXPIRED', outcome_checked_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), row["id"]))
                 updated += 1
                 continue
@@ -103,6 +119,7 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
             outcome = evaluate_outcome(float(row["entry"]), float(row["stop_loss"]), float(row["take_profit_1"]), float(row["take_profit_2"]), candles, interval_min)
 
             status = row["status"]
+            prev_status = str(row["status"] or "PENDING")
             if outcome.status in {"TP1", "TP2", "SL", "AMBIGUOUS"}:
                 status = outcome.status
 
@@ -126,6 +143,16 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                     row["id"],
                 ),
             )
+            if status != prev_status:
+                store.add_event(
+                    signal_key=str(row["signal_key"]),
+                    symbol=str(row["symbol"]),
+                    timeframe=str(row["timeframe"]),
+                    event_type="outcome_transition",
+                    from_status=prev_status,
+                    to_status=status,
+                    score_last=float(row["score_last"] or 0.0),
+                )
             updated += 1
 
     conn.commit()
