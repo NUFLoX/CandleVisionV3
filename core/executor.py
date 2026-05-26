@@ -11,7 +11,7 @@ from agents.notifier import TelegramNotifier
 from api.telegram import TelegramReporter
 from api.charting import generate_setup_chart
 from api.bybit_client import BybitClient
-from config.settings import TOKEN, CHAT_ID, BYBIT_TESTNET, SIGNALS_ONLY
+from config.settings import TOKEN, CHAT_ID, BYBIT_TESTNET, SIGNALS_ONLY, trading_enabled
 from dashboard.ingest_client import DashboardIngestClient
 
 def calculate_position_size(balance, risk, entry, sl):
@@ -374,7 +374,7 @@ class Executor:
                     continue
 
                 try:
-                    if self.exchange.session:
+                    if trading_enabled() and self.exchange.session:
                         # Обратный ордер для закрытия
                         close_side = "Buy" if side == "Sell" else "Sell"
                         self.exchange.session.place_order(
