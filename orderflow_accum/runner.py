@@ -217,6 +217,7 @@ class AccumulationRunner:
         now = time.time()
         cooldown = self._cooldown_seconds(signal)
         cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
+
         last_sent = self._cooldowns.get(cooldown_key, 0.0)
         if now - last_sent < cooldown:
             return
