@@ -45,16 +45,15 @@ def main() -> None:
     if not rows:
         print("No signals found.")
         return
+
     reason_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
     score_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
     tf_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
     kind_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
     source_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
-
     reason_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "mfe": 0.0, "mae": 0.0})
     score_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
     tf_stats: dict[str, dict[str, float]] = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
-
 
     for r in rows:
         status = (r["status"] or "PENDING").upper()
@@ -90,7 +89,6 @@ def main() -> None:
                 st["pending"] += 1
 
         for st in (score_stats[bucket], tf_stats[tf], kind_stats[kind], source_stats[source]):
-
         for st in (score_stats[bucket], tf_stats[tf]):
             st["total"] += 1
             st["mfe"] += mfe
@@ -136,6 +134,5 @@ def main() -> None:
         total = st["total"] or 1
         win_rate = (st["tp"] / max(st["tp"] + st["sl"], 1)) * 100.0
         print(f"{source}\t{int(st['total'])}\t{int(st['tp'])}\t{int(st['sl'])}\t{int(st['pending'])}\t{win_rate:.2f}%\t{st['mfe']/total:.3f}\t{st['mae']/total:.3f}")
-
 if __name__ == "__main__":
     main()
