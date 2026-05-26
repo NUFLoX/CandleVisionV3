@@ -11,6 +11,7 @@ from orderflow_accum.bybit_rest import BybitRestClient
 from orderflow_accum.config import Settings
 from orderflow_accum.signal_store import SignalStore
 
+
 ACTIVE_STATUSES = {"WATCHING", "ACCUMULATION", "PRE_IMPULSE", "BREAKOUT_PRESSURE", "PENDING"}
 
 
@@ -80,6 +81,7 @@ def evaluate_outcome(entry: float, sl: float, tp1: float, tp2: float, rows: list
 
 async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int:
     settings = Settings()
+
     store = SignalStore(db_path=db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -105,6 +107,7 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                         to_status="EXPIRED",
                         score_last=float(row["score_last"] or 0.0),
                     )
+                conn.execute("UPDATE signals SET status='EXPIRED', outcome='EXPIRED', outcome_checked_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), row["id"]))
                 updated += 1
                 continue
 
