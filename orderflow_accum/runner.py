@@ -137,12 +137,14 @@ class AccumulationRunner:
                             metrics["tf"] = interval
                             self.rejection_logger.append("orderflow", symbol, reason, score, metrics)
                         for signal in signals:
+
                             interval_u = str(interval).upper()
                             is_preimpulse = signal.kind in self._preimpulse_kinds
                             if is_preimpulse and interval_u not in preimpulse_intervals:
                                 continue
                             if not is_preimpulse and interval_u not in realtime_intervals:
                                 continue
+
                             signal.meta["tf"] = interval
                             await self._emit_signal(rest, signal)
                 except Exception as exc:
@@ -212,7 +214,9 @@ class AccumulationRunner:
     async def _emit_signal(self, rest: BybitRestClient, signal) -> None:
         now = time.time()
         cooldown = self._cooldown_seconds(signal)
+        
         cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
+
         last_sent = self._cooldowns.get(cooldown_key, 0.0)
         if now - last_sent < cooldown:
             return
