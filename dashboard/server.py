@@ -181,13 +181,18 @@ def create_app() -> FastAPI:
     @app.get("/api/setup-performance")
     async def setup_performance():
         if not SIGNALS_DB_PATH.exists():
+            return {"by_reason": [], "by_score_bucket": [], "by_timeframe": [], "by_kind": [], "by_source": []}
             return {"by_reason": [], "by_score_bucket": [], "by_timeframe": []}
+
 
         conn = sqlite3.connect(str(SIGNALS_DB_PATH))
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
+                "SELECT reasons_last, score_last, timeframe, kind, source, status, max_gain_pct, max_drawdown_pct FROM signals"
+
                 "SELECT reasons_last, score_last, timeframe, status, max_gain_pct, max_drawdown_pct FROM signals"
+
             ).fetchall()
         finally:
             conn.close()
@@ -214,11 +219,16 @@ def create_app() -> FastAPI:
         reason_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "mfe": 0.0, "mae": 0.0})
         score_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
         tf_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
+        kind_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
+        source_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
+
 
         for row in rows:
             outcome = wl(str(row["status"] or ""))
             score = float(row["score_last"] or 0.0)
             tf = str(row["timeframe"] or "1")
+            kind = str(row["kind"] or "UNKNOWN") if "kind" in row.keys() else "UNKNOWN"
+            source = str(row["source"] or "UNKNOWN") if "source" in row.keys() else "UNKNOWN"
             score_b = bucket(score)
             mfe = float(row["max_gain_pct"] or 0.0)
             mae = float(row["max_drawdown_pct"] or 0.0)
@@ -239,7 +249,11 @@ def create_app() -> FastAPI:
                 elif outcome == "SL":
                     entry["sl"] += 1
 
+
+            for group in (score_stats[score_b], tf_stats[tf], kind_stats[kind], source_stats[source]):
+
             for group in (score_stats[score_b], tf_stats[tf]):
+
                 group["total"] += 1
                 group["mfe"] += mfe
                 group["mae"] += mae
@@ -275,6 +289,8 @@ def create_app() -> FastAPI:
             "by_reason": finalize(reason_stats, "reason"),
             "by_score_bucket": finalize(score_stats, "score_bucket"),
             "by_timeframe": finalize(tf_stats, "timeframe"),
+            "by_kind": finalize(kind_stats, "kind"),
+            "by_source": finalize(source_stats, "source"),
         }
 
     @app.get("/api/watchlist")
