@@ -6,7 +6,6 @@ from scoring.scorer import calculate_score
 from api.market import fetch_ohlcv_bybit_async
 from core.risk_manager import assess_rr
 from config.settings import SCOUT_SCAN_TIMEFRAMES
-from dashboard.ingest_client import DashboardIngestClient
 
 class Scout:
     def __init__(self, queue, strategies=None, ws_stream=None, tape_agent=None):
@@ -99,4 +98,3 @@ class Scout:
             for tf in SCOUT_SCAN_TIMEFRAMES:
                 await self.run_scan_async(symbol, tf)
                 await asyncio.sleep(0.2)
-        self.logger.info("✅ Цикл сканирования завершен.")
