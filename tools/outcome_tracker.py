@@ -9,6 +9,7 @@ from pathlib import Path
 from orderflow_accum.bybit_rest import BybitRestClient
 from orderflow_accum.config import Settings
 from orderflow_accum.signal_store import SignalStore
+
 ACTIVE_STATUSES = {"WATCHING", "ACCUMULATION", "PRE_IMPULSE", "BREAKOUT_PRESSURE", "PENDING"}
 
 
@@ -77,7 +78,6 @@ def evaluate_outcome(entry: float, sl: float, tp1: float, tp2: float, rows: list
 
 
 async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int:
-
     from orderflow_accum.bybit_rest import BybitRestClient
     from orderflow_accum.config import Settings
     from orderflow_accum.signal_store import SignalStore

@@ -124,7 +124,6 @@ def main() -> None:
         win_rate = (st["tp"] / max(st["tp"] + st["sl"], 1)) * 100.0
         print(f"{tf}\t{int(st['total'])}\t{int(st['tp'])}\t{int(st['sl'])}\t{int(st['pending'])}\t{win_rate:.2f}%\t{st['mfe']/total:.3f}\t{st['mae']/total:.3f}")
 
-
     print("\n=== KIND REPORT ===")
     print("kind\ttotal\ttp\tsl\tpending\twin_rate\tavg_mfe\tavg_mae")
     for kind, st in sorted(kind_stats.items(), key=lambda x: x[1]["total"], reverse=True):
