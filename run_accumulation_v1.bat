@@ -63,6 +63,10 @@ if not exist ".env" (
     copy /Y ".env.example" ".env" >nul
 )
 
+if "%DASHBOARD_API_URL%"=="" (
+    set "DASHBOARD_API_URL=http://127.0.0.1:8000"
+)
+
 echo Starting Accumulation V1.4.2 DIAG...
 python orderflow_accum_main.py
 

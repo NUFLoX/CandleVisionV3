@@ -2,6 +2,7 @@ import asyncio
 import uuid
 from enum import Enum
 from typing import Dict, Optional
+from config.settings import trading_enabled
 
 
 class OrderStatus(str, Enum):
@@ -37,6 +38,8 @@ class OrderManager:
 
     async def create_order(self, symbol, side, qty, price, sl, tp):
         async with self._lock(symbol):
+            if not trading_enabled():
+                return OrderStatus.FAILED
             if self.store.has_active_position(symbol):
                 return OrderStatus.FAILED
 
