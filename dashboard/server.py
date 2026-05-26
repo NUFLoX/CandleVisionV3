@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Annotated
 
@@ -18,6 +19,7 @@ from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+SIGNALS_DB_PATH = Path("data/signals.db")
 
 
 class WebSocketHub:
@@ -132,6 +134,48 @@ def create_app() -> FastAPI:
         timeframe: str | None = None,
     ):
         return await store.list_signals(strength, signal_type, exchange, timeframe)
+
+    @app.get("/api/active-setups")
+    async def active_setups(limit: Annotated[int, Query(ge=1, le=2000)] = 500):
+        if not SIGNALS_DB_PATH.exists():
+            return []
+        statuses = ("WATCHING", "ACCUMULATION", "PRE_IMPULSE", "BREAKOUT_PRESSURE", "PENDING")
+        query = f"""
+            SELECT
+                id,
+                signal_key,
+                symbol,
+                market,
+                timeframe,
+                source,
+                kind,
+                side,
+                score_first,
+                score_last,
+                score_max,
+                entry,
+                stop_loss,
+                take_profit_1,
+                take_profit_2,
+                first_seen,
+                last_seen,
+                repeat_count,
+                status,
+                reasons_last,
+                max_gain_pct,
+                max_drawdown_pct
+            FROM signals
+            WHERE status IN ({",".join("?" for _ in statuses)})
+            ORDER BY last_seen DESC
+            LIMIT ?
+        """
+        conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(query, (*statuses, limit)).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
 
     @app.get("/api/watchlist")
     async def watchlist():
