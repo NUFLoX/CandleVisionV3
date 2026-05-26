@@ -444,18 +444,13 @@ class RealtimeAccumulationEngine:
         pre_score = 0.0
         pre_reasons: list[str] = []
 
-        tf_scale = max(1.0, min(tf_minutes / 5.0, 6.0))
-        duration_threshold_minutes = int(90 * tf_scale)
-        wide_range_threshold = 5.5 + max(0.0, (tf_scale - 1.0) * 0.8)
-        high_displacement_threshold = 1.3 + max(0.0, (tf_scale - 1.0) * 0.35)
-
         if range_width_pct <= 3.2:
             pre_score += 2.0
             pre_reasons.append(f"long_sideways_range={range_width_pct:.2f}%")
         if body_compression_ratio <= 0.7:
             pre_score += 2.0
             pre_reasons.append(f"candle_body_compression={body_compression_ratio:.2f}")
-        if turnover_build > self.settings.effective_min_trade_notional * 3.0 and displacement_pct <= high_displacement_threshold:
+        if turnover_build > self.settings.effective_min_trade_notional * 3.0 and displacement_pct <= 1.3:
             pre_score += 2.0
             pre_reasons.append("high_turnover_low_displacement")
         if turnover_displacement_ratio >= 2.0:
