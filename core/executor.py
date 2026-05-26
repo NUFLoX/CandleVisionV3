@@ -11,7 +11,7 @@ from agents.notifier import TelegramNotifier
 from api.telegram import TelegramReporter
 from api.charting import generate_setup_chart
 from api.bybit_client import BybitClient
-from config.settings import TOKEN, CHAT_ID, BYBIT_TESTNET, SIGNALS_ONLY
+from config.settings import TOKEN, CHAT_ID, BYBIT_TESTNET, SIGNALS_ONLY, trading_enabled
 from dashboard.ingest_client import DashboardIngestClient
 
 def calculate_position_size(balance, risk, entry, sl):
@@ -280,6 +280,9 @@ class Executor:
 
     def _place_limit_order(self, symbol, side, qty, entry_price, sl_price, tp_price, timeframe="1m"):
         try:
+            if not trading_enabled():
+                self.logger.warning(f"🛡️ trading_enabled=false. Пропускаем _place_limit_order для {symbol}")
+                return None
             rules = self._instrument_rules(symbol)
             if not rules:
                 self.logger.error(f"❌ {symbol}: нет instrument rules, ордер запрещен.")
@@ -374,7 +377,7 @@ class Executor:
                     continue
 
                 try:
-                    if self.exchange.session:
+                    if trading_enabled() and self.exchange.session:
                         # Обратный ордер для закрытия
                         close_side = "Buy" if side == "Sell" else "Sell"
                         self.exchange.session.place_order(
