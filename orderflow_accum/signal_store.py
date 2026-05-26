@@ -71,10 +71,37 @@ class SignalStore:
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL,
                 repeat_count INTEGER NOT NULL,
+
+                status TEXT NOT NULL,
+                outcome TEXT,
+                outcome_checked_at TEXT,
+                time_to_tp1_minutes REAL,
+                time_to_tp2_minutes REAL,
+                time_to_sl_minutes REAL,
+                max_gain_pct REAL,
+                max_drawdown_pct REAL
+            )
+            """
+        )
+        for col, typ in (
+            ("outcome", "TEXT"),
+            ("outcome_checked_at", "TEXT"),
+            ("time_to_tp1_minutes", "REAL"),
+            ("time_to_tp2_minutes", "REAL"),
+            ("time_to_sl_minutes", "REAL"),
+            ("max_gain_pct", "REAL"),
+            ("max_drawdown_pct", "REAL"),
+        ):
+            try:
+                cur.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass
+
                 status TEXT NOT NULL
             )
             """
         )
+        
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_tf ON signals(symbol, timeframe)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
         self.conn.commit()

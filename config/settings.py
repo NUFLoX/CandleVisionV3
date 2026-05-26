@@ -80,21 +80,3 @@ def trading_enabled() -> bool:
     return (not SIGNALS_ONLY) and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
 
 
-
-def trading_enabled() -> bool:
-    return (not SIGNALS_ONLY) and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
-
-
-def trading_enabled() -> bool:
-    return (not SIGNALS_ONLY) and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
-
-def trading_enabled() -> bool:
-    return (not SIGNALS_ONLY) and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
-
-def trading_enabled() -> bool:
-    return (not SIGNALS_ONLY) and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)
-
-
-
-
-
