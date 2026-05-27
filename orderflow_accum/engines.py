@@ -452,9 +452,11 @@ class RealtimeAccumulationEngine:
         if range_width_pct <= 3.2:
             pre_score += 2.0
             pre_reasons.append(f"long_sideways_range={range_width_pct:.2f}%")
+
         if body_compression_ratio <= 0.7:
             pre_score += 2.0
             pre_reasons.append(f"candle_body_compression={body_compression_ratio:.2f}")
+
         if turnover_build > self.settings.effective_min_trade_notional * 3.0 and displacement_pct <= high_displacement_threshold:
             pre_score += 2.0
             pre_reasons.append("high_turnover_low_displacement")
