@@ -8,7 +8,7 @@ import time
 
 from dashboard.ingest_client import DashboardIngestClient
 
-from .bybit_rest import BybitRestClient
+from .bybit_rest import BybitRestClient, ScanTarget
 from .config import Settings
 from .console_ui import ConsoleUI
 from .engines import MacroAccumulationEngine, RealtimeAccumulationEngine
@@ -43,18 +43,20 @@ class AccumulationRunner:
             "BREAKOUT_PRESSURE",
         }
 
-    def _filter_symbols(self, symbols: list[str]) -> list[str]:
-        out: list[str] = []
-        seen: set[str] = set()
-        for symbol in symbols:
+    def _filter_symbols(self, symbols: list[ScanTarget]) -> list[ScanTarget]:
+        out: list[ScanTarget] = []
+        seen: set[tuple[str, str]] = set()
+        for target in symbols:
+            symbol = target.symbol
             if any(fnmatch.fnmatch(symbol, pattern) for pattern in self.settings.symbol_exclude_patterns):
                 continue
             if symbol in self.settings.symbols_blocklist:
                 continue
-            if symbol in seen:
+            key = (symbol, target.market)
+            if key in seen:
                 continue
-            seen.add(symbol)
-            out.append(symbol)
+            seen.add(key)
+            out.append(target)
         return out
 
     async def run(self) -> None:
@@ -96,7 +98,7 @@ class AccumulationRunner:
             )
 
             tasks = [
-                asyncio.create_task(stream.run(realtime_symbols), name="accum_ws"),
+                asyncio.create_task(stream.run([target.symbol for target in realtime_symbols]), name="accum_ws"),
                 asyncio.create_task(self._run_realtime_scan(rest, stream, realtime_symbols), name="accum_realtime"),
                 asyncio.create_task(self._run_macro_scan(rest, macro_symbols), name="accum_macro"),
                 asyncio.create_task(self._run_status(stream, len(realtime_symbols), len(macro_symbols)), name="accum_status"),
@@ -121,16 +123,32 @@ class AccumulationRunner:
             self.ui.print_session(realtime_count, macro_count)
             await asyncio.sleep(30)
 
-    async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[str]) -> None:
+    async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[ScanTarget]) -> None:
         self.logger.info("Realtime accumulation loop started for %s symbols", len(symbols))
         preimpulse_intervals = {value.upper() for value in self.settings.preimpulse_intervals}
         realtime_intervals = {value.upper() for value in self.settings.realtime_intervals}
-        while True:
-            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "realtime", "symbols": len(symbols)})
-            for symbol in symbols:
+                while True:
+            await self.dashboard.post_heartbeat(
+                "scanner",
+                meta={
+                    "runner": "orderflow_accum",
+                    "loop": "realtime",
+                    "symbols": len(symbols),
+                },
+            )
+
+            for target in symbols:
                 try:
+                    symbol = target.symbol
+
                     for interval in self.settings.realtime_intervals:
-                        df = await rest.fetch_klines(symbol, interval=interval, limit=180)
+                        df = await rest.fetch_klines(
+                            symbol,
+                            interval=interval,
+                            limit=180,
+                            category=target.market,
+                        )
+
                         state = stream.get_state(symbol)
                         signals = self.realtime_engine.analyze(symbol, df, state)
                         if not signals:
@@ -143,28 +161,33 @@ class AccumulationRunner:
                             is_preimpulse = signal.kind in self._preimpulse_kinds
                             if is_preimpulse and interval_u not in preimpulse_intervals:
                                 continue
-                            if not is_preimpulse and interval_u not in realtime_intervals:
+                                                        if not is_preimpulse and interval_u not in realtime_intervals:
                                 continue
+
                             signal.meta["tf"] = interval
+                            signal.meta["market"] = target.market
+
                             await self._emit_signal(rest, signal)
                 except Exception as exc:
                     self.logger.warning("Realtime scan failed for %s: %r", symbol, exc)
                 await asyncio.sleep(0.05)
             await asyncio.sleep(max(self.settings.realtime_scan_every_seconds, 1))
 
-    async def _run_macro_scan(self, rest: BybitRestClient, symbols: list[str]) -> None:
+    async def _run_macro_scan(self, rest: BybitRestClient, symbols: list[ScanTarget]) -> None:
         self.logger.info("Macro base scan loop started for %s symbols", len(symbols))
         intervals = {"60": 60, "240": 50, "D": 45}
         while True:
             await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "macro", "symbols": len(symbols)})
-            for symbol in symbols:
+            for target in symbols:
                 try:
+                    symbol = target.symbol
                     frames = {}
                     for interval, limit in intervals.items():
-                        frames[interval] = await rest.fetch_klines(symbol, interval=interval, limit=limit)
+                        frames[interval] = await rest.fetch_klines(symbol, interval=interval, limit=limit, category=target.market)
                         await asyncio.sleep(0.04)
                     signal = self.macro_engine.analyze(symbol, frames)
                     if signal:
+                        signal.meta["market"] = target.market
                         await self._emit_signal(rest, signal)
                     else:
                         reason, score, metrics = self.macro_engine.diagnose(symbol, frames)
@@ -185,7 +208,8 @@ class AccumulationRunner:
             else:
                 interval = str(signal.meta.get("tf") or "1")
                 bars = self.settings.chart_bars_realtime
-            df = await rest.fetch_klines(signal.symbol, interval=interval, limit=bars)
+            market = str(signal.meta.get("market", "linear"))
+            df = await rest.fetch_klines(signal.symbol, interval=interval, limit=bars, category=market)
             if df.empty:
                 return None
             support = signal.meta.get("support")
@@ -235,6 +259,9 @@ class AccumulationRunner:
         )
         target_logger = self.orderflow_logger if signal.source == "orderflow" else self.macro_logger
         target_logger.info("📡 %s", log_body)
+        if not upsert.should_notify:
+            return
+        # Policy: CSV/UI are notify-only to avoid repeat-noise pollution.
         self.csv_logger.append(signal)
         self.ui.update_session(macro=self._counts["macro"], orderflow=self._counts["orderflow"])
         self.ui.print_signal(signal)

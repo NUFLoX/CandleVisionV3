@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
 import pandas as pd
 
 logger = logging.getLogger("OrderFlow.BybitREST")
+
+@dataclass(slots=True)
+class ScanTarget:
+    symbol: str
+    market: str
 
 
 class BybitRestClient:
@@ -94,7 +100,7 @@ class BybitRestClient:
         market_categories: list[str] | None = None,
         allowlist: list[str] | None = None,
         blocklist: list[str] | None = None,
-    ) -> list[str]:
+    ) -> list[ScanTarget]:
         allow = set(allowlist or [])
         block = set(blocklist or [])
         categories = [c.lower() for c in (market_categories or ["linear"]) if c]
@@ -105,7 +111,9 @@ class BybitRestClient:
                 row = dict(row)
                 row["_category"] = category
                 tickers.append(row)
-        symbols: list[tuple[str, float]] = []
+
+        symbols: list[tuple[str, float, str]] = []
+
         for row in tickers:
             symbol = row.get("symbol", "")
             if not symbol.endswith(quote_coin):
@@ -121,8 +129,8 @@ class BybitRestClient:
                 continue
             if turnover < min_notional_24h or last_price < min_last_price:
                 continue
-            symbols.append((symbol, turnover))
+            symbols.append((symbol, turnover, str(row.get("_category", "linear")).lower()))
         symbols.sort(key=lambda item: item[1], reverse=True)
-        selected = [symbol for symbol, _ in symbols[:limit]]
+        selected = [ScanTarget(symbol=symbol, market=market) for symbol, _, market in symbols[:limit]]
         logger.info("Selected %s symbols for scan", len(selected))
         return selected

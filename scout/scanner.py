@@ -5,8 +5,6 @@ import asyncio
 import logging
 from typing import Any
 
-import pandas as pd
-
 from api.market import fetch_ohlcv_bybit_async
 from config.settings import SCOUT_SCAN_TIMEFRAMES
 from core.risk_manager import assess_rr
@@ -55,13 +53,15 @@ class Scout:
                 }
             )
         except TypeError:
-            # Fallback на старую сигнатуру, если dashboard client её использует.
-            await self.dashboard.post_watchlist(
-                symbol,
-                timeframe=timeframe,
-                score=score,
-                reason=reason,
-            )
+            try:
+                await self.dashboard.post_watchlist(
+                    symbol,
+                    timeframe=timeframe,
+                    score=score,
+                    reason=reason,
+                )
+            except Exception as exc:
+                self.logger.debug(f"Dashboard watchlist ingest failed for {symbol}: {exc}")
         except Exception as exc:
             self.logger.debug(f"Dashboard watchlist ingest failed for {symbol}: {exc}")
 
@@ -77,8 +77,10 @@ class Scout:
                 meta=meta,
             )
         except TypeError:
-            # Fallback на старую сигнатуру.
-            await self.dashboard.post_heartbeat("scanner", meta=meta)
+            try:
+                await self.dashboard.post_heartbeat("scanner", meta=meta)
+            except Exception as exc:
+                self.logger.debug(f"Dashboard heartbeat failed: {exc}")
         except Exception as exc:
             self.logger.debug(f"Dashboard heartbeat failed: {exc}")
 
@@ -88,7 +90,7 @@ class Scout:
         if df.empty or len(df) < 50:
             return
 
-        reasons = []
+        reasons: list[str] = []
         found_any = False
 
         for strategy in self.strategies:
@@ -98,7 +100,7 @@ class Scout:
                 found_any = True
 
                 if isinstance(msg, list):
-                    reasons.extend(msg)
+                    reasons.extend(str(item) for item in msg)
                 elif msg:
                     reasons.append(str(msg))
 
@@ -126,34 +128,36 @@ class Scout:
 
         score += whale_bonus
 
-        if score >= 1.5:
-            signal_data = {
-                "symbol": symbol,
-                "timeframe": tf,
-                "entry_price": risk["entry"],
-                "score": score,
-                "side": "Buy",
-                "sl": risk["sl"],
-                "tp": risk["tp"],
-                "rr": risk["rr"],
-                "reasons": reasons
-                + [
-                    f"RR={risk['rr']:.2f}",
-                    f"SL={risk['sl_pct']:.2f}%",
-                    f"TP={risk['tp_pct']:.2f}%",
-                ],
-                "imbalance": imbalance,
-                "df": df.tail(100),
-            }
+        if score < 1.5:
+            return
 
-            await self.queue.put(signal_data)
+        signal_data = {
+            "symbol": symbol,
+            "timeframe": tf,
+            "entry_price": risk["entry"],
+            "score": score,
+            "side": "Buy",
+            "sl": risk["sl"],
+            "tp": risk["tp"],
+            "rr": risk["rr"],
+            "reasons": reasons
+            + [
+                f"RR={risk['rr']:.2f}",
+                f"SL={risk['sl_pct']:.2f}%",
+                f"TP={risk['tp_pct']:.2f}%",
+            ],
+            "imbalance": imbalance,
+            "df": df.tail(100),
+        }
 
-            await self._post_watchlist_safe(
-                symbol=symbol,
-                timeframe=tf,
-                score=score,
-                reason="; ".join(reasons[:4]) if reasons else "scout_signal",
-            )
+        await self.queue.put(signal_data)
+
+        await self._post_watchlist_safe(
+            symbol=symbol,
+            timeframe=tf,
+            score=score,
+            reason="; ".join(reasons[:4]) if reasons else "scout_signal",
+        )
 
     async def recheck_watchlist_async(self, watchlist_symbols: list):
         """Метод 'Спецназа': быстрая проверка избранных монет."""
