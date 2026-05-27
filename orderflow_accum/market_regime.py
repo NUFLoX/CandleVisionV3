@@ -27,7 +27,7 @@ class MarketRegimeAnalyzer:
         if df is None:
             df = next(iter(frames.values()))
 
-        if df is None or df.empty or len(df) < 30:
+        if df is None or df.empty or len(df) < 4:
             return MarketRegime()
 
         last = df.iloc[-1]
