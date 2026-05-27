@@ -123,11 +123,13 @@ class AccumulationRunner:
             self.ui.print_session(realtime_count, macro_count)
             await asyncio.sleep(30)
 
-    async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[ScanTarget]) -> None:
+        async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[ScanTarget]) -> None:
         self.logger.info("Realtime accumulation loop started for %s symbols", len(symbols))
+
         preimpulse_intervals = {value.upper() for value in self.settings.preimpulse_intervals}
         realtime_intervals = {value.upper() for value in self.settings.realtime_intervals}
-                while True:
+
+        while True:
             await self.dashboard.post_heartbeat(
                 "scanner",
                 meta={
@@ -161,9 +163,8 @@ class AccumulationRunner:
                             is_preimpulse = signal.kind in self._preimpulse_kinds
                             if is_preimpulse and interval_u not in preimpulse_intervals:
                                 continue
-                                                        if not is_preimpulse and interval_u not in realtime_intervals:
+                            if not is_preimpulse and interval_u not in realtime_intervals:
                                 continue
-
                             signal.meta["tf"] = interval
                             signal.meta["market"] = target.market
 

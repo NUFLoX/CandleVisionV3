@@ -33,3 +33,10 @@ This document tracks closure evidence for the final stage of the pre-impulse/sig
   - TP/SL distribution
   - reason/timeframe effectiveness
   - duplicate signal suppression ratio
+
+
+## Documentation
+
+- `docs/OPERATIONS.md` (runbook, safe/live mode, sidecar outcome tracker)
+- `docs/MIGRATIONS.md` (schema versioning and migration policy)
+

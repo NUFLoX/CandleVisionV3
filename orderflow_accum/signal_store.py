@@ -100,7 +100,6 @@ class SignalStore:
             """
         )
 
-        # Lightweight migrations for older local databases.
         for col, typ in (
             ("outcome", "TEXT"),
             ("outcome_checked_at", "TEXT"),
@@ -113,7 +112,6 @@ class SignalStore:
             try:
                 cur.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
             except sqlite3.OperationalError:
-                # Column already exists.
                 pass
 
         cur.execute(
