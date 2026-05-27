@@ -129,9 +129,15 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                 updated += 1
                 continue
 
-            category = str(row["market"] or "linear").lower()
-            df = await client.fetch_klines(str(row["symbol"]), interval=tf, limit=lookahead_bars, category=category)
-                        if df.empty:
+                        category = str(row["market"] or "linear").lower()
+            df = await client.fetch_klines(
+                str(row["symbol"]),
+                interval=tf,
+                limit=lookahead_bars,
+                category=category,
+            )
+
+            if df.empty:
                 continue
 
             candles = df.to_dict("records")
@@ -147,7 +153,7 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
             )
 
             status = row["status"]
-            prev_status = str(row["status"] or "PENDING")G")
+            prev_status = str(row["status"] or "PENDING")
             if outcome.status in {"TP1", "TP2", "SL", "AMBIGUOUS"}:
                 status = outcome.status
 
