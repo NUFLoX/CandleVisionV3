@@ -38,6 +38,18 @@ class Outcome:
 
 
 def evaluate_outcome(entry: float, sl: float, tp1: float, tp2: float, rows: list[dict], interval_min: int) -> Outcome:
+    return evaluate_outcome_for_side(entry, sl, tp1, tp2, rows, interval_min, side="Buy")
+
+
+def evaluate_outcome_for_side(
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    rows: list[dict],
+    interval_min: int,
+    side: str = "Buy",
+) -> Outcome:
     max_gain = float("-inf")
     max_dd = float("inf")
     t_tp1 = None
@@ -47,14 +59,22 @@ def evaluate_outcome(entry: float, sl: float, tp1: float, tp2: float, rows: list
     for idx, candle in enumerate(rows):
         high = float(candle["high"])
         low = float(candle["low"])
-        gain = (high - entry) / max(entry, 1e-12) * 100.0
-        dd = (low - entry) / max(entry, 1e-12) * 100.0
+
+        if str(side).lower() == "sell":
+            gain = (entry - low) / max(entry, 1e-12) * 100.0
+            dd = (entry - high) / max(entry, 1e-12) * 100.0
+            hit_tp1 = low <= tp1
+            hit_tp2 = low <= tp2
+            hit_sl = high >= sl
+        else:
+            gain = (high - entry) / max(entry, 1e-12) * 100.0
+            dd = (low - entry) / max(entry, 1e-12) * 100.0
+            hit_tp1 = high >= tp1
+            hit_tp2 = high >= tp2
+            hit_sl = low <= sl
+
         max_gain = max(max_gain, gain)
         max_dd = min(max_dd, dd)
-
-        hit_tp1 = high >= tp1
-        hit_tp2 = high >= tp2
-        hit_sl = low <= sl
 
         if hit_tp1 and t_tp1 is None:
             t_tp1 = (idx + 1) * interval_min
@@ -111,13 +131,23 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
 
             category = str(row["market"] or "linear").lower()
             df = await client.fetch_klines(str(row["symbol"]), interval=tf, limit=lookahead_bars, category=category)
-            if df.empty:
+                        if df.empty:
                 continue
+
             candles = df.to_dict("records")
-            outcome = evaluate_outcome(float(row["entry"]), float(row["stop_loss"]), float(row["take_profit_1"]), float(row["take_profit_2"]), candles, interval_min)
+
+            outcome = evaluate_outcome_for_side(
+                float(row["entry"]),
+                float(row["stop_loss"]),
+                float(row["take_profit_1"]),
+                float(row["take_profit_2"]),
+                candles,
+                interval_min,
+                side=str(row["side"] or "Buy"),
+            )
 
             status = row["status"]
-            prev_status = str(row["status"] or "PENDING")
+            prev_status = str(row["status"] or "PENDING")G")
             if outcome.status in {"TP1", "TP2", "SL", "AMBIGUOUS"}:
                 status = outcome.status
 

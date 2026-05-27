@@ -85,6 +85,22 @@ if "%RUN_OUTCOME_TRACKER%"=="" (
     set "RUN_OUTCOME_TRACKER=false"
 )
 
+if "%DASHBOARD_API_URL%"=="" (
+    set "DASHBOARD_API_URL=http://127.0.0.1:8000"
+)
+
+if "%DASHBOARD_INGEST_TOKEN%"=="" (
+    set "DASHBOARD_INGEST_TOKEN="
+)
+
+if "%SIGNALS_ONLY%"=="" (
+    set "SIGNALS_ONLY=true"
+)
+
+if "%RUN_OUTCOME_TRACKER%"=="" (
+    set "RUN_OUTCOME_TRACKER=false"
+)
+
 if "%OUTCOME_TRACKER_INTERVAL_MINUTES%"=="" (
     set "OUTCOME_TRACKER_INTERVAL_MINUTES=10"
 )

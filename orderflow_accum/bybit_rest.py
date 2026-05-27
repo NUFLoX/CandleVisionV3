@@ -111,7 +111,7 @@ class BybitRestClient:
                 row = dict(row)
                 row["_category"] = category
                 tickers.append(row)
-                
+
         symbols: list[tuple[str, float, str]] = []
 
         for row in tickers:

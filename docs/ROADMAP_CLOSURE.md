@@ -39,4 +39,3 @@ This document tracks closure evidence for the final stage of the pre-impulse/sig
 
 - `docs/OPERATIONS.md` (runbook, safe/live mode, sidecar outcome tracker)
 - `docs/MIGRATIONS.md` (schema versioning and migration policy)
-

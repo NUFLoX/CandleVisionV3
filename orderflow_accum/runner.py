@@ -12,6 +12,8 @@ from .bybit_rest import BybitRestClient, ScanTarget
 from .config import Settings
 from .console_ui import ConsoleUI
 from .engines import MacroAccumulationEngine, RealtimeAccumulationEngine
+from .short_engine import DistributionShortEngine
+from .market_regime import MarketRegimeAnalyzer
 from .chart_render import render_signal_chart
 from .signal_logger import RejectionCsvLogger, SignalCsvLogger
 from .signal_store import SignalStore
@@ -29,6 +31,8 @@ class AccumulationRunner:
         self.orderflow_logger = logging.getLogger("Accum.Signal.Realtime")
         self.telegram = TelegramNotifier(settings.telegram_token, settings.telegram_chat_id)
         self.realtime_engine = RealtimeAccumulationEngine(settings)
+        self.short_engine = DistributionShortEngine(settings)
+        self.regime_analyzer = MarketRegimeAnalyzer(short_bonus=settings.short_btc_bonus, long_bearish_penalty=settings.long_btc_bearish_penalty)
         self.macro_engine = MacroAccumulationEngine(settings)
         self.csv_logger = SignalCsvLogger("accumulation_signals.csv")
         self.rejection_logger = RejectionCsvLogger("rejection_reasons.csv")
@@ -139,6 +143,21 @@ class AccumulationRunner:
                 },
             )
 
+            btc_frames = {}
+
+            try:
+                for tf in self.settings.btc_regime_intervals:
+                    btc_frames[tf] = await rest.fetch_klines(
+                        "BTCUSDT",
+                        interval=tf,
+                        limit=120,
+                        category="linear",
+                    )
+            except Exception:
+                btc_frames = {}
+
+            regime = self.regime_analyzer.analyze_btc(btc_frames)
+
             for target in symbols:
                 try:
                     symbol = target.symbol
@@ -152,7 +171,22 @@ class AccumulationRunner:
                         )
 
                         state = stream.get_state(symbol)
-                        signals = self.realtime_engine.analyze(symbol, df, state)
+
+                        long_signals = self.realtime_engine.analyze(symbol, df, state)
+
+                        for signal in long_signals:
+                            signal.score = round(signal.score + float(regime.long_penalty or 0.0), 2)
+                            signal.meta["btc_regime"] = regime.btc_regime
+
+                        short_signals = []
+
+                        if self.settings.enable_short_engine and target.market == "linear":
+                            short_signals = self.short_engine.analyze(symbol, df, state, regime)
+
+                            for signal in short_signals:
+                                signal.meta["btc_regime"] = regime.btc_regime
+
+                        signals = long_signals + short_signals
                         if not signals:
                             reason, score, metrics = self.realtime_engine.diagnose(symbol, df, state)
                             metrics = dict(metrics or {})

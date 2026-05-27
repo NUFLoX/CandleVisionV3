@@ -27,6 +27,18 @@ def _phase_from_kind(kind: str) -> str:
     if k == "BREAKOUT_PRESSURE":
         return "BREAKOUT_PRESSURE"
 
+    if k == "SHORT_WATCH":
+        return "WATCHING"
+
+    if k == "DISTRIBUTION_ZONE":
+        return "DISTRIBUTION"
+
+    if k == "PRE_DUMP_ZONE":
+        return "PRE_DUMP"
+
+    if k == "CONFIRMED_BREAKDOWN":
+        return "BREAKDOWN_PRESSURE"
+
     return "PENDING"
 
 
