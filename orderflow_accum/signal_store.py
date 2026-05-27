@@ -397,3 +397,4 @@ class SignalStore:
 
     def close(self) -> None:
         self.conn.close()
+

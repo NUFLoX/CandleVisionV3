@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import asyncio
@@ -199,3 +198,4 @@ class Scout:
                 await asyncio.sleep(0.2)
 
         self.logger.info("✅ Цикл сканирования завершен.")
+

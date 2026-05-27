@@ -25,8 +25,6 @@ if [[ "$RUN_OUTCOME_TRACKER" == "true" ]]; then
   python tools/outcome_tracker.py --db data/signals.db --loop --interval-minutes "$OUTCOME_TRACKER_INTERVAL_MINUTES" &
 fi
 
-
-
 echo "DASHBOARD_API_URL=$DASHBOARD_API_URL"
 echo "SIGNALS_ONLY=$SIGNALS_ONLY"
 echo "RUN_OUTCOME_TRACKER=$RUN_OUTCOME_TRACKER"
@@ -34,7 +32,6 @@ echo "RUN_OUTCOME_TRACKER=$RUN_OUTCOME_TRACKER"
 if [[ "$RUN_OUTCOME_TRACKER" == "true" ]]; then
   python tools/outcome_tracker.py --db data/signals.db --loop --interval-minutes "$OUTCOME_TRACKER_INTERVAL_MINUTES" &
 fi
-
 
 python orderflow_accum_main.py
 
