@@ -129,7 +129,6 @@ class AccumulationRunner:
 
     async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[ScanTarget]) -> None:
         self.logger.info("Realtime accumulation loop started for %s symbols", len(symbols))
-
         preimpulse_intervals = {value.upper() for value in self.settings.preimpulse_intervals}
         realtime_intervals = {value.upper() for value in self.settings.realtime_intervals}
 
@@ -185,7 +184,6 @@ class AccumulationRunner:
 
                             for signal in short_signals:
                                 signal.meta["btc_regime"] = regime.btc_regime
-
                         signals = long_signals + short_signals
                         if not signals:
                             reason, score, metrics = self.realtime_engine.diagnose(symbol, df, state)

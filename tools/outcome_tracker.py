@@ -8,21 +8,47 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-ACTIVE_STATUSES = {"WATCHING", "ACCUMULATION", "PRE_IMPULSE", "BREAKOUT_PRESSURE", "PENDING"}
+ACTIVE_STATUSES = {
+    "WATCHING",
+    "ACCUMULATION",
+    "PRE_IMPULSE",
+    "BREAKOUT_PRESSURE",
+    "DISTRIBUTION",
+    "PRE_DUMP",
+    "PENDING",
+}
 
 
 def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
+
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt
     except Exception:
         return None
 
 
 def _interval_to_minutes(tf: str) -> int:
     t = (tf or "1").strip().upper()
-    mapping = {"1": 1, "3": 3, "5": 5, "15": 15, "30": 30, "60": 60, "120": 120, "240": 240, "D": 1440}
+
+    mapping = {
+        "1": 1,
+        "3": 3,
+        "5": 5,
+        "15": 15,
+        "30": 30,
+        "60": 60,
+        "120": 120,
+        "240": 240,
+        "D": 1440,
+    }
+
     return mapping.get(t, 1)
 
 
@@ -37,8 +63,23 @@ class Outcome:
     max_drawdown_pct: float
 
 
-def evaluate_outcome(entry: float, sl: float, tp1: float, tp2: float, rows: list[dict], interval_min: int) -> Outcome:
-    return evaluate_outcome_for_side(entry, sl, tp1, tp2, rows, interval_min, side="Buy")
+def evaluate_outcome(
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    rows: list[dict],
+    interval_min: int,
+) -> Outcome:
+    return evaluate_outcome_for_side(
+        entry=entry,
+        sl=sl,
+        tp1=tp1,
+        tp2=tp2,
+        rows=rows,
+        interval_min=interval_min,
+        side="Buy",
+    )
 
 
 def evaluate_outcome_for_side(
@@ -56,19 +97,23 @@ def evaluate_outcome_for_side(
     t_tp2 = None
     t_sl = None
 
+    is_short = str(side or "Buy").lower() == "sell"
+
     for idx, candle in enumerate(rows):
         high = float(candle["high"])
         low = float(candle["low"])
 
-        if str(side).lower() == "sell":
+        if is_short:
             gain = (entry - low) / max(entry, 1e-12) * 100.0
             dd = (entry - high) / max(entry, 1e-12) * 100.0
+
             hit_tp1 = low <= tp1
             hit_tp2 = low <= tp2
             hit_sl = high >= sl
         else:
             gain = (high - entry) / max(entry, 1e-12) * 100.0
             dd = (low - entry) / max(entry, 1e-12) * 100.0
+
             hit_tp1 = high >= tp1
             hit_tp2 = high >= tp2
             hit_sl = low <= sl
@@ -78,21 +123,29 @@ def evaluate_outcome_for_side(
 
         if hit_tp1 and t_tp1 is None:
             t_tp1 = (idx + 1) * interval_min
+
         if hit_tp2 and t_tp2 is None:
             t_tp2 = (idx + 1) * interval_min
+
         if hit_sl and t_sl is None:
             t_sl = (idx + 1) * interval_min
 
-        if hit_tp2 and hit_sl:
+        if hit_sl and (hit_tp1 or hit_tp2):
             return Outcome("AMBIGUOUS", idx + 1, t_tp1, t_tp2, t_sl, max_gain, max_dd)
-        if hit_sl and not hit_tp1:
+
+        if hit_sl:
             return Outcome("SL", idx + 1, t_tp1, t_tp2, t_sl, max_gain, max_dd)
+
         if hit_tp2:
             return Outcome("TP2", idx + 1, t_tp1, t_tp2, t_sl, max_gain, max_dd)
 
+    safe_gain = max_gain if max_gain != float("-inf") else 0.0
+    safe_dd = max_dd if max_dd != float("inf") else 0.0
+
     if t_tp1 is not None:
-        return Outcome("TP1", len(rows), t_tp1, t_tp2, t_sl, max_gain if max_gain != float("-inf") else 0.0, max_dd if max_dd != float("inf") else 0.0)
-    return Outcome("PENDING", len(rows), t_tp1, t_tp2, t_sl, max_gain if max_gain != float("-inf") else 0.0, max_dd if max_dd != float("inf") else 0.0)
+        return Outcome("TP1", len(rows), t_tp1, t_tp2, t_sl, safe_gain, safe_dd)
+
+    return Outcome("PENDING", len(rows), t_tp1, t_tp2, t_sl, safe_gain, safe_dd)
 
 
 async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int:
@@ -102,20 +155,47 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
 
     settings = Settings()
     store = SignalStore(db_path=db_path)
+
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM signals WHERE status IN (%s)" % ",".join("?" * len(ACTIVE_STATUSES)), tuple(ACTIVE_STATUSES)).fetchall()
+
+    placeholders = ",".join("?" * len(ACTIVE_STATUSES))
+    rows = conn.execute(
+        f"SELECT * FROM signals WHERE status IN ({placeholders})",
+        tuple(ACTIVE_STATUSES),
+    ).fetchall()
+
     updated = 0
 
-    async with BybitRestClient(settings.rest_base_url, timeout_seconds=settings.rest_timeout_seconds, retries=settings.rest_retries) as client:
+    async with BybitRestClient(
+        settings.rest_base_url,
+        timeout_seconds=settings.rest_timeout_seconds,
+        retries=settings.rest_retries,
+    ) as client:
         for row in rows:
             tf = str(row["timeframe"] or "1")
             interval_min = _interval_to_minutes(tf)
+
             created = _parse_time(row["first_seen"]) or datetime.now(timezone.utc)
             age_min = (datetime.now(timezone.utc) - created).total_seconds() / 60.0
+
             if age_min > expires_hours * 60:
                 prev_status = str(row["status"] or "PENDING")
-                conn.execute("UPDATE signals SET status='EXPIRED', outcome='EXPIRED', outcome_checked_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), row["id"]))
+
+                conn.execute(
+                    """
+                    UPDATE signals
+                    SET status='EXPIRED',
+                        outcome='EXPIRED',
+                        outcome_checked_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        row["id"],
+                    ),
+                )
+
                 if prev_status != "EXPIRED":
                     store.add_event(
                         signal_key=str(row["signal_key"]),
@@ -126,10 +206,12 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                         to_status="EXPIRED",
                         score_last=float(row["score_last"] or 0.0),
                     )
+
                 updated += 1
                 continue
 
-                        category = str(row["market"] or "linear").lower()
+            category = str(row["market"] or "linear").lower()
+
             df = await client.fetch_klines(
                 str(row["symbol"]),
                 interval=tf,
@@ -152,17 +234,24 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                 side=str(row["side"] or "Buy"),
             )
 
-            status = row["status"]
             prev_status = str(row["status"] or "PENDING")
+            status = prev_status
+
             if outcome.status in {"TP1", "TP2", "SL", "AMBIGUOUS"}:
                 status = outcome.status
 
             conn.execute(
                 """
-                UPDATE signals SET
-                  status=?, outcome=?, outcome_checked_at=?,
-                  time_to_tp1_minutes=?, time_to_tp2_minutes=?, time_to_sl_minutes=?,
-                  max_gain_pct=?, max_drawdown_pct=?
+                UPDATE signals
+                SET
+                    status=?,
+                    outcome=?,
+                    outcome_checked_at=?,
+                    time_to_tp1_minutes=?,
+                    time_to_tp2_minutes=?,
+                    time_to_sl_minutes=?,
+                    max_gain_pct=?,
+                    max_drawdown_pct=?
                 WHERE id=?
                 """,
                 (
@@ -177,6 +266,7 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                     row["id"],
                 ),
             )
+
             if status != prev_status:
                 store.add_event(
                     signal_key=str(row["signal_key"]),
@@ -187,10 +277,13 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                     to_status=status,
                     score_last=float(row["score_last"] or 0.0),
                 )
+
             updated += 1
 
     conn.commit()
     conn.close()
+    store.close()
+
     return updated
 
 
@@ -201,7 +294,12 @@ async def main() -> None:
     parser.add_argument("--expires-hours", type=int, default=48)
     parser.add_argument("--loop", action="store_true", help="Run continuously")
     parser.add_argument("--interval-minutes", type=int, default=10, help="Loop interval in minutes when --loop is set")
+
     args = parser.parse_args()
+
+    if not Path(args.db).exists():
+        print(f"signals db not found: {args.db}")
+        return
 
     if not args.loop:
         count = await run_once(args.db, args.lookahead_bars, args.expires_hours)
@@ -209,6 +307,7 @@ async def main() -> None:
         return
 
     interval_seconds = max(args.interval_minutes, 1) * 60
+
     while True:
         count = await run_once(args.db, args.lookahead_bars, args.expires_hours)
         print(f"updated={count}")

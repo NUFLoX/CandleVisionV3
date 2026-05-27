@@ -93,6 +93,14 @@ if "%DASHBOARD_INGEST_TOKEN%"=="" (
     set "DASHBOARD_INGEST_TOKEN="
 )
 
+if "%DASHBOARD_API_URL%"=="" (
+    set "DASHBOARD_API_URL=http://127.0.0.1:8000"
+)
+
+if "%DASHBOARD_INGEST_TOKEN%"=="" (
+    set "DASHBOARD_INGEST_TOKEN="
+)
+
 if "%SIGNALS_ONLY%"=="" (
     set "SIGNALS_ONLY=true"
 )
@@ -133,7 +141,6 @@ if /I "%RUN_OUTCOME_TRACKER%"=="true" (
 REM ==================================================
 REM Start scanner
 REM ==================================================
-
 echo Starting Accumulation V1.4.2 DIAG...
 python orderflow_accum_main.py
 
