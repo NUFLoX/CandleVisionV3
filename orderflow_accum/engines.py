@@ -415,12 +415,155 @@ class RealtimeAccumulationEngine:
         base_range_short = rolling_range_pct(df, 14)
         base_range_long = rolling_range_pct(df, 48)
         compression_ratio = base_range_short / max(base_range_long, 1e-9)
+        range_duration_bars = int(min(len(df), 48))
+        tf_minutes = {"1": 1, "3": 3, "5": 5, "15": 15, "30": 30, "60": 60, "120": 120, "240": 240}.get(
+            str(state.interval or "1"), 1
+        ) if hasattr(state, "interval") else 1
+        range_duration_minutes = range_duration_bars * tf_minutes
         turnover_build = float(pd.to_numeric(df.tail(12)["turnover"], errors="coerce").sum())
         displacement_pct = abs(float(pd.to_numeric(df.tail(12)["return_1"], errors="coerce").sum() * 100.0))
+        turnover_displacement_ratio = turnover_build / max(displacement_pct, 0.05)
+        recent = df.tail(20).copy()
+        bodies = (recent["close"] - recent["open"]).abs()
+        wicks = (recent["high"] - recent["low"]).abs() - bodies
+        wick_to_body_ratio = float(pd.to_numeric((wicks / (bodies + 1e-12)).clip(lower=0), errors="coerce").mean())
+        range_compression_ratio = range_width_pct = (resistance - support) / max(mid, 1e-12) * 100.0
         pullback_depth_pct = _recent_pullback_depth(df, 8)
 
         signals: list[Signal] = []
         atr = max(float(last["atr_14"]), close * 0.0028)
+
+        # --- Pre-Impulse Accumulation Compression detector (observe/watch phase) ---
+        # Separate score from trade-ready logic: this block identifies quiet accumulation
+        # before a breakout, without requiring breakout confirmation.
+        range_width_pct = range_compression_ratio
+        body_last_20 = float(pd.to_numeric((df.tail(20)["close"] - df.tail(20)["open"]).abs(), errors="coerce").mean())
+        body_prev_20 = float(pd.to_numeric((df.tail(40).head(20)["close"] - df.tail(40).head(20)["open"]).abs(), errors="coerce").mean())
+        body_compression_ratio = body_last_20 / max(body_prev_20, 1e-12)
+        atr_compression = float(last.get("atr_ratio_20", 1.0))
+        pre_score = 0.0
+        pre_reasons: list[str] = []
+
+        tf_scale = max(1.0, min(tf_minutes / 5.0, 6.0))
+        duration_threshold_minutes = int(90 * tf_scale)
+        wide_range_threshold = 5.5 + max(0.0, (tf_scale - 1.0) * 0.8)
+        high_displacement_threshold = 1.3 + max(0.0, (tf_scale - 1.0) * 0.35)
+
+        if range_width_pct <= 3.2:
+            pre_score += 2.0
+            pre_reasons.append(f"long_sideways_range={range_width_pct:.2f}%")
+        if body_compression_ratio <= 0.7:
+            pre_score += 2.0
+            pre_reasons.append(f"candle_body_compression={body_compression_ratio:.2f}")
+        if turnover_build > self.settings.effective_min_trade_notional * 3.0 and displacement_pct <= high_displacement_threshold:
+            pre_score += 2.0
+            pre_reasons.append("high_turnover_low_displacement")
+        if turnover_displacement_ratio >= 2.0:
+            pre_score += 1.0
+            pre_reasons.append(f"turnover_displacement_ratio={turnover_displacement_ratio:.2f}")
+        if sell_notional >= self.settings.effective_min_sell_pressure_notional and delta_notional > -sell_notional * 0.6:
+            pre_score += 2.0
+            pre_reasons.append("sell_pressure_absorbed")
+        if (
+            sell_notional >= self.settings.effective_min_sell_pressure_notional * 1.1
+            and displacement_pct <= 1.0
+            and float(last["close_pos"]) >= 0.52
+        ):
+            pre_score += 1.0
+            pre_reasons.append("sell_pressure_absorbed_v2")
+        if support_holds >= 4:
+            pre_score += 1.0
+            pre_reasons.append(f"support_defended={support_holds}")
+        if range_duration_minutes >= duration_threshold_minutes:
+            pre_score += 1.0
+            pre_reasons.append(f"range_duration_minutes={range_duration_minutes}>={duration_threshold_minutes}")
+        if float(last["close_pos"]) >= 0.56:
+            pre_score += 1.0
+            pre_reasons.append("close_in_upper_half")
+        if atr_compression <= 0.92:
+            pre_score += 1.0
+            pre_reasons.append(f"atr_compression={atr_compression:.2f}")
+        if wick_to_body_ratio >= 1.2:
+            pre_score += 1.0
+            pre_reasons.append(f"wick_to_body_ratio={wick_to_body_ratio:.2f}")
+        if tape_total >= self.settings.effective_min_trade_notional * 1.15:
+            pre_score += 1.0
+            pre_reasons.append("volume_not_dead")
+        if resistance_dist <= self.settings.effective_breakout_ready_bps * 1.2:
+            pre_score += 2.0
+            pre_reasons.append(f"price_near_range_high={resistance_dist:.1f}bps")
+        if buy_notional >= sell_notional * 1.05:
+            pre_score += 1.0
+            pre_reasons.append("buyers_regaining_tape")
+        if range_width_pct > wide_range_threshold:
+            pre_score -= 2.0
+            pre_reasons.append("range_too_wide")
+        if tape_total < self.settings.effective_min_trade_notional * 0.8:
+            pre_score -= 2.0
+            pre_reasons.append("dead_volume")
+        if ask_near_persistence >= 0.42:
+            pre_score -= 2.0
+            pre_reasons.append("heavy_ask_wall")
+
+        pre_kind: str | None = None
+        if pre_score >= 13:
+            pre_kind = "BREAKOUT_PRESSURE"
+        elif pre_score >= 10:
+            pre_kind = "PRE_IMPULSE_ZONE"
+        elif pre_score >= 7:
+            pre_kind = "ABSORPTION_ZONE"
+        elif pre_score >= 4:
+            pre_kind = "ACCUMULATION_WATCH"
+
+        if pre_kind:
+            entry = best_ask
+            stop = min(support - atr * 0.25, entry - atr * self.settings.atr_stop_mult)
+            risk = max(entry - stop, atr * 0.45)
+            tp1, tp2, tp_reasons, tp_meta = _find_structural_resistances(
+                df=df,
+                state=state,
+                entry=entry,
+                fallback_risk=risk,
+                base_resistance=resistance,
+                settings=self.settings,
+            )
+            pre_final_reasons = pre_reasons + tp_reasons
+            signals.append(
+                Signal(
+                    symbol=symbol,
+                    side="Buy",
+                    kind=pre_kind,  # phase/status signal, not a breakout confirmation
+                    source="orderflow",
+                    score=round(pre_score, 2),
+                    entry=entry,
+                    stop_loss=stop,
+                    take_profit_1=tp1,
+                    take_profit_2=tp2,
+                    reasons=pre_final_reasons,
+                    meta={
+                        "support": round(support, 8),
+                        "resistance": round(resistance, 8),
+                        "range_width_pct": round(range_width_pct, 4),
+                        "range_compression_ratio": round(range_compression_ratio, 4),
+                        "range_duration_minutes": int(range_duration_minutes),
+                        "range_duration_bars": int(range_duration_bars),
+                        "duration_threshold_minutes": int(duration_threshold_minutes),
+                        "body_compression_ratio": round(body_compression_ratio, 4),
+                        "wick_to_body_ratio": round(wick_to_body_ratio, 4),
+                        "atr_compression": round(atr_compression, 4),
+                        "turnover_displacement_ratio": round(turnover_displacement_ratio, 4),
+                        "high_displacement_threshold": round(high_displacement_threshold, 4),
+                        "wide_range_threshold": round(wide_range_threshold, 4),
+                        "delta_notional": round(delta_notional, 2),
+                        "buy_notional": round(buy_notional, 2),
+                        "sell_notional": round(sell_notional, 2),
+                        "compression_ratio": round(compression_ratio, 3),
+                        "signal_mode": self.settings.signal_mode,
+                        "phase": "pre_impulse_absorption",
+                        **tp_meta,
+                    },
+                )
+            )
 
         early_score = 0.0
         reasons: list[str] = []

@@ -12,6 +12,8 @@ __pycache__/
 *.session
 *.session-journal
 accum_charts/
+accumulation_signals.csv
+rejection_reasons.csv
 setup_*.png
 
 data/dashboard_state.json
