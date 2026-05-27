@@ -22,7 +22,11 @@ class MarketRegimeAnalyzer:
         if not frames:
             return MarketRegime()
         # prefer 60m if available
-        df = frames.get("60") or next(iter(frames.values()))
+
+        df = frames.get("60")
+        if df is None:
+            df = next(iter(frames.values()))
+
         if df is None or df.empty or len(df) < 30:
             return MarketRegime()
 
