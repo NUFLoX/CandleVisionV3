@@ -127,7 +127,7 @@ def signal_to_dashboard_payload(signal: Any, *, exchange: str = "Bybit", timefra
         "id": f"{source}-{kind}-{getattr(signal, 'symbol', 'UNKNOWN')}-{uuid4().hex[:10]}",
         "symbol": str(getattr(signal, "symbol", "UNKNOWN")),
         "exchange": exchange,
-        "timeframe": _timeframe_from_signal(source, kind, timeframe),
+        "timeframe": _normalize_tf(meta.get("tf") or _timeframe_from_signal(source, kind, timeframe)),
         "score": score,
         "strength": _strength_from_score(score),
         "signal_type": _signal_type_from_signal(source, kind),
@@ -151,6 +151,10 @@ def _strength_from_score(score: float) -> str:
 
 def _signal_type_from_signal(source: str, kind: str) -> str:
     text = f"{source} {kind}".upper()
+    if any(phase in text for phase in ("ACCUMULATION_WATCH", "ABSORPTION_ZONE", "PRE_IMPULSE_ZONE")):
+        return "Watchlist"
+    if "BREAKOUT_PRESSURE" in text:
+        return "Confirmed"
     if "EARLY" in text or "BASE" in text:
         return "Watchlist"
     if "BREAKOUT" in text or "READY" in text or "CONFIRMED" in text:
@@ -165,6 +169,25 @@ def _timeframe_from_signal(source: str, kind: str, fallback: str) -> str:
     if fallback and fallback != "live":
         return fallback
     return "1m"
+
+
+def _normalize_tf(tf: object) -> str:
+    value = str(tf or "").strip().upper()
+    mapping = {
+        "1": "1m",
+        "3": "3m",
+        "5": "5m",
+        "15": "15m",
+        "30": "30m",
+        "60": "1h",
+        "120": "2h",
+        "240": "4h",
+        "D": "1d",
+        "W": "1w",
+    }
+    if not value:
+        return "1m"
+    return mapping.get(value, value.lower())
 
 
 def _reason_text(side: str, kind: str, source: str, reasons: list[Any], meta: dict[str, Any]) -> str:
