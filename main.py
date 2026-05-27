@@ -72,13 +72,7 @@ async def main():
             # scout = Scout(queue=signal_queue, strategies=strategies, ws_stream=ws_stream, sentiment_agent=sentiment_agent)
 
             # --- TELEGRAM ALPHA ---
-            #API_ID = 31253660  # Вставь свои цифры (без кавычек)
-            #API_HASH = "01f8061d064a53d40526587222bef6c4"
-            #tg_agent = TelegramScout(api_id=API_ID, api_hash=API_HASH)
             
-            #print("\n⏳ Ожидание авторизации Telegram (введи номер и код, если просит)...")
-            #await tg_agent.client.start() 
-            #print("✅ Telegram готов!\n")
 
             # --- TAPE READER (Отслеживание китов) ---
             # Порог 50,000$ (можно менять)
@@ -129,7 +123,7 @@ async def main():
                 if hasattr(ws_stream, 'ws') and ws_stream.ws:
                     try:
                         await ws_stream.ws.close()
-                    except:
+                    except Exception:
                         pass
                         
                 await asyncio.sleep(10) # Пауза перед новой попыткой подключения
