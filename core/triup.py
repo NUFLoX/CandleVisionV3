@@ -21,6 +21,8 @@ class TriUpManager:
 
     async def _check_breakeven(self):
         """Проверяет открытые позиции и переводит в Б/У, если достигнут таргет"""
+        if not trading_enabled():
+            return
         if not self.api.session:
             return
 
