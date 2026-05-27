@@ -8,6 +8,10 @@ SignalKind = Literal[
     "BASE_BUILDUP_LONG",
     "ACCUMULATION_LONG_EARLY",
     "ACCUMULATION_LONG_READY",
+    "ACCUMULATION_WATCH",
+    "ABSORPTION_ZONE",
+    "PRE_IMPULSE_ZONE",
+    "BREAKOUT_PRESSURE",
 ]
 SignalSource = Literal["macro", "orderflow"]
 
