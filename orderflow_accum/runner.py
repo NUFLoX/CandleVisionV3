@@ -127,13 +127,28 @@ class AccumulationRunner:
         self.logger.info("Realtime accumulation loop started for %s symbols", len(symbols))
         preimpulse_intervals = {value.upper() for value in self.settings.preimpulse_intervals}
         realtime_intervals = {value.upper() for value in self.settings.realtime_intervals}
-        while True:
-            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "realtime", "symbols": len(symbols)})
+                while True:
+            await self.dashboard.post_heartbeat(
+                "scanner",
+                meta={
+                    "runner": "orderflow_accum",
+                    "loop": "realtime",
+                    "symbols": len(symbols),
+                },
+            )
+
             for target in symbols:
                 try:
                     symbol = target.symbol
+
                     for interval in self.settings.realtime_intervals:
-                        df = await rest.fetch_klines(symbol, interval=interval, limit=180, category=target.market)
+                        df = await rest.fetch_klines(
+                            symbol,
+                            interval=interval,
+                            limit=180,
+                            category=target.market,
+                        )
+
                         state = stream.get_state(symbol)
                         signals = self.realtime_engine.analyze(symbol, df, state)
                         if not signals:
@@ -146,10 +161,12 @@ class AccumulationRunner:
                             is_preimpulse = signal.kind in self._preimpulse_kinds
                             if is_preimpulse and interval_u not in preimpulse_intervals:
                                 continue
-                            if not is_preimpulse and interval_u not in realtime_intervals:
+                                                        if not is_preimpulse and interval_u not in realtime_intervals:
                                 continue
+
                             signal.meta["tf"] = interval
                             signal.meta["market"] = target.market
+
                             await self._emit_signal(rest, signal)
                 except Exception as exc:
                     self.logger.warning("Realtime scan failed for %s: %r", symbol, exc)
@@ -248,6 +265,8 @@ class AccumulationRunner:
         self.csv_logger.append(signal)
         self.ui.update_session(macro=self._counts["macro"], orderflow=self._counts["orderflow"])
         self.ui.print_signal(signal)
+        if not upsert.should_notify:
+            return
         await self.dashboard.post_signal(signal)
         if upsert.status_changed:
             await self.dashboard.post_log(
