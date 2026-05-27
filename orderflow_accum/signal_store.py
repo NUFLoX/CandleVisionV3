@@ -39,6 +39,12 @@ def _phase_from_kind(kind: str) -> str:
     if k == "CONFIRMED_BREAKDOWN":
         return "BREAKDOWN_PRESSURE"
 
+    if k == "CONFIRMED_LONG":
+        return "CONFIRMED_LONG"
+
+    if k == "CONFIRMED_SHORT":
+        return "CONFIRMED_SHORT"
+
     return "PENDING"
 
 
@@ -395,6 +401,65 @@ class SignalStore:
             repeat_count=repeat_count,
         )
 
+    def promote_signal(
+        self,
+        *,
+        signal_key: str,
+        to_status: str,
+        score_last: float | None = None,
+    ) -> bool:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT symbol, timeframe, status, score_last
+            FROM signals
+            WHERE signal_key = ?
+            """,
+            (signal_key,),
+        )
+        row = cur.fetchone()
+
+        if row is None:
+            return False
+
+        from_status = str(row["status"] or "PENDING")
+
+        if from_status == to_status:
+            return False
+
+        score = float(score_last if score_last is not None else row["score_last"] or 0.0)
+        now = _utc_now()
+
+        cur.execute(
+            """
+            UPDATE signals
+            SET
+                status = ?,
+                score_last = ?,
+                last_seen = ?
+            WHERE signal_key = ?
+            """,
+            (
+                to_status,
+                score,
+                now,
+                signal_key,
+            ),
+        )
+
+        self.conn.commit()
+
+        self.add_event(
+            signal_key=signal_key,
+            symbol=str(row["symbol"]),
+            timeframe=str(row["timeframe"]),
+            event_type="promoted_to_confirmed",
+            from_status=from_status,
+            to_status=to_status,
+            score_last=score,
+        )
+
+        return True
+
     def close(self) -> None:
         self.conn.close()
-

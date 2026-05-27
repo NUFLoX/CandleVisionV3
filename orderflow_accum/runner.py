@@ -184,6 +184,7 @@ class AccumulationRunner:
 
                             for signal in short_signals:
                                 signal.meta["btc_regime"] = regime.btc_regime
+                                
                         signals = long_signals + short_signals
                         if not signals:
                             reason, score, metrics = self.realtime_engine.diagnose(symbol, df, state)
