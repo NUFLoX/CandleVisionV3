@@ -71,7 +71,7 @@ class OrderBookStream:
             if self.ws and not self.ws.closed:
                 try:
                     await self.ws.send(json.dumps({"op": "ping"}))
-                except:
+                except Exception:
                     pass
 
     async def _listen(self):

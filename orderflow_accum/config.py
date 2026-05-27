@@ -4,9 +4,24 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+
+def _load_dotenv(path: str = ".env") -> None:
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv()
 
 
 def _csv_env(name: str, default: str = "") -> list[str]:
@@ -28,6 +43,15 @@ class Settings:
     realtime_symbols_limit: int = int(os.getenv("ACC_REALTIME_SYMBOLS_LIMIT", "20"))
     macro_symbols_limit: int = int(os.getenv("ACC_MACRO_SYMBOLS_LIMIT", "50"))
     realtime_scan_every_seconds: int = int(os.getenv("ACC_SCAN_EVERY_SECONDS", "12"))
+    realtime_intervals: list[str] = field(default_factory=lambda: _csv_env("ACC_REALTIME_INTERVALS", "1,5,15"))
+    preimpulse_intervals: list[str] = field(default_factory=lambda: _csv_env("ACC_PREIMPULSE_INTERVALS", "5,15,60"))
+    market_categories: list[str] = field(default_factory=lambda: _csv_env("ACC_MARKET_CATEGORIES", "LINEAR"))
+    enable_short_engine: bool = os.getenv("ACC_ENABLE_SHORT_ENGINE", "true").lower() == "true"
+    short_only_when_btc_bearish: bool = os.getenv("ACC_SHORT_ONLY_WHEN_BTC_BEARISH", "true").lower() == "true"
+    short_min_score: float = float(os.getenv("ACC_SHORT_MIN_SCORE", "6.0"))
+    short_btc_bonus: float = float(os.getenv("ACC_SHORT_BTC_BONUS", "2.0"))
+    long_btc_bearish_penalty: float = float(os.getenv("ACC_LONG_BTC_BEARISH_PENALTY", "-2.0"))
+    btc_regime_intervals: list[str] = field(default_factory=lambda: _csv_env("ACC_BTC_REGIME_INTERVALS", "15,60,240"))
     macro_every_seconds: int = int(os.getenv("ACC_MACRO_EVERY_SECONDS", "1800"))
     book_depth: int = int(os.getenv("ACC_BOOK_DEPTH", "20"))
 
