@@ -48,7 +48,7 @@ class ConsoleUI:
         header.add_column(justify="right")
         header.add_row(
             f"[{kind_style}]{signal.kind}[/{kind_style}]",
-            f"[dim]{datetime.now().strftime("%H:%M:%S")}[/dim]",
+            f"[dim]{datetime.now().strftime('%H:%M:%S')}[/dim]",
         )
         header.add_row(
             f"[bold white]{signal.symbol}[/bold white]  [{side_style}]{signal.side}[/{side_style}]",

@@ -46,12 +46,14 @@ class Settings:
     realtime_intervals: list[str] = field(default_factory=lambda: _csv_env("ACC_REALTIME_INTERVALS", "1,5,15"))
     preimpulse_intervals: list[str] = field(default_factory=lambda: _csv_env("ACC_PREIMPULSE_INTERVALS", "5,15,60"))
     market_categories: list[str] = field(default_factory=lambda: _csv_env("ACC_MARKET_CATEGORIES", "LINEAR"))
+
     enable_short_engine: bool = os.getenv("ACC_ENABLE_SHORT_ENGINE", "true").lower() == "true"
     short_only_when_btc_bearish: bool = os.getenv("ACC_SHORT_ONLY_WHEN_BTC_BEARISH", "true").lower() == "true"
     short_min_score: float = float(os.getenv("ACC_SHORT_MIN_SCORE", "6.0"))
     short_btc_bonus: float = float(os.getenv("ACC_SHORT_BTC_BONUS", "2.0"))
     long_btc_bearish_penalty: float = float(os.getenv("ACC_LONG_BTC_BEARISH_PENALTY", "-2.0"))
     btc_regime_intervals: list[str] = field(default_factory=lambda: _csv_env("ACC_BTC_REGIME_INTERVALS", "15,60,240"))
+
     macro_every_seconds: int = int(os.getenv("ACC_MACRO_EVERY_SECONDS", "1800"))
     book_depth: int = int(os.getenv("ACC_BOOK_DEPTH", "20"))
 

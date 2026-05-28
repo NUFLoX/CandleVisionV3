@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -33,7 +32,10 @@ class AccumulationRunner:
         self.telegram = TelegramNotifier(settings.telegram_token, settings.telegram_chat_id)
         self.realtime_engine = RealtimeAccumulationEngine(settings)
         self.short_engine = DistributionShortEngine(settings)
-        self.regime_analyzer = MarketRegimeAnalyzer(short_bonus=settings.short_btc_bonus, long_bearish_penalty=settings.long_btc_bearish_penalty)
+        self.regime_analyzer = MarketRegimeAnalyzer(
+            short_bonus=settings.short_btc_bonus,
+            long_bearish_penalty=settings.long_btc_bearish_penalty,
+        )
         self.macro_engine = MacroAccumulationEngine(settings)
         self.csv_logger = SignalCsvLogger("accumulation_signals.csv")
         self.rejection_logger = RejectionCsvLogger("rejection_reasons.csv")
@@ -47,26 +49,41 @@ class AccumulationRunner:
             "ABSORPTION_ZONE",
             "PRE_IMPULSE_ZONE",
             "BREAKOUT_PRESSURE",
+            "SHORT_WATCH",
+            "DISTRIBUTION_ZONE",
+            "PRE_DUMP_ZONE",
+            "CONFIRMED_BREAKDOWN",
         }
 
     def _filter_symbols(self, symbols: list[ScanTarget]) -> list[ScanTarget]:
         out: list[ScanTarget] = []
         seen: set[tuple[str, str]] = set()
+
         for target in symbols:
             symbol = target.symbol
+
             if any(fnmatch.fnmatch(symbol, pattern) for pattern in self.settings.symbol_exclude_patterns):
                 continue
+
             if symbol in self.settings.symbols_blocklist:
                 continue
+
             key = (symbol, target.market)
+
             if key in seen:
                 continue
+
             seen.add(key)
             out.append(target)
+
         return out
 
     async def run(self) -> None:
-        async with BybitRestClient(self.settings.rest_base_url, timeout_seconds=self.settings.rest_timeout_seconds, retries=self.settings.rest_retries) as rest:
+        async with BybitRestClient(
+            self.settings.rest_base_url,
+            timeout_seconds=self.settings.rest_timeout_seconds,
+            retries=self.settings.rest_retries,
+        ) as rest:
             realtime_symbols = await rest.fetch_best_symbols(
                 quote_coin=self.settings.quote_coin,
                 limit=self.settings.realtime_symbols_limit,
@@ -76,6 +93,7 @@ class AccumulationRunner:
                 allowlist=self.settings.symbols_allowlist,
                 blocklist=self.settings.symbols_blocklist,
             )
+
             macro_symbols = await rest.fetch_best_symbols(
                 quote_coin=self.settings.quote_coin,
                 limit=self.settings.macro_symbols_limit,
@@ -85,6 +103,7 @@ class AccumulationRunner:
                 allowlist=self.settings.symbols_allowlist,
                 blocklist=self.settings.symbols_blocklist,
             )
+
             realtime_symbols = self._filter_symbols(realtime_symbols)
             macro_symbols = self._filter_symbols(macro_symbols)
 
@@ -95,6 +114,7 @@ class AccumulationRunner:
                 wall_persistence_seconds=self.settings.wall_persistence_seconds,
                 heartbeat_seconds=self.settings.ws_heartbeat_seconds,
             )
+
             await self.telegram.send_message(
                 f"🚀 <b>Accumulation {self.version} started</b>\n"
                 f"Realtime symbols: {len(realtime_symbols)}\n"
@@ -109,6 +129,7 @@ class AccumulationRunner:
                 asyncio.create_task(self._run_macro_scan(rest, macro_symbols), name="accum_macro"),
                 asyncio.create_task(self._run_status(stream, len(realtime_symbols), len(macro_symbols)), name="accum_status"),
             ]
+
             await asyncio.gather(*tasks)
 
     async def _run_status(self, stream: MarketStream, realtime_count: int, macro_count: int) -> None:
@@ -125,87 +146,159 @@ class AccumulationRunner:
                     "orderflow_signals": self._counts["orderflow"],
                 },
             )
-            self.ui.update_session(ws_status=stream.status, macro=self._counts["macro"], orderflow=self._counts["orderflow"])
+
+            self.ui.update_session(
+                ws_status=stream.status,
+                macro=self._counts["macro"],
+                orderflow=self._counts["orderflow"],
+            )
             self.ui.print_session(realtime_count, macro_count)
+
             await asyncio.sleep(30)
 
-    async def _run_realtime_scan(self, rest: BybitRestClient, stream: MarketStream, symbols: list[ScanTarget]) -> None:
+    async def _run_realtime_scan(
+        self,
+        rest: BybitRestClient,
+        stream: MarketStream,
+        symbols: list[ScanTarget],
+    ) -> None:
         self.logger.info("Realtime accumulation loop started for %s symbols", len(symbols))
+
         preimpulse_intervals = {value.upper() for value in self.settings.preimpulse_intervals}
         realtime_intervals = {value.upper() for value in self.settings.realtime_intervals}
+
         while True:
-            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "realtime", "symbols": len(symbols)})
+            await self.dashboard.post_heartbeat(
+                "scanner",
+                meta={
+                    "runner": "orderflow_accum",
+                    "loop": "realtime",
+                    "symbols": len(symbols),
+                },
+            )
+
             btc_frames = {}
+
             try:
                 for tf in self.settings.btc_regime_intervals:
-                    btc_frames[tf] = await rest.fetch_klines("BTCUSDT", interval=tf, limit=120, category="linear")
+                    btc_frames[tf] = await rest.fetch_klines(
+                        "BTCUSDT",
+                        interval=tf,
+                        limit=120,
+                        category="linear",
+                    )
             except Exception:
                 btc_frames = {}
+
             regime = self.regime_analyzer.analyze_btc(btc_frames)
+
             for target in symbols:
                 try:
                     symbol = target.symbol
+
                     for interval in self.settings.realtime_intervals:
-                        df = await rest.fetch_klines(symbol, interval=interval, limit=180, category=target.market)
+                        df = await rest.fetch_klines(
+                            symbol,
+                            interval=interval,
+                            limit=180,
+                            category=target.market,
+                        )
+
                         state = stream.get_state(symbol)
+
                         long_signals = self.realtime_engine.analyze(symbol, df, state)
+
                         for signal in long_signals:
                             signal.score = round(signal.score + float(regime.long_penalty or 0.0), 2)
                             signal.meta["btc_regime"] = regime.btc_regime
+
                         short_signals = []
+
                         if self.settings.enable_short_engine and target.market == "linear":
                             short_signals = self.short_engine.analyze(symbol, df, state, regime)
+
                             for signal in short_signals:
                                 signal.meta["btc_regime"] = regime.btc_regime
+
                         signals = long_signals + short_signals
+
                         if not signals:
                             reason, score, metrics = self.realtime_engine.diagnose(symbol, df, state)
                             metrics = dict(metrics or {})
                             metrics["tf"] = interval
                             self.rejection_logger.append("orderflow", symbol, reason, score, metrics)
+
                         for signal in signals:
                             interval_u = str(interval).upper()
                             is_preimpulse = signal.kind in self._preimpulse_kinds
+
                             if is_preimpulse and interval_u not in preimpulse_intervals:
                                 continue
+
                             if not is_preimpulse and interval_u not in realtime_intervals:
                                 continue
+
                             signal.meta["tf"] = interval
                             signal.meta["market"] = target.market
+
                             await self._emit_signal(rest, signal)
+
                 except Exception as exc:
                     self.logger.warning("Realtime scan failed for %s: %r", symbol, exc)
+
                 await asyncio.sleep(0.05)
+
             await asyncio.sleep(max(self.settings.realtime_scan_every_seconds, 1))
 
     async def _run_macro_scan(self, rest: BybitRestClient, symbols: list[ScanTarget]) -> None:
         self.logger.info("Macro base scan loop started for %s symbols", len(symbols))
+
         intervals = {"60": 60, "240": 50, "D": 45}
+
         while True:
-            await self.dashboard.post_heartbeat("scanner", meta={"runner": "orderflow_accum", "loop": "macro", "symbols": len(symbols)})
+            await self.dashboard.post_heartbeat(
+                "scanner",
+                meta={
+                    "runner": "orderflow_accum",
+                    "loop": "macro",
+                    "symbols": len(symbols),
+                },
+            )
+
             for target in symbols:
                 try:
                     symbol = target.symbol
                     frames = {}
+
                     for interval, limit in intervals.items():
-                        frames[interval] = await rest.fetch_klines(symbol, interval=interval, limit=limit, category=target.market)
+                        frames[interval] = await rest.fetch_klines(
+                            symbol,
+                            interval=interval,
+                            limit=limit,
+                            category=target.market,
+                        )
                         await asyncio.sleep(0.04)
+
                     signal = self.macro_engine.analyze(symbol, frames)
+
                     if signal:
                         signal.meta["market"] = target.market
                         await self._emit_signal(rest, signal)
                     else:
                         reason, score, metrics = self.macro_engine.diagnose(symbol, frames)
                         self.rejection_logger.append("macro", symbol, reason, score, metrics)
+
                 except Exception as exc:
                     self.logger.warning("Macro scan failed for %s: %r", symbol, exc)
-                await asyncio.sleep(0.08)
-            await asyncio.sleep(max(self.settings.macro_every_seconds, 120))
 
+                await asyncio.sleep(0.08)
+
+            await asyncio.sleep(max(self.settings.macro_every_seconds, 120))
 
     async def _build_chart_for_signal(self, rest: BybitRestClient, signal) -> str | None:
         if not self.settings.telegram_send_charts:
             return None
+
         try:
             if signal.source == "macro":
                 interval = str(signal.meta.get("tf") or "240")
@@ -213,12 +306,22 @@ class AccumulationRunner:
             else:
                 interval = str(signal.meta.get("tf") or "1")
                 bars = self.settings.chart_bars_realtime
+
             market = str(signal.meta.get("market", "linear"))
-            df = await rest.fetch_klines(signal.symbol, interval=interval, limit=bars, category=market)
+
+            df = await rest.fetch_klines(
+                signal.symbol,
+                interval=interval,
+                limit=bars,
+                category=market,
+            )
+
             if df.empty:
                 return None
+
             support = signal.meta.get("support")
             resistance = signal.meta.get("resistance") or signal.meta.get("corridor_high")
+
             return render_signal_chart(
                 df=df,
                 symbol=signal.symbol,
@@ -231,6 +334,7 @@ class AccumulationRunner:
                 take_profit_2=signal.take_profit_2,
                 output_dir="accum_charts",
             )
+
         except Exception as exc:
             self.logger.warning("Chart build failed for %s: %r", signal.symbol, exc)
             return None
@@ -238,8 +342,8 @@ class AccumulationRunner:
     def _cooldown_seconds(self, signal) -> int:
         if signal.source == "macro":
             return self.settings.macro_symbol_cooldown_minutes * 60
-        return self.settings.signal_cooldown_seconds
 
+        return self.settings.signal_cooldown_seconds
 
     def _maybe_promote_confirmed(self, signal, upsert, market: str) -> tuple[bool, str | None, list[str]]:
         setup = {
@@ -253,25 +357,49 @@ class AccumulationRunner:
             "reasons": list(signal.reasons or []),
             "btc_regime": signal.meta.get("btc_regime"),
         }
-        decision = self.promoter.should_promote(setup, {"reasons": list(signal.reasons or [])}, {"btc_regime": signal.meta.get("btc_regime")})
+
+        decision = self.promoter.should_promote(
+            setup,
+            {"reasons": list(signal.reasons or [])},
+            {"btc_regime": signal.meta.get("btc_regime")},
+        )
+
         if not decision.should_promote or not decision.target_status:
             return False, None, decision.reasons
+
         signal_key = f"{signal.symbol}|{market}|{setup['timeframe']}|{signal.kind}|{signal.side}"
-        changed = self.signal_store.promote_signal(signal_key=signal_key, to_status=decision.target_status, score_last=float(signal.score))
+
+        changed = self.signal_store.promote_signal(
+            signal_key=signal_key,
+            to_status=decision.target_status,
+            score_last=float(signal.score),
+        )
+
         if changed:
             signal.meta["promotion_status"] = decision.target_status
             signal.meta["promotion_reasons"] = decision.reasons
+
         return changed, decision.target_status, decision.reasons
 
     async def _emit_signal(self, rest: BybitRestClient, signal) -> None:
-        market = str(signal.meta.get("market", self.settings.market_categories[0].lower() if self.settings.market_categories else "linear"))
+        market = str(
+            signal.meta.get(
+                "market",
+                self.settings.market_categories[0].lower() if self.settings.market_categories else "linear",
+            )
+        )
+
         upsert = self.signal_store.upsert_signal(signal, market=market)
+        promoted, promoted_to, promoted_reasons = self._maybe_promote_confirmed(signal, upsert, market)
+
         now = time.time()
         cooldown = self._cooldown_seconds(signal)
         cooldown_key = f"{signal.dedupe_key()}|{signal.meta.get('tf', 'na')}"
         last_sent = self._cooldowns.get(cooldown_key, 0.0)
+
         if now - last_sent < cooldown:
             return
+
         self._cooldowns[cooldown_key] = now
         self._counts[signal.source] += 1
 
@@ -285,22 +413,30 @@ class AccumulationRunner:
             f"reasons: {', '.join(signal.reasons)}\n"
             f"meta: {', '.join(f'{k}={v}' for k, v in signal.meta.items())}"
         )
+
         target_logger = self.orderflow_logger if signal.source == "orderflow" else self.macro_logger
         target_logger.info("📡 %s", log_body)
-        promoted, promoted_to, promoted_reasons = self._maybe_promote_confirmed(signal, upsert, market)
+
         if not upsert.should_notify and not promoted:
             return
+
         # Policy: CSV/UI are notify-only to avoid repeat-noise pollution.
         self.csv_logger.append(signal)
-        self.ui.update_session(macro=self._counts["macro"], orderflow=self._counts["orderflow"])
+        self.ui.update_session(
+            macro=self._counts["macro"],
+            orderflow=self._counts["orderflow"],
+        )
         self.ui.print_signal(signal)
+
         await self.dashboard.post_signal(signal)
+
         if promoted:
             await self.dashboard.post_log(
                 f"{signal.symbol} {signal.meta.get('tf', 'na')}: promoted to {promoted_to} ({', '.join(promoted_reasons)})",
                 source="confirmed_promoter",
                 severity="success",
             )
+
         if upsert.status_changed:
             await self.dashboard.post_log(
                 f"{signal.symbol} {signal.meta.get('tf', 'na')}: stage {upsert.from_status or 'NEW'} -> {upsert.to_status}",
@@ -313,7 +449,9 @@ class AccumulationRunner:
                 source="signal_store",
                 severity="info",
             )
+
         chart_path = await self._build_chart_for_signal(rest, signal)
+
         try:
             await self.telegram.send_signal(
                 signal.symbol,
