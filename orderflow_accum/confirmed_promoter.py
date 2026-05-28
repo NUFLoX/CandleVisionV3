@@ -10,6 +10,8 @@ GOOD_LONG_REASONS = {
     "high_turnover_low_displacement",
     "candle_body_compression",
     "no_heavy_ask_wall",
+    "buyers_regaining_tape",
+    "micro_trend_up",
 }
 
 GOOD_SHORT_REASONS = {
@@ -18,12 +20,14 @@ GOOD_SHORT_REASONS = {
     "close_in_lower_half",
     "high_turnover_low_displacement",
     "bid_wall_weakening",
+    "sellers_regaining_tape",
+    "micro_trend_down",
 }
 
-BAD_REASONS = {"rr_fallback", "strong_ask_wall", "bad_spread"}
+BAD_REASONS = {"rr_fallback", "bad_spread", "heavy_ask_wall", "weak_liquidity"}
 
 WATCHLIST_LONG_STATUSES = {"WATCHING", "ACCUMULATION", "PRE_IMPULSE"}
-WATCHLIST_SHORT_STATUSES = {"SHORT_WATCH", "DISTRIBUTION_ZONE", "PRE_DUMP_ZONE"}
+WATCHLIST_SHORT_STATUSES = {"WATCHING", "DISTRIBUTION", "PRE_DUMP"}
 
 
 @dataclass(slots=True)
@@ -44,20 +48,19 @@ class ConfirmedPromoter:
         side = str(setup.get("side") or "Buy")
         market = str(setup.get("market") or "linear").lower()
         status = str(setup.get("status") or "PENDING").upper()
-        score_first = float(setup.get("score_first") or 0.0)
         score_last = float(setup.get("score_last") or 0.0)
         repeat_count = int(setup.get("repeat_count") or 0)
         timeframe = str(setup.get("timeframe") or "1")
         reasons = {str(x) for x in (features.get("reasons") or setup.get("reasons") or [])}
+        t05 = setup.get("time_to_0_5R_minutes")
+        has_t05 = t05 is not None and str(t05).strip() != ""
 
         why: list[str] = []
         if score_last < self.min_score:
             why.append("score_below_min")
-        if score_last <= score_first:
-            why.append("score_not_increasing")
         if repeat_count < self.min_repeat_count:
             why.append("repeat_count_too_low")
-        if timeframe == "1":
+        if timeframe.lower() in {"1", "1m"}:
             why.append("timeframe_1m_blocked")
         if reasons & BAD_REASONS:
             why.append("bad_reason_present")
@@ -69,8 +72,12 @@ class ConfirmedPromoter:
                 why.append("btc_regime_blocks_long")
             if len(reasons & GOOD_LONG_REASONS) < 3:
                 why.append("insufficient_good_long_reasons")
+            if has_t05:
+                why.append("maturity_confirmed_0_5R")
             if why:
-                return PromotionDecision(False, None, why)
+                blockers = [x for x in why if x != "maturity_confirmed_0_5R"]
+                if blockers:
+                    return PromotionDecision(False, None, why)
             return PromotionDecision(True, "CONFIRMED_LONG", ["long_promotion_rules_met"])
 
         if side.lower() == "sell":
@@ -82,8 +89,12 @@ class ConfirmedPromoter:
                 why.append("btc_regime_not_bearish_for_short")
             if len(reasons & GOOD_SHORT_REASONS) < 3:
                 why.append("insufficient_good_short_reasons")
+            if has_t05:
+                why.append("maturity_confirmed_0_5R")
             if why:
-                return PromotionDecision(False, None, why)
+                blockers = [x for x in why if x != "maturity_confirmed_0_5R"]
+                if blockers:
+                    return PromotionDecision(False, None, why)
             return PromotionDecision(True, "CONFIRMED_SHORT", ["short_promotion_rules_met"])
 
         return PromotionDecision(False, None, ["unsupported_side"])
