@@ -317,19 +317,23 @@ class SignalStore:
             )
 
         prev_status = str(row["status"] or "PENDING")
+        prev_status_u = prev_status.upper()
         prev_outcome = str(row["outcome"] or "").upper()
         prev_score = float(row["score_last"])
         prev_max = float(row["score_max"])
         repeat_count = int(row["repeat_count"]) + 1
 
-        is_closed = prev_status in CLOSED_STATUSES or prev_outcome in CLOSED_STATUSES
+        is_closed = prev_status_u in CLOSED_STATUSES or prev_outcome in CLOSED_STATUSES
 
         if is_closed:
-            status = prev_outcome if prev_outcome in CLOSED_STATUSES else prev_status
-
-        score_jump = (score - prev_score) >= self.score_jump_threshold
-        status_changed = status != prev_status
-        should_notify = (status_changed or score_jump) and not is_closed
+            status = prev_outcome if prev_outcome in CLOSED_STATUSES else prev_status_u
+            score_jump = False
+            status_changed = False
+            should_notify = False
+        else:
+            score_jump = (score - prev_score) >= self.score_jump_threshold
+            status_changed = status != prev_status
+            should_notify = status_changed or score_jump
 
         cur.execute(
             """
@@ -365,6 +369,17 @@ class SignalStore:
         )
 
         self.conn.commit()
+
+        if is_closed:
+            return UpsertResult(
+                is_new=False,
+                should_notify=False,
+                status_changed=False,
+                score_jump=False,
+                from_status=prev_status,
+                to_status=status,
+                repeat_count=repeat_count,
+            )
 
         if status_changed:
             self.add_event(
