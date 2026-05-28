@@ -38,6 +38,7 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 # BYBIT_TESTNET — новый единый флаг; TESTNET оставлен для обратной совместимости.
 BYBIT_TESTNET = _env_bool("BYBIT_TESTNET", _env_bool("TESTNET", False))
 SIGNALS_ONLY = _env_bool("SIGNALS_ONLY", True)
+TRADING_ENABLED = _env_bool("TRADING_ENABLED", False)
 BYBIT_REST_BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
 BYBIT_WS_PUBLIC_URL = (
     "wss://stream-testnet.bybit.com/v5/public/linear"
@@ -64,3 +65,17 @@ RISK_PERCENT = 1.0
 INITIAL_BALANCE = 1000
 SCORE_TO_WATCH = 1.5
 SCORE_TO_TRADE = 2.5
+
+
+def _env_csv(name: str, default: str) -> list[str]:
+    raw = os.getenv(name, default)
+    return [item.strip() for item in raw.split(',') if item.strip()]
+
+
+# Таймфреймы сканирования для текущего Scout.
+# По умолчанию: 1m + добавленные 5m/15m/30m.
+SCOUT_SCAN_TIMEFRAMES = _env_csv("SCOUT_SCAN_TIMEFRAMES", "1m,5m,15m,30m")
+
+
+def trading_enabled() -> bool:
+    return TRADING_ENABLED and (not SIGNALS_ONLY) and bool(BYBIT_API_KEY) and bool(BYBIT_API_SECRET)

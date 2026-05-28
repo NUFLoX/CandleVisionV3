@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+from config.settings import trading_enabled
 import logging
 from datetime import datetime, timedelta
 
@@ -20,6 +21,8 @@ class TriUpManager:
 
     async def _check_breakeven(self):
         """Проверяет открытые позиции и переводит в Б/У, если достигнут таргет"""
+        if not trading_enabled():
+            return
         if not self.api.session:
             return
 
@@ -101,6 +104,9 @@ class TriUpManager:
         self.logger.info("🛡️ Модуль triUP (Защита и Аналитика) успешно запущен.")
         
         while True:
+            if not trading_enabled():
+                await asyncio.sleep(10)
+                continue
             # 1. Проверяем безубыток (каждые 10 секунд)
             await self._check_breakeven()
             
