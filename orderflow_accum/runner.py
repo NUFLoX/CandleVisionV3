@@ -467,4 +467,3 @@ class AccumulationRunner:
             )
         except Exception as exc:
             self.logger.warning("Signal notify failed for %s: %r", signal.symbol, exc)
-

@@ -25,12 +25,13 @@ class MarketRegimeAnalyzer:
 
 
 
+
         df = frames.get("60")
         if df is None:
             df = next(iter(frames.values()))
 
         if df is None or df.empty or len(df) < 4:
-         
+
             return MarketRegime()
 
         last = df.iloc[-1]

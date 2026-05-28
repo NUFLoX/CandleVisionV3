@@ -53,6 +53,8 @@
         const [snapshot, setSnapshot] = useState(null);
         const [filters, setFilters] = useState({ strength: '', signal_type: '', exchange: '', timeframe: '' });
         const [coinQuery, setCoinQuery] = useState('BTC');
+        const [signalTab, setSignalTab] = useState('All');
+        const [sideFilter, setSideFilter] = useState('All');
         const [coin, setCoin] = useState(null);
         const [coinError, setCoinError] = useState('');
         const [stats, setStats] = useState(null);
@@ -117,9 +119,17 @@
             (!filters.strength || s.strength === filters.strength) &&
             (!filters.signal_type || s.signal_type === filters.signal_type) &&
             (!filters.exchange || s.exchange === filters.exchange) &&
-            (!filters.timeframe || s.timeframe === filters.timeframe)
+            (!filters.timeframe || s.timeframe === filters.timeframe) &&
+            (sideFilter === 'All' || (s.side || '').toLowerCase() === sideFilter.toLowerCase()) &&
+            (
+              signalTab === 'All' ||
+              (signalTab === 'Watchlist' && ((s.signal_type || '').toLowerCase() === 'watchlist' || (s.status || '').toUpperCase().includes('WATCH') || (s.kind || '').toUpperCase().includes('WATCH'))) ||
+              (signalTab === 'Confirmed' && ((s.signal_type || '').toLowerCase() === 'confirmed' || (s.status || '').toUpperCase().includes('CONFIRMED'))) ||
+              (signalTab === 'Buy' && (s.side || '').toLowerCase() === 'buy') ||
+              (signalTab === 'Sell' && (s.side || '').toLowerCase() === 'sell')
+            )
           );
-        }, [snapshot, filters]);
+        }, [snapshot, filters, signalTab, sideFilter]);
 
         if (!snapshot) return <div className="flex min-h-screen items-center justify-center text-xl">Loading CandleVision...</div>;
         const market = snapshot.market_state;
@@ -174,10 +184,13 @@
             </Card>
           </section>
 
-          <Card title="Окно сигналов" action={<SignalFilters filters={filters} setFilters={setFilters} />}>
+          <Card title={`Окно сигналов (${filteredSignals.length})`} action={<SignalFilters filters={filters} setFilters={setFilters} sideFilter={sideFilter} setSideFilter={setSideFilter} />}>
+            <SignalTabs signalTab={signalTab} setSignalTab={setSignalTab} />
+            <div className="mt-3 max-h-[720px] overflow-y-auto pr-1">
             <div className="grid gap-4 lg:grid-cols-3">
               {filteredSignals.length === 0 && <p className="text-sm text-slate-500">Реальных сигналов пока нет. Отправьте сигнал через /api/ingest/signal или дождитесь сканера.</p>}
               {filteredSignals.map((signal) => <SignalCard key={signal.id} signal={signal} outcome={outcomesBySignal[signal.id]} />)}
+            </div>
             </div>
           </Card>
 
@@ -212,7 +225,12 @@
         return <div className="glass rounded-2xl p-5"><p className="text-sm text-slate-400">{label}</p><div className="mt-2"><Badge tone={tone}>{value}</Badge></div></div>;
       }
 
-      function SignalFilters({ filters, setFilters }) {
+      function SignalTabs({ signalTab, setSignalTab }) {
+        const tabs = ['All', 'Watchlist', 'Confirmed', 'Buy', 'Sell'];
+        return <div className="flex flex-wrap gap-2">{tabs.map((tab) => <button key={tab} onClick={() => setSignalTab(tab)} className={`rounded-full border px-3 py-1 text-xs font-semibold ${signalTab === tab ? 'border-cyan-400/40 bg-cyan-400/15 text-cyan-200' : 'border-slate-700 bg-slate-950 text-slate-300 hover:border-slate-500'}`}>{tab}</button>)}</div>;
+      }
+
+      function SignalFilters({ filters, setFilters, sideFilter, setSideFilter }) {
         const configs = [
           ['strength', ['Strong', 'Medium', 'Weak']],
           ['signal_type', ['Watchlist', 'Confirmed', 'Aggressive']],
@@ -221,7 +239,13 @@
         ];
         return <div className="flex flex-wrap gap-2">{configs.map(([key, values]) => <select key={key} className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-xs" value={filters[key]} onChange={(e) => setFilters({ ...filters, [key]: e.target.value })}>
           <option value="">{key}</option>{values.map((v) => <option key={v}>{v}</option>)}
-        </select>)}</div>;
+        </select>)}
+        <select className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-xs" value={sideFilter} onChange={(e) => setSideFilter(e.target.value)}>
+          <option value="All">side: All</option>
+          <option value="Buy">side: Buy</option>
+          <option value="Sell">side: Sell</option>
+        </select>
+        </div>;
       }
 
       function SignalCard({ signal, outcome }) {
@@ -234,7 +258,7 @@
             <span>Entry: <b>{signal.entry}</b></span><span>SL: <b>{signal.stop_loss}</b></span>
             <span>TP1: <b>{signal.take_profit_1}</b></span><span>Strength: <b>{signal.strength}</b></span>
           </div>
-          <p className="mt-3 rounded-xl bg-slate-900 p-3 text-sm text-slate-400">{signal.reason}</p>
+          <div className="mt-3 max-h-32 overflow-y-auto rounded-xl bg-slate-900 p-3 text-sm text-slate-400">{signal.reason}</div>
         </article>;
       }
 
@@ -267,7 +291,7 @@
 
       function ActiveSetupsPanel({ setups, onRefresh }) {
         return <Card title="Active Setups" action={<button onClick={onRefresh} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh setups</button>}>
-          <div className="overflow-auto rounded-xl border border-slate-800">
+          <div className="max-h-[560px] overflow-auto rounded-xl border border-slate-800">
             <table className="min-w-full text-left text-sm">
               <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500">
                 <tr>
