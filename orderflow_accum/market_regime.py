@@ -24,6 +24,7 @@ class MarketRegimeAnalyzer:
         # prefer 60m if available
 
 
+
         df = frames.get("60")
         if df is None:
             df = next(iter(frames.values()))
