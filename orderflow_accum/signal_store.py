@@ -11,6 +11,8 @@ from typing import Any
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+CLOSED_STATUSES = {"TP1", "TP2", "SL", "AMBIGUOUS", "EXPIRED"}
+
 
 def _phase_from_kind(kind: str) -> str:
     k = (kind or "").upper()
@@ -314,14 +316,20 @@ class SignalStore:
                 repeat_count=1,
             )
 
-        prev_status = str(row["status"])
+        prev_status = str(row["status"] or "PENDING")
+        prev_outcome = str(row["outcome"] or "").upper()
         prev_score = float(row["score_last"])
         prev_max = float(row["score_max"])
         repeat_count = int(row["repeat_count"]) + 1
 
+        is_closed = prev_status in CLOSED_STATUSES or prev_outcome in CLOSED_STATUSES
+
+        if is_closed:
+            status = prev_outcome if prev_outcome in CLOSED_STATUSES else prev_status
+
         score_jump = (score - prev_score) >= self.score_jump_threshold
         status_changed = status != prev_status
-        should_notify = status_changed or score_jump
+        should_notify = (status_changed or score_jump) and not is_closed
 
         cur.execute(
             """
