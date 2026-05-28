@@ -6,6 +6,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tools.watchlist_transition_study import replay_ohlc_after_signal
+
 
 def _seed_db(path: Path) -> None:
     conn = sqlite3.connect(path)
@@ -118,3 +124,49 @@ def test_watchlist_reason_edge_report(tmp_path: Path) -> None:
     assert "sell_pressure_absorbed" in by_reason
     assert "rr_fallback" in by_reason
     assert float(by_reason["sell_pressure_absorbed"]["tp_rate"]) >= float(by_reason["rr_fallback"]["tp_rate"])
+
+
+def test_replay_ohlc_after_signal_buy() -> None:
+    rows = [
+        {"high": 100.2, "low": 99.6},
+        {"high": 100.7, "low": 99.4},
+        {"high": 101.2, "low": 99.5},
+        {"high": 102.1, "low": 100.0},
+    ]
+    out = replay_ohlc_after_signal(
+        entry=100.0,
+        stop_loss=99.0,
+        tp1=101.0,
+        tp2=102.0,
+        side="Buy",
+        rows=rows,
+        interval_min=5,
+    )
+    assert out["time_to_0_5R_minutes"] == 5
+    assert out["time_to_1R_minutes"] == 10
+    assert out["time_to_2R_minutes"] == 15
+    assert out["impulse_started"] is True
+    assert out["drawdown_before_0_5R_pct"] < 0
+
+
+def test_replay_ohlc_after_signal_sell() -> None:
+    rows = [
+        {"high": 100.4, "low": 99.8},
+        {"high": 100.5, "low": 99.4},
+        {"high": 100.2, "low": 99.0},
+        {"high": 99.8, "low": 97.8},
+    ]
+    out = replay_ohlc_after_signal(
+        entry=100.0,
+        stop_loss=101.0,
+        tp1=99.0,
+        tp2=98.0,
+        side="Sell",
+        rows=rows,
+        interval_min=5,
+    )
+    assert out["time_to_0_5R_minutes"] == 5
+    assert out["time_to_1R_minutes"] == 10
+    assert out["time_to_2R_minutes"] == 15
+    assert out["impulse_started"] is True
+    assert out["drawdown_before_0_5R_pct"] <= 0

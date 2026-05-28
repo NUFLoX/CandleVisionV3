@@ -5,6 +5,7 @@ import csv
 import json
 import sqlite3
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 WATCHLIST_STATUSES = {"WATCHING", "ACCUMULATION", "PRE_IMPULSE"}
@@ -87,6 +88,116 @@ def _write_csv(path: Path, rows: list[dict], headers: list[str]) -> None:
             w.writerow({k: r.get(k) for k in headers})
 
 
+def _parse_dt(v: str | None) -> datetime | None:
+    if not v:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _parse_interval_minutes(timeframe: object) -> float:
+    tf = str(timeframe or "").strip().lower()
+    if tf.endswith("m"):
+        tf = tf[:-1]
+    mapping = {"1h": 60, "2h": 120, "4h": 240, "1d": 1440}
+    if tf in mapping:
+        return float(mapping[tf])
+    try:
+        return float(tf)
+    except Exception:
+        return 1.0
+
+
+def replay_ohlc_after_signal(
+    entry: float,
+    stop_loss: float,
+    tp1: float | None,
+    tp2: float | None,
+    side: str,
+    rows: list[dict],
+    interval_min: float,
+) -> dict[str, float | bool | str | None]:
+    side_u = str(side or "Buy").strip().upper()
+    is_buy = side_u != "SELL"
+    r = (entry - stop_loss) if is_buy else (stop_loss - entry)
+    if r <= 0:
+        return {
+            "time_to_0_5R_minutes": None, "time_to_1R_minutes": None, "time_to_1_5R_minutes": None, "time_to_2R_minutes": None,
+            "time_to_max_gain_minutes": None, "drawdown_before_0_5R_pct": None, "drawdown_before_1R_pct": None, "drawdown_before_tp1_pct": None,
+            "impulse_started": False, "time_to_impulse_minutes": None, "impulse_price": None, "impulse_rule": "0.5R",
+        }
+
+    levels = {
+        "0_5R": entry + 0.5 * r if is_buy else entry - 0.5 * r,
+        "1R": entry + 1.0 * r if is_buy else entry - 1.0 * r,
+        "1_5R": entry + 1.5 * r if is_buy else entry - 1.5 * r,
+        "2R": entry + 2.0 * r if is_buy else entry - 2.0 * r,
+    }
+
+    time_hit: dict[str, float | None] = {k: None for k in levels}
+    dd_before: dict[str, float | None] = {"0_5R": None, "1R": None}
+    min_low = float("inf")
+    max_high = float("-inf")
+    max_gain = float("-inf")
+    t_max_gain: float | None = None
+    tp1_key = "tp1"
+    tp1_time: float | None = None
+    tp1_level = tp1 if tp1 is not None else levels["1R"]
+    dd_tp1: float | None = None
+
+    for i, row in enumerate(rows):
+        h = float(row["high"])
+        l = float(row["low"])
+        if l < min_low:
+            min_low = l
+        if h > max_high:
+            max_high = h
+
+        gain = ((h - entry) / entry * 100.0) if is_buy else ((entry - l) / entry * 100.0)
+        if gain > max_gain:
+            max_gain = gain
+            t_max_gain = i * interval_min
+
+        for k, level in levels.items():
+            if time_hit[k] is None and ((h >= level) if is_buy else (l <= level)):
+                time_hit[k] = i * interval_min
+                if k in dd_before:
+                    if is_buy:
+                        dd_before[k] = ((min_low - entry) / entry) * 100.0
+                    else:
+                        dd_before[k] = ((entry - max_high) / entry) * 100.0
+
+        if tp1_time is None and ((h >= tp1_level) if is_buy else (l <= tp1_level)):
+            tp1_time = i * interval_min
+            if is_buy:
+                dd_tp1 = ((min_low - entry) / entry) * 100.0
+            else:
+                dd_tp1 = ((entry - max_high) / entry) * 100.0
+
+    impulse_started = time_hit["0_5R"] is not None
+    return {
+        "time_to_0_5R_minutes": time_hit["0_5R"],
+        "time_to_1R_minutes": time_hit["1R"],
+        "time_to_1_5R_minutes": time_hit["1_5R"],
+        "time_to_2R_minutes": time_hit["2R"],
+        "time_to_max_gain_minutes": t_max_gain,
+        "drawdown_before_0_5R_pct": dd_before["0_5R"],
+        "drawdown_before_1R_pct": dd_before["1R"],
+        "drawdown_before_tp1_pct": dd_tp1,
+        "impulse_started": impulse_started,
+        "time_to_impulse_minutes": time_hit["0_5R"],
+        "impulse_price": levels["0_5R"] if impulse_started else None,
+        "impulse_rule": "0.5R",
+    }
+
+
 def build_reports(db_path: Path, out_dir: Path) -> dict[str, Path]:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -104,8 +215,50 @@ def build_reports(db_path: Path, out_dir: Path) -> dict[str, Path]:
         tp1 = _to_float(r["time_to_tp1_minutes"])
         tp2 = _to_float(r["time_to_tp2_minutes"])
         tsl = _to_float(r["time_to_sl_minutes"])
-        t05 = tp1
-        t1r = tp1
+        interval_min = _parse_interval_minutes(r["timeframe"])
+        meta_obj = None
+        if str(r["meta"] or "").startswith("{"):
+            try:
+                meta_obj = json.loads(r["meta"])
+            except Exception:
+                meta_obj = None
+        ohlc_rows = []
+        if isinstance(meta_obj, dict):
+            raw_rows = meta_obj.get("ohlc_rows")
+            if isinstance(raw_rows, list):
+                for rr in raw_rows:
+                    if isinstance(rr, dict) and {"high", "low"}.issubset(rr.keys()):
+                        ohlc_rows.append({"high": rr["high"], "low": rr["low"]})
+        replay = {}
+        entry = _to_float(r["entry"])
+        stop_loss = _to_float(r["stop_loss"])
+        take_profit_1 = _to_float(r["take_profit_1"])
+        take_profit_2 = _to_float(r["take_profit_2"])
+        if entry is not None and stop_loss is not None and ohlc_rows:
+            replay = replay_ohlc_after_signal(
+                entry=entry,
+                stop_loss=stop_loss,
+                tp1=take_profit_1,
+                tp2=take_profit_2,
+                side=str(r["side"] or "Buy"),
+                rows=ohlc_rows,
+                interval_min=interval_min,
+            )
+        else:
+            replay = {
+                "time_to_0_5R_minutes": tp1,
+                "time_to_1R_minutes": tp1,
+                "time_to_1_5R_minutes": tp2,
+                "time_to_2R_minutes": tp2,
+                "time_to_max_gain_minutes": None,
+                "drawdown_before_0_5R_pct": r["max_drawdown_pct"],
+                "drawdown_before_1R_pct": r["max_drawdown_pct"],
+                "drawdown_before_tp1_pct": r["max_drawdown_pct"],
+                "impulse_started": tp1 is not None,
+                "time_to_impulse_minutes": tp1,
+                "impulse_price": None,
+                "impulse_rule": "0.5R",
+            }
         analysis.append(
             {
                 "symbol": r["symbol"],
@@ -130,16 +283,23 @@ def build_reports(db_path: Path, out_dir: Path) -> dict[str, Path]:
                 "time_to_tp1_minutes": tp1,
                 "time_to_tp2_minutes": tp2,
                 "time_to_sl_minutes": tsl,
-                "time_to_max_gain_minutes": None,
+                "time_to_max_gain_minutes": replay["time_to_max_gain_minutes"],
                 "drawdown_before_tp_pct": r["max_drawdown_pct"],
-                "btc_regime": (json.loads(r["meta"]).get("btc_regime") if r["meta"] else None) if str(r["meta"] or "").startswith("{") else None,
+                "btc_regime": (meta_obj or {}).get("btc_regime") if isinstance(meta_obj, dict) else None,
                 "reasons_first": r["reasons_first"],
                 "reasons_last": r["reasons_last"],
                 "winner_group": _winner_group(outcome),
-                "time_to_0_5R_minutes": t05,
-                "time_to_1R_minutes": t1r,
-                "time_to_1_5R_minutes": tp2,
-                "time_to_2R_minutes": tp2,
+                "time_to_0_5R_minutes": replay["time_to_0_5R_minutes"],
+                "time_to_1R_minutes": replay["time_to_1R_minutes"],
+                "time_to_1_5R_minutes": replay["time_to_1_5R_minutes"],
+                "time_to_2R_minutes": replay["time_to_2R_minutes"],
+                "drawdown_before_0_5R_pct": replay["drawdown_before_0_5R_pct"],
+                "drawdown_before_1R_pct": replay["drawdown_before_1R_pct"],
+                "drawdown_before_tp1_pct": replay["drawdown_before_tp1_pct"],
+                "impulse_started": replay["impulse_started"],
+                "time_to_impulse_minutes": replay["time_to_impulse_minutes"],
+                "impulse_price": replay["impulse_price"],
+                "impulse_rule": replay["impulse_rule"],
             }
         )
 
@@ -148,7 +308,9 @@ def build_reports(db_path: Path, out_dir: Path) -> dict[str, Path]:
         "repeat_count","score_first","score_last","score_max","entry","stop_loss","take_profit_1","take_profit_2",
         "max_gain_pct","max_drawdown_pct","time_to_tp1_minutes","time_to_tp2_minutes","time_to_sl_minutes",
         "time_to_max_gain_minutes","drawdown_before_tp_pct","btc_regime","reasons_first","reasons_last","winner_group",
-        "time_to_0_5R_minutes","time_to_1R_minutes","time_to_1_5R_minutes","time_to_2R_minutes"
+        "time_to_0_5R_minutes","time_to_1R_minutes","time_to_1_5R_minutes","time_to_2R_minutes",
+        "drawdown_before_0_5R_pct","drawdown_before_1R_pct","drawdown_before_tp1_pct",
+        "impulse_started","time_to_impulse_minutes","impulse_price","impulse_rule"
     ]
     paths = {"analysis": out_dir / "watchlist_analysis.csv"}
     _write_csv(paths["analysis"], analysis, analysis_headers)
