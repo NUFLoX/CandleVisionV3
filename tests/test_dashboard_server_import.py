@@ -12,6 +12,8 @@ def test_dashboard_server_has_no_merge_artifacts_and_imports() -> None:
 
     forbidden_tokens = ("<<<<<<<", "=======", ">>>>>>>", "codex/")
     assert not any(token in source for token in forbidden_tokens)
+    assert "@app.on_event" not in source
+    assert "lifespan=lifespan" in source
 
     py_compile.compile(str(server_path), doraise=True)
 

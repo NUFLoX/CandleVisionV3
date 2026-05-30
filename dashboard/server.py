@@ -7,7 +7,7 @@ import os
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, AsyncIterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,10 +79,23 @@ async def _live_refresh_loop(store: DashboardStore, hub: WebSocketHub) -> None:
 def create_app() -> FastAPI:
     store = DashboardStore()
     hub = WebSocketHub()
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.refresh_task = asyncio.create_task(_live_refresh_loop(store, hub))
+        try:
+            yield
+        finally:
+            task = app.state.refresh_task
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     app = FastAPI(
         title="CandleVision Dashboard API",
         version="0.1.0",
         description="MVP API for bot console, market state, signals, dominance strips, watchlist, trades and coin analytics.",
+        lifespan=lifespan,
     )
     app.state.store = store
     app.state.hub = hub
@@ -95,17 +108,6 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-    @app.on_event("startup")
-    async def startup() -> None:
-        app.state.refresh_task = asyncio.create_task(_live_refresh_loop(store, hub))
-
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
-        task = app.state.refresh_task
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
