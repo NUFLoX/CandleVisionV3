@@ -299,3 +299,22 @@ def test_max_gain_r_and_max_drawdown_r_update_correctly():
     assert second_decision.position is not None
     assert math.isclose(second_decision.position.max_gain_r, 0.5, rel_tol=0.0, abs_tol=1e-9)
     assert math.isclose(second_decision.position.max_drawdown_r, 0.2, rel_tol=0.0, abs_tol=1e-9)
+
+def test_sell_setup_blocked_when_score_is_low():
+    executor = SmartTradeExecutor()
+    setup = make_sell_setup(score=5.0)
+    snapshot = make_snapshot(
+        price=100.0,
+        buy_flow=80.0,
+        sell_flow=120.0,
+        bid_wall_strength=0.20,
+        resistance=101.0,
+        ema20=100.5,
+        vwap=100.4,
+    )
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_low_score"
+    assert decision.position is None

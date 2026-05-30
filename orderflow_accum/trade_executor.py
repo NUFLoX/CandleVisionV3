@@ -209,24 +209,37 @@ class SmartTradeExecutor:
 
     def _short_entry_blockers(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> list[str]:
         blockers: list[str] = []
+
         if setup.side != SELL:
             blockers.append("entry_blocked_side_not_sell")
+
+        if setup.score < self.min_long_score:
+            blockers.append("entry_blocked_low_score")
+
         if setup.btc_regime not in {BTC_BEARISH, BTC_DUMP_RISK}:
             blockers.append("entry_blocked_btc_regime")
+
         if snapshot.spread_bps > self.max_spread_bps:
             blockers.append("entry_blocked_spread")
+
         if snapshot.sell_flow <= snapshot.buy_flow * self.flow_ratio:
             blockers.append("entry_blocked_sell_flow")
+
         if snapshot.volume_impulse < self.min_entry_volume_impulse:
             blockers.append("entry_blocked_volume_impulse")
+
         if snapshot.bid_wall_strength > self.bid_wall_entry_limit:
             blockers.append("entry_blocked_bid_wall")
+
         if snapshot.resistance is not None and snapshot.price > snapshot.resistance:
             blockers.append("entry_blocked_above_resistance")
+
         if snapshot.ema20 is not None and snapshot.price > snapshot.ema20:
             blockers.append("entry_blocked_above_ema20")
+
         if snapshot.vwap is not None and snapshot.price > snapshot.vwap:
             blockers.append("entry_blocked_above_vwap")
+
         return blockers
 
     def _initial_stop_loss(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> float:
