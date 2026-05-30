@@ -7,7 +7,7 @@ import os
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, AsyncIterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,7 +81,7 @@ def create_app() -> FastAPI:
     hub = WebSocketHub()
 
     @contextlib.asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.refresh_task = asyncio.create_task(_live_refresh_loop(store, hub))
         try:
             yield
@@ -108,7 +108,6 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
