@@ -21,6 +21,14 @@ SUPPORTED_EVENT_TYPES = {
     "OUTCOME_AMBIGUOUS",
 }
 
+OUTCOME_EVENT_TYPES = {
+    "TP1": "OUTCOME_TP",
+    "TP2": "OUTCOME_TP",
+    "SL": "OUTCOME_SL",
+    "EXPIRED": "OUTCOME_EXPIRED",
+    "AMBIGUOUS": "OUTCOME_AMBIGUOUS",
+}
+
 
 @dataclass(slots=True)
 class TradeLifecycleEvent:
@@ -43,8 +51,8 @@ class TradeLifecycleEvent:
 class TradeLearningEngine:
     """Best-effort lifecycle memory recorder.
 
-    This engine only converts signal/executor context into durable lifecycle
-    events. It does not make decisions, alter thresholds, place orders, or
+    This engine only converts signal/executor/outcome context into durable
+    memory. It does not make decisions, alter thresholds, place orders, or
     mutate signal/executor state.
     """
 
@@ -120,6 +128,135 @@ class TradeLearningEngine:
             )
         )
 
+    def record_outcome(
+        self,
+        signal: Any,
+        signal_key: str,
+        outcome: str,
+        outcome_features: dict[str, Any],
+    ) -> None:
+        """Record final outcome lifecycle memory and a basic diagnosis.
+
+        PENDING is intentionally ignored. All writes are best-effort so callers
+        such as outcome_tracker never fail because learning memory failed.
+        """
+        try:
+            outcome_u = str(outcome or "").upper()
+            event_type = OUTCOME_EVENT_TYPES.get(outcome_u)
+            if event_type is None:
+                return
+
+            meta = dict(getattr(signal, "meta", {}) or {})
+            features = dict(outcome_features or {})
+            timeframe = str(features.get("timeframe") or meta.get("tf") or "")
+            side = str(features.get("side") or getattr(signal, "side", ""))
+            symbol = str(features.get("symbol") or getattr(signal, "symbol", "UNKNOWN"))
+            score = _safe_float(features.get("score", getattr(signal, "score", None)))
+
+            if not self.store.has_trade_lifecycle_event(signal_key, event_type):
+                self.store.add_trade_lifecycle_event(
+                    TradeLifecycleEvent(
+                        signal_key=signal_key,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        side=side,
+                        event_type=event_type,
+                        status=outcome_u,
+                        price=_safe_float(features.get("entry", getattr(signal, "entry", None))),
+                        score=score,
+                        btc_regime=_optional_str(meta.get("btc_regime")),
+                        market_regime=_optional_str(meta.get("market_regime")),
+                        features=features,
+                        created_at=_utc_now(),
+                    )
+                )
+
+            self.store.upsert_trade_diagnosis(
+                self._build_diagnosis(
+                    signal=signal,
+                    signal_key=signal_key,
+                    outcome=outcome_u,
+                    event_type=event_type,
+                    features=features,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    side=side,
+                    score=score,
+                )
+            )
+        except Exception as exc:
+            self.logger.warning("Trade outcome learning failed: %r", exc, exc_info=True)
+
+    def _build_diagnosis(
+        self,
+        *,
+        signal: Any,
+        signal_key: str,
+        outcome: str,
+        event_type: str,
+        features: dict[str, Any],
+        symbol: str,
+        timeframe: str,
+        side: str,
+        score: float | None,
+    ) -> dict[str, Any]:
+        raw_reasons = features.get("reasons")
+        if not isinstance(raw_reasons, list):
+            raw_reasons = getattr(signal, "reasons", []) or []
+        reasons = list(raw_reasons)
+        success_factors: dict[str, Any] = {}
+        failure_factors: dict[str, Any] = {}
+        recommendation = None
+
+        if event_type == "OUTCOME_TP":
+            diagnosis = "Signal reached take profit. Setup direction was correct."
+            success_factors = _compact_dict(
+                {
+                    "score": score,
+                    "reasons": reasons,
+                    "timeframe": timeframe,
+                    "max_gain_pct": _safe_float(features.get("max_gain_pct")),
+                    "time_to_tp1_minutes": _safe_float(features.get("time_to_tp1_minutes")),
+                    "time_to_tp2_minutes": _safe_float(features.get("time_to_tp2_minutes")),
+                }
+            )
+        elif event_type == "OUTCOME_SL":
+            diagnosis = "Signal hit stop loss. Setup failed before reaching take profit."
+            failure_factors = _compact_dict(
+                {
+                    "max_drawdown_pct": _safe_float(features.get("max_drawdown_pct")),
+                    "time_to_sl_minutes": _safe_float(features.get("time_to_sl_minutes")),
+                    "reasons": reasons,
+                    "timeframe": timeframe,
+                }
+            )
+            recommendation = "Review entry timing, stop placement, and weak reasons for this symbol/timeframe."
+        elif event_type == "OUTCOME_EXPIRED":
+            diagnosis = "Signal expired without decisive TP/SL outcome."
+            recommendation = "Review whether timeout window or confirmation threshold is too strict."
+        else:
+            diagnosis = "Signal produced ambiguous outcome. Price action touched conflicting levels or insufficient order was available."
+            recommendation = "Review OHLC replay ordering and volatility conditions."
+
+        return {
+            "signal_key": signal_key,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "side": side,
+            "outcome": outcome,
+            "diagnosis": diagnosis,
+            "success_factors": success_factors,
+            "failure_factors": failure_factors,
+            "recommendation": recommendation,
+            "r_result": _rough_r_result(signal, outcome, features),
+            "max_gain_pct": _safe_float(features.get("max_gain_pct")),
+            "max_drawdown_pct": _safe_float(features.get("max_drawdown_pct")),
+            "time_to_tp1_minutes": _safe_float(features.get("time_to_tp1_minutes")),
+            "time_to_tp2_minutes": _safe_float(features.get("time_to_tp2_minutes")),
+            "time_to_sl_minutes": _safe_float(features.get("time_to_sl_minutes")),
+            "updated_at": _utc_now(),
+        }
+
     @staticmethod
     def executor_event_type(action: str | None) -> str | None:
         action_u = str(action or "").upper()
@@ -166,3 +303,38 @@ def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _compact_dict(value: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in value.items() if v is not None}
+
+
+def _feature_or_attr(signal: Any, features: dict[str, Any], feature_name: str, attr_name: str) -> float | None:
+    return _safe_float(features.get(feature_name, getattr(signal, attr_name, None)))
+
+
+def _rough_r_result(signal: Any, outcome: str, features: dict[str, Any]) -> float | None:
+    outcome_u = str(outcome or "").upper()
+    if outcome_u == "SL":
+        return -1.0
+    if outcome_u in {"EXPIRED", "AMBIGUOUS"}:
+        return 0.0
+    if outcome_u not in {"TP1", "TP2"}:
+        return None
+
+    entry = _feature_or_attr(signal, features, "entry", "entry")
+    sl = _feature_or_attr(signal, features, "stop_loss", "stop_loss")
+    tp_attr = "take_profit_2" if outcome_u == "TP2" else "take_profit_1"
+    tp = _feature_or_attr(signal, features, tp_attr, tp_attr)
+    if entry is None or sl is None or tp is None:
+        return None
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+
+    side = str(features.get("side") or getattr(signal, "side", "Buy")).lower()
+    reward = entry - tp if side == "sell" else tp - entry
+    if reward <= 0:
+        return None
+    return reward / risk
