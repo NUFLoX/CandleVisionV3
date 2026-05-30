@@ -174,6 +174,7 @@ class SignalStore:
         self.ensure_executor_schema()
         self.ensure_trade_learning_schema()
 
+
         if user_version < self.SCHEMA_VERSION:
             cur.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
 
@@ -354,6 +355,7 @@ class SignalStore:
         payload = self._trade_lifecycle_payload(event)
         features_json = self._json_dumps_safe(payload.get("features") or {})
         created_at = str(payload.get("created_at") or _utc_now())
+
         self.conn.execute(
             """
             INSERT INTO trade_lifecycle_events (
@@ -403,6 +405,7 @@ class SignalStore:
             """,
             (signal_key,),
         ).fetchall()
+
         events: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
@@ -455,7 +458,6 @@ class SignalStore:
             return float(value)
         except (TypeError, ValueError):
             return None
-
     def add_event(
         self,
         *,

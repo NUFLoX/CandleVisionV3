@@ -591,6 +591,7 @@ class AccumulationRunner:
             float(row["max_drawdown_r"] or 0.0),
         )
         trade_learning = getattr(self, "trade_learning", None)
+
         if trade_learning is not None:
             trade_learning.record_executor_decision(
                 signal=signal,
@@ -608,6 +609,7 @@ class AccumulationRunner:
                     "bars_in_trade": int(row["bars_in_trade"] or 0),
                 },
             )
+
         return row
 
     def _process_paper_executor(self, signal, market: str, confirmed_status: str | None, state=None) -> None:
@@ -654,8 +656,13 @@ class AccumulationRunner:
         upsert = self.signal_store.upsert_signal(signal, market=market)
         promoted, promoted_to, promoted_reasons = self._maybe_promote_confirmed(signal, upsert, market)
         confirmed_status = promoted_to or upsert.to_status
+        upsert = self.signal_store.upsert_signal(signal, market=market)
+        promoted, promoted_to, promoted_reasons = self._maybe_promote_confirmed(signal, upsert, market)
+        confirmed_status = promoted_to or upsert.to_status
+
         signal_key = self._signal_key(signal, market)
         self._record_signal_lifecycle(signal, signal_key, upsert, confirmed_status)
+
         self._process_paper_executor(signal, market, confirmed_status, state)
 
         now = time.time()
