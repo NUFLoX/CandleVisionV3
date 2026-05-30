@@ -173,7 +173,7 @@ class SignalStore:
 
         self.ensure_executor_schema()
         self.ensure_trade_learning_schema()
-
+        self.ensure_trade_diagnosis_schema()
 
         if user_version < self.SCHEMA_VERSION:
             cur.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
@@ -349,6 +349,157 @@ class SignalStore:
             """
         )
         self.conn.commit()
+
+    def ensure_trade_diagnosis_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_diagnoses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_key TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                timeframe TEXT,
+                side TEXT,
+                outcome TEXT NOT NULL,
+                diagnosis TEXT NOT NULL,
+                success_factors_json TEXT,
+                failure_factors_json TEXT,
+                recommendation TEXT,
+                r_result REAL,
+                max_gain_pct REAL,
+                max_drawdown_pct REAL,
+                time_to_tp1_minutes REAL,
+                time_to_tp2_minutes REAL,
+                time_to_sl_minutes REAL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_diagnoses_symbol_timeframe
+            ON trade_diagnoses(symbol, timeframe)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_diagnoses_outcome
+            ON trade_diagnoses(outcome)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_diagnoses_created_at
+            ON trade_diagnoses(created_at)
+            """
+        )
+        self.conn.commit()
+
+    def upsert_trade_diagnosis(self, diagnosis: dict[str, Any]) -> None:
+        self.ensure_trade_diagnosis_schema()
+        now = _utc_now()
+        signal_key = str(diagnosis.get("signal_key") or "")
+        existing = self.conn.execute(
+            "SELECT created_at FROM trade_diagnoses WHERE signal_key = ?",
+            (signal_key,),
+        ).fetchone()
+        created_at = str(existing["created_at"]) if existing is not None else str(diagnosis.get("created_at") or now)
+        updated_at = str(diagnosis.get("updated_at") or now)
+
+        self.conn.execute(
+            """
+            INSERT INTO trade_diagnoses (
+                signal_key,
+                symbol,
+                timeframe,
+                side,
+                outcome,
+                diagnosis,
+                success_factors_json,
+                failure_factors_json,
+                recommendation,
+                r_result,
+                max_gain_pct,
+                max_drawdown_pct,
+                time_to_tp1_minutes,
+                time_to_tp2_minutes,
+                time_to_sl_minutes,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_key) DO UPDATE SET
+                symbol=excluded.symbol,
+                timeframe=excluded.timeframe,
+                side=excluded.side,
+                outcome=excluded.outcome,
+                diagnosis=excluded.diagnosis,
+                success_factors_json=excluded.success_factors_json,
+                failure_factors_json=excluded.failure_factors_json,
+                recommendation=excluded.recommendation,
+                r_result=excluded.r_result,
+                max_gain_pct=excluded.max_gain_pct,
+                max_drawdown_pct=excluded.max_drawdown_pct,
+                time_to_tp1_minutes=excluded.time_to_tp1_minutes,
+                time_to_tp2_minutes=excluded.time_to_tp2_minutes,
+                time_to_sl_minutes=excluded.time_to_sl_minutes,
+                updated_at=excluded.updated_at
+            """,
+            (
+                signal_key,
+                str(diagnosis.get("symbol") or ""),
+                self._optional_text(diagnosis.get("timeframe")),
+                self._optional_text(diagnosis.get("side")),
+                str(diagnosis.get("outcome") or ""),
+                str(diagnosis.get("diagnosis") or ""),
+                self._json_dumps_safe(diagnosis.get("success_factors") or {}),
+                self._json_dumps_safe(diagnosis.get("failure_factors") or {}),
+                self._optional_text(diagnosis.get("recommendation")),
+                self._optional_float(diagnosis.get("r_result")),
+                self._optional_float(diagnosis.get("max_gain_pct")),
+                self._optional_float(diagnosis.get("max_drawdown_pct")),
+                self._optional_float(diagnosis.get("time_to_tp1_minutes")),
+                self._optional_float(diagnosis.get("time_to_tp2_minutes")),
+                self._optional_float(diagnosis.get("time_to_sl_minutes")),
+                created_at,
+                updated_at,
+            ),
+        )
+        self.conn.commit()
+
+    def get_trade_diagnosis(self, signal_key: str) -> dict[str, Any] | None:
+        self.ensure_trade_diagnosis_schema()
+        row = self.conn.execute(
+            "SELECT * FROM trade_diagnoses WHERE signal_key = ?",
+            (signal_key,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        item = dict(row)
+        for json_col, output_col in (
+            ("success_factors_json", "success_factors"),
+            ("failure_factors_json", "failure_factors"),
+        ):
+            raw = item.pop(json_col, None)
+            try:
+                item[output_col] = json.loads(raw or "{}")
+            except json.JSONDecodeError:
+                item[output_col] = {}
+        return item
+
+    def has_trade_lifecycle_event(self, signal_key: str, event_type: str) -> bool:
+        self.ensure_trade_learning_schema()
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM trade_lifecycle_events
+            WHERE signal_key = ? AND event_type = ?
+            LIMIT 1
+            """,
+            (signal_key, event_type),
+        ).fetchone()
+        return row is not None
 
     def add_trade_lifecycle_event(self, event: Any) -> None:
         self.ensure_trade_learning_schema()

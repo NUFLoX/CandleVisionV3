@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sqlite3
 import sys
 from dataclasses import dataclass
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,7 @@ from typing import Any
 BYBIT_RATE_LIMIT_SLEEP_SECONDS = 5.0
 BYBIT_RATE_LIMIT_RETRIES = 3
 FETCH_KLINES_DELAY_SECONDS = 0.2
+LOGGER = logging.getLogger("OutcomeTracker")
 
 
 ACTIVE_STATUSES = {
@@ -194,6 +197,54 @@ def evaluate_outcome_for_side(
     return Outcome("PENDING", len(rows), t_tp1, t_tp2, t_sl, safe_gain, safe_dd)
 
 
+def _signal_from_row(row: sqlite3.Row) -> SimpleNamespace:
+    reasons_raw = row["reasons_last"] if "reasons_last" in row.keys() else "[]"
+    meta_raw = row["meta"] if "meta" in row.keys() else "{}"
+    try:
+        import json
+
+        reasons = json.loads(reasons_raw or "[]")
+        if not isinstance(reasons, list):
+            reasons = []
+    except Exception:
+        reasons = []
+    try:
+        meta = json.loads(meta_raw or "{}")
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+    meta.setdefault("tf", str(row["timeframe"] or ""))
+    meta.setdefault("market", str(row["market"] or "linear"))
+    return SimpleNamespace(
+        symbol=str(row["symbol"]),
+        side=str(row["side"] or "Buy"),
+        kind=str(row["kind"] or ""),
+        source=str(row["source"] or ""),
+        score=float(row["score_last"] or 0.0),
+        entry=float(row["entry"] or 0.0),
+        stop_loss=float(row["stop_loss"] or 0.0),
+        take_profit_1=float(row["take_profit_1"] or 0.0),
+        take_profit_2=float(row["take_profit_2"] or 0.0),
+        reasons=reasons,
+        meta=meta,
+    )
+
+
+def _record_outcome_learning(store: Any, row: sqlite3.Row, outcome: str, outcome_features: dict[str, Any]) -> None:
+    try:
+        from orderflow_accum.trade_learning import TradeLearningEngine
+
+        TradeLearningEngine(store, logger=LOGGER).record_outcome(
+            _signal_from_row(row),
+            signal_key=str(row["signal_key"]),
+            outcome=outcome,
+            outcome_features=outcome_features,
+        )
+    except Exception as exc:
+        LOGGER.debug("Outcome learning call failed for %s: %r", row["signal_key"], exc, exc_info=True)
+
+
 async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int:
     from orderflow_accum.bybit_rest import BybitRestClient
     from orderflow_accum.config import Settings
@@ -256,6 +307,22 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                         to_status="EXPIRED",
                         score_last=float(row["score_last"] or 0.0),
                     )
+
+                _record_outcome_learning(
+                    store,
+                    row,
+                    "EXPIRED",
+                    {
+                        "symbol": str(row["symbol"]),
+                        "timeframe": str(row["timeframe"]),
+                        "side": str(row["side"] or "Buy"),
+                        "score": float(row["score_last"] or 0.0),
+                        "entry": float(row["entry"] or 0.0),
+                        "stop_loss": float(row["stop_loss"] or 0.0),
+                        "take_profit_1": float(row["take_profit_1"] or 0.0),
+                        "take_profit_2": float(row["take_profit_2"] or 0.0),
+                    },
+                )
 
                 updated += 1
                 continue
@@ -342,6 +409,27 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                     to_status=status,
                     score_last=float(row["score_last"] or 0.0),
                 )
+
+            _record_outcome_learning(
+                store,
+                row,
+                outcome.status,
+                {
+                    "symbol": str(row["symbol"]),
+                    "timeframe": str(row["timeframe"]),
+                    "side": str(row["side"] or "Buy"),
+                    "score": float(row["score_last"] or 0.0),
+                    "entry": float(row["entry"] or 0.0),
+                    "stop_loss": float(row["stop_loss"] or 0.0),
+                    "take_profit_1": float(row["take_profit_1"] or 0.0),
+                    "take_profit_2": float(row["take_profit_2"] or 0.0),
+                    "time_to_tp1_minutes": outcome.time_to_tp1_minutes,
+                    "time_to_tp2_minutes": outcome.time_to_tp2_minutes,
+                    "time_to_sl_minutes": outcome.time_to_sl_minutes,
+                    "max_gain_pct": outcome.max_gain_pct,
+                    "max_drawdown_pct": outcome.max_drawdown_pct,
+                },
+            )
 
             updated += 1
 
