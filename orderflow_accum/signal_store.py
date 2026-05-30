@@ -205,6 +205,35 @@ class SignalStore:
             )
             """
         )
+        for col, typ in (
+            ("entry_price", "REAL"),
+            ("current_sl", "REAL"),
+            ("exit_price", "REAL"),
+            ("exit_reason", "TEXT"),
+            ("max_gain_r", "REAL NOT NULL DEFAULT 0"),
+            ("max_drawdown_r", "REAL NOT NULL DEFAULT 0"),
+            ("bars_in_trade", "INTEGER NOT NULL DEFAULT 0"),
+            ("price", "REAL"),
+            ("spread_bps", "REAL"),
+            ("buy_flow", "REAL"),
+            ("sell_flow", "REAL"),
+            ("required_buy_flow", "REAL"),
+            ("required_sell_flow", "REAL"),
+            ("volume_impulse", "REAL"),
+            ("required_volume_impulse", "REAL"),
+            ("bid_wall_strength", "REAL"),
+            ("ask_wall_strength", "REAL"),
+            ("support", "REAL"),
+            ("resistance", "REAL"),
+            ("ema20", "REAL"),
+            ("vwap", "REAL"),
+            ("diagnostics_json", "TEXT"),
+        ):
+            try:
+                cur.execute(f"ALTER TABLE executor_outcomes ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass
+
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_executor_outcomes_symbol
@@ -229,6 +258,21 @@ class SignalStore:
         max_gain_r: float = 0.0,
         max_drawdown_r: float = 0.0,
         bars_in_trade: int = 0,
+        price: float | None = None,
+        spread_bps: float | None = None,
+        buy_flow: float | None = None,
+        sell_flow: float | None = None,
+        required_buy_flow: float | None = None,
+        required_sell_flow: float | None = None,
+        volume_impulse: float | None = None,
+        required_volume_impulse: float | None = None,
+        bid_wall_strength: float | None = None,
+        ask_wall_strength: float | None = None,
+        support: float | None = None,
+        resistance: float | None = None,
+        ema20: float | None = None,
+        vwap: float | None = None,
+        diagnostics_json: str | dict[str, Any] | None = None,
     ) -> sqlite3.Row:
         self.ensure_executor_schema()
         now = _utc_now()
@@ -252,10 +296,25 @@ class SignalStore:
                 max_gain_r,
                 max_drawdown_r,
                 bars_in_trade,
+                price,
+                spread_bps,
+                buy_flow,
+                sell_flow,
+                required_buy_flow,
+                required_sell_flow,
+                volume_impulse,
+                required_volume_impulse,
+                bid_wall_strength,
+                ask_wall_strength,
+                support,
+                resistance,
+                ema20,
+                vwap,
+                diagnostics_json,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(signal_key) DO UPDATE SET
                 symbol=excluded.symbol,
                 side=excluded.side,
@@ -269,6 +328,21 @@ class SignalStore:
                 max_gain_r=excluded.max_gain_r,
                 max_drawdown_r=excluded.max_drawdown_r,
                 bars_in_trade=excluded.bars_in_trade,
+                price=excluded.price,
+                spread_bps=excluded.spread_bps,
+                buy_flow=excluded.buy_flow,
+                sell_flow=excluded.sell_flow,
+                required_buy_flow=excluded.required_buy_flow,
+                required_sell_flow=excluded.required_sell_flow,
+                volume_impulse=excluded.volume_impulse,
+                required_volume_impulse=excluded.required_volume_impulse,
+                bid_wall_strength=excluded.bid_wall_strength,
+                ask_wall_strength=excluded.ask_wall_strength,
+                support=excluded.support,
+                resistance=excluded.resistance,
+                ema20=excluded.ema20,
+                vwap=excluded.vwap,
+                diagnostics_json=excluded.diagnostics_json,
                 updated_at=excluded.updated_at
             """,
             (
@@ -285,6 +359,21 @@ class SignalStore:
                 float(max_gain_r or 0.0),
                 float(max_drawdown_r or 0.0),
                 int(bars_in_trade or 0),
+                self._optional_float(price),
+                self._optional_float(spread_bps),
+                self._optional_float(buy_flow),
+                self._optional_float(sell_flow),
+                self._optional_float(required_buy_flow),
+                self._optional_float(required_sell_flow),
+                self._optional_float(volume_impulse),
+                self._optional_float(required_volume_impulse),
+                self._optional_float(bid_wall_strength),
+                self._optional_float(ask_wall_strength),
+                self._optional_float(support),
+                self._optional_float(resistance),
+                self._optional_float(ema20),
+                self._optional_float(vwap),
+                self._json_dumps_safe(diagnostics_json or {}) if not isinstance(diagnostics_json, str) else diagnostics_json,
                 created_at,
                 now,
             ),

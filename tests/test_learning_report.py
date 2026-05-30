@@ -100,6 +100,14 @@ def create_executor_table(conn: sqlite3.Connection) -> None:
             reason TEXT NOT NULL,
             max_gain_r REAL,
             max_drawdown_r REAL,
+            volume_impulse REAL,
+            required_volume_impulse REAL,
+            buy_flow REAL,
+            sell_flow REAL,
+            required_buy_flow REAL,
+            spread_bps REAL,
+            ask_wall_strength REAL,
+            bid_wall_strength REAL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -116,14 +124,41 @@ def insert_executor(
     reason: str,
     max_gain_r: float = 0.0,
     max_drawdown_r: float = 0.0,
+    volume_impulse: float | None = None,
+    required_volume_impulse: float | None = None,
+    buy_flow: float | None = None,
+    sell_flow: float | None = None,
+    required_buy_flow: float | None = None,
+    spread_bps: float | None = None,
+    ask_wall_strength: float | None = None,
+    bid_wall_strength: float | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO executor_outcomes (
-            signal_key, symbol, side, state, action, reason, max_gain_r, max_drawdown_r, created_at, updated_at
-        ) VALUES (?, ?, 'Buy', 'WATCHING', ?, ?, ?, ?, ?, ?)
+            signal_key, symbol, side, state, action, reason, max_gain_r, max_drawdown_r,
+            volume_impulse, required_volume_impulse, buy_flow, sell_flow, required_buy_flow,
+            spread_bps, ask_wall_strength, bid_wall_strength, created_at, updated_at
+        ) VALUES (?, ?, 'Buy', 'WATCHING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (signal_key, symbol, action, reason, max_gain_r, max_drawdown_r, now_iso(), now_iso()),
+        (
+            signal_key,
+            symbol,
+            action,
+            reason,
+            max_gain_r,
+            max_drawdown_r,
+            volume_impulse,
+            required_volume_impulse,
+            buy_flow,
+            sell_flow,
+            required_buy_flow,
+            spread_bps,
+            ask_wall_strength,
+            bid_wall_strength,
+            now_iso(),
+            now_iso(),
+        ),
     )
 
 
@@ -225,6 +260,64 @@ def test_executor_outcomes_produce_blocker_report(tmp_path: Path) -> None:
     assert rows[0]["symbols_count"] == "2"
     assert rows[0]["avg_max_gain_r"] == "1"
     assert rows[0]["avg_max_drawdown_r"] == "-0.3"
+    for header in (
+        "avg_volume_impulse",
+        "avg_required_volume_impulse",
+        "avg_buy_flow",
+        "avg_sell_flow",
+        "avg_required_buy_flow",
+        "avg_spread_bps",
+        "avg_ask_wall_strength",
+        "avg_bid_wall_strength",
+    ):
+        assert header in rows[0]
+
+
+def test_executor_blocker_report_recommends_volume_threshold_sensitivity_when_close(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_executor_table(conn)
+    insert_executor(
+        conn,
+        signal_key="close",
+        symbol="BTCUSDT",
+        action="WATCH",
+        reason="entry_blocked_volume_impulse",
+        volume_impulse=1.05,
+        required_volume_impulse=1.2,
+    )
+    conn.commit()
+    conn.close()
+
+    generate_learning_report(db_path, tmp_path / "reports")
+
+    rows = read_csv(tmp_path / "reports" / "learning_executor_blockers.csv")
+    assert rows[0]["avg_volume_impulse"] == "1.05"
+    assert rows[0]["avg_required_volume_impulse"] == "1.2"
+    assert "threshold sensitivity" in rows[0]["recommendation"]
+
+
+def test_executor_blocker_report_recommends_snapshot_review_when_volume_far_below(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_executor_table(conn)
+    insert_executor(
+        conn,
+        signal_key="far",
+        symbol="ETHUSDT",
+        action="WATCH",
+        reason="entry_blocked_volume_impulse",
+        volume_impulse=0.4,
+        required_volume_impulse=1.2,
+    )
+    conn.commit()
+    conn.close()
+
+    generate_learning_report(db_path, tmp_path / "reports")
+
+    rows = read_csv(tmp_path / "reports" / "learning_executor_blockers.csv")
+    assert "snapshot mapping" in rows[0]["recommendation"]
+    assert "far below required" in rows[0]["recommendation"]
 
 
 def test_recommendations_are_generated_for_high_sl_symbol(tmp_path: Path) -> None:

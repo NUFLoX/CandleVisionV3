@@ -452,16 +452,16 @@ class AccumulationRunner:
         override = meta.get("executor_snapshot")
         if isinstance(override, dict):
             data = dict(override)
-            price = float(data.get("price") or signal.entry or 0.0)
+            price = self._float_or_default(data.get("price"), self._optional_float(signal.entry) or 0.0)
             return (
                 OrderflowSnapshot(
                     price=price,
-                    spread_bps=float(data.get("spread_bps", 0.0)),
-                    buy_flow=float(data.get("buy_flow", 1.0)),
-                    sell_flow=float(data.get("sell_flow", 1.0)),
-                    bid_wall_strength=float(data.get("bid_wall_strength", 0.0)),
-                    ask_wall_strength=float(data.get("ask_wall_strength", 0.0)),
-                    volume_impulse=float(data.get("volume_impulse", 1.0)),
+                    spread_bps=self._float_or_default(data.get("spread_bps"), 0.0),
+                    buy_flow=self._float_or_default(data.get("buy_flow"), 1.0),
+                    sell_flow=self._float_or_default(data.get("sell_flow"), 1.0),
+                    bid_wall_strength=self._float_or_default(data.get("bid_wall_strength"), 0.0),
+                    ask_wall_strength=self._float_or_default(data.get("ask_wall_strength"), 0.0),
+                    volume_impulse=self._float_or_default(data.get("volume_impulse"), 1.0),
                     support=self._optional_float(data.get("support", meta.get("support"))),
                     resistance=self._optional_float(
                         data.get(
@@ -471,7 +471,7 @@ class AccumulationRunner:
                     ),
                     ema20=self._optional_float(data.get("ema20", meta.get("ema20"))),
                     vwap=self._optional_float(data.get("vwap", meta.get("vwap"))),
-                    bars_since_entry=int(data.get("bars_since_entry", 0) or 0),
+                    bars_since_entry=int(self._float_or_default(data.get("bars_since_entry"), 0.0)),
                 ),
                 price <= 0,
             )
@@ -534,6 +534,11 @@ class AccumulationRunner:
         except (TypeError, ValueError):
             return None
 
+    @classmethod
+    def _float_or_default(cls, value, default: float) -> float:
+        parsed = cls._optional_float(value)
+        return default if parsed is None else parsed
+
     def _position_from_executor_row(self, signal, row) -> TradePosition:
         side = str(row["side"] or signal.side)
         entry = float(row["entry_price"] or signal.entry or 0.0)
@@ -564,7 +569,58 @@ class AccumulationRunner:
             initial_risk=initial_risk,
         )
 
-    def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None):
+    def _paper_executor_diagnostics(self, signal, snapshot=None) -> dict[str, object]:
+        executor = getattr(self, "trade_executor", None)
+        thresholds = {
+            "max_spread_bps": self._optional_float(getattr(executor, "max_spread_bps", None)),
+            "flow_ratio": self._optional_float(getattr(executor, "flow_ratio", None)),
+            "min_entry_volume_impulse": self._optional_float(getattr(executor, "min_entry_volume_impulse", None)),
+            "ask_wall_entry_limit": self._optional_float(getattr(executor, "ask_wall_entry_limit", None)),
+            "bid_wall_entry_limit": self._optional_float(getattr(executor, "bid_wall_entry_limit", None)),
+            "strong_reversal_ratio": self._optional_float(getattr(executor, "strong_reversal_ratio", None)),
+            "strong_wall_exit_threshold": self._optional_float(getattr(executor, "strong_wall_exit_threshold", None)),
+        }
+        meta = dict(getattr(signal, "meta", {}) or {})
+        override = meta.get("executor_snapshot")
+        values: dict[str, float | None] = {}
+        for field in (
+            "price",
+            "spread_bps",
+            "buy_flow",
+            "sell_flow",
+            "volume_impulse",
+            "bid_wall_strength",
+            "ask_wall_strength",
+            "support",
+            "resistance",
+            "ema20",
+            "vwap",
+        ):
+            if isinstance(override, dict):
+                values[field] = self._optional_float(override.get(field)) if field in override else None
+            elif snapshot is not None:
+                values[field] = self._optional_float(getattr(snapshot, field, None))
+            else:
+                values[field] = None
+
+        flow_ratio = thresholds["flow_ratio"]
+        side = str(getattr(signal, "side", "") or "")
+        required_buy_flow = None
+        required_sell_flow = None
+        if flow_ratio is not None:
+            if side == "Buy" and values.get("sell_flow") is not None:
+                required_buy_flow = values["sell_flow"] * flow_ratio
+            if side == "Sell" and values.get("buy_flow") is not None:
+                required_sell_flow = values["buy_flow"] * flow_ratio
+
+        values["required_buy_flow"] = required_buy_flow
+        values["required_sell_flow"] = required_sell_flow
+        values["required_volume_impulse"] = thresholds["min_entry_volume_impulse"]
+        values["diagnostics_json"] = thresholds
+        return values
+
+    def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None, snapshot=None):
+        diagnostics = self._paper_executor_diagnostics(signal, snapshot)
         row = self.signal_store.upsert_executor_decision(
             signal_key=signal_key,
             symbol=str(signal.symbol),
@@ -579,6 +635,7 @@ class AccumulationRunner:
             max_gain_r=float(position.max_gain_r) if position is not None else 0.0,
             max_drawdown_r=float(position.max_drawdown_r) if position is not None else 0.0,
             bars_in_trade=int(position.bars_in_trade) if position is not None else 0,
+            **diagnostics,
         )
         self.logger.info(
             "Paper executor decision symbol=%s side=%s action=%s reason=%s state=%s max_gain_r=%.4f max_drawdown_r=%.4f",
@@ -607,6 +664,15 @@ class AccumulationRunner:
                     "max_gain_r": float(row["max_gain_r"] or 0.0),
                     "max_drawdown_r": float(row["max_drawdown_r"] or 0.0),
                     "bars_in_trade": int(row["bars_in_trade"] or 0),
+                    "volume_impulse": self._optional_float(row["volume_impulse"]),
+                    "required_volume_impulse": self._optional_float(row["required_volume_impulse"]),
+                    "buy_flow": self._optional_float(row["buy_flow"]),
+                    "sell_flow": self._optional_float(row["sell_flow"]),
+                    "required_buy_flow": self._optional_float(row["required_buy_flow"]),
+                    "required_sell_flow": self._optional_float(row["required_sell_flow"]),
+                    "spread_bps": self._optional_float(row["spread_bps"]),
+                    "ask_wall_strength": self._optional_float(row["ask_wall_strength"]),
+                    "bid_wall_strength": self._optional_float(row["bid_wall_strength"]),
                 },
             )
 
@@ -626,24 +692,24 @@ class AccumulationRunner:
         if weak:
             current_state = str(existing["state"]) if existing is not None else "TRADE_WATCH"
             decision = TradeDecision(WATCH, "paper_executor_missing_snapshot_data", current_state, None)
-            self._store_paper_executor_decision(signal_key, signal, decision, None)
+            self._store_paper_executor_decision(signal_key, signal, decision, None, snapshot)
             return
 
         if existing is not None and str(existing["state"]) in {ENTERED, PROTECT_BREAKEVEN, TRAILING_PROFIT}:
             position = self._position_from_executor_row(signal, existing)
             decision = self.trade_executor.update_position(position, snapshot)
-            self._store_paper_executor_decision(signal_key, signal, decision, decision.position)
+            self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot)
             return
 
         entry_decision = self.trade_executor.evaluate_entry(setup, snapshot)
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
             position = self.trade_executor.open_position(setup, snapshot)
             entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
-            self._store_paper_executor_decision(signal_key, signal, entry_decision, position)
+            self._store_paper_executor_decision(signal_key, signal, entry_decision, position, snapshot)
             return
 
         watch_decision = TradeDecision(WATCH, entry_decision.reason, "TRADE_WATCH", None)
-        self._store_paper_executor_decision(signal_key, signal, watch_decision, None)
+        self._store_paper_executor_decision(signal_key, signal, watch_decision, None, snapshot)
 
     async def _emit_signal(self, rest: BybitRestClient, signal, state=None) -> None:
         market = str(
