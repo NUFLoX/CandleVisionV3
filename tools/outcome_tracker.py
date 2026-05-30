@@ -3,9 +3,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+
+BYBIT_RATE_LIMIT_SLEEP_SECONDS = 5.0
+BYBIT_RATE_LIMIT_RETRIES = 3
+FETCH_KLINES_DELAY_SECONDS = 0.2
 
 
 ACTIVE_STATUSES = {
@@ -50,6 +57,45 @@ def _interval_to_minutes(tf: str) -> int:
     }
 
     return mapping.get(t, 1)
+
+
+def _is_bybit_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "retCode 10006" in text or "Too many visits" in text
+
+
+async def _fetch_klines_with_retry(
+    client: Any,
+    symbol: str,
+    *,
+    interval: str,
+    limit: int,
+    category: str,
+) -> Any | None:
+    for attempt in range(BYBIT_RATE_LIMIT_RETRIES + 1):
+        try:
+            return await client.fetch_klines(
+                symbol,
+                interval=interval,
+                limit=limit,
+                category=category,
+            )
+        except Exception as exc:
+            if _is_bybit_rate_limit_error(exc) and attempt < BYBIT_RATE_LIMIT_RETRIES:
+                print(
+                    f"Bybit rate limit fetching {symbol} {interval} {category}; "
+                    f"retrying in {BYBIT_RATE_LIMIT_SLEEP_SECONDS:g}s "
+                    f"({attempt + 1}/{BYBIT_RATE_LIMIT_RETRIES})",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(BYBIT_RATE_LIMIT_SLEEP_SECONDS)
+                continue
+
+            print(
+                f"Skipping signal for {symbol} {interval} {category}: {exc}",
+                file=sys.stderr,
+            )
+            return None
 
 
 @dataclass(slots=True)
@@ -167,6 +213,7 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
     ).fetchall()
 
     updated = 0
+    candle_cache = {}
 
     async with BybitRestClient(
         settings.rest_base_url,
@@ -213,19 +260,32 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                 updated += 1
                 continue
 
+            symbol = str(row["symbol"])
             category = str(row["market"] or "linear").lower()
+            cache_key = (symbol, tf, category)
 
-            df = await client.fetch_klines(
-                str(row["symbol"]),
-                interval=tf,
-                limit=lookahead_bars,
-                category=category,
-            )
+            candles = candle_cache.get(cache_key)
 
-            if df.empty:
+            if candles is None:
+                df = await _fetch_klines_with_retry(
+                    client,
+                    symbol,
+                    interval=tf,
+                    limit=lookahead_bars,
+                    category=category,
+                )
+
+                await asyncio.sleep(FETCH_KLINES_DELAY_SECONDS)
+
+                if df is None or df.empty:
+                    candle_cache[cache_key] = []
+                    continue
+
+                candles = df.to_dict("records")
+                candle_cache[cache_key] = candles
+
+            if not candles:
                 continue
-
-            candles = df.to_dict("records")
 
             outcome = evaluate_outcome_for_side(
                 float(row["entry"]),
@@ -269,7 +329,7 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                     row["id"],
                 ),
             )
-            
+
             conn.commit()
 
             if status != prev_status:

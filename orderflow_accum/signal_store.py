@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -171,10 +171,290 @@ class SignalStore:
             """
         )
 
+        self.ensure_executor_schema()
+        self.ensure_trade_learning_schema()
+
         if user_version < self.SCHEMA_VERSION:
             cur.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
 
         self.conn.commit()
+
+
+    def ensure_executor_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS executor_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_key TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                state TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                entry_price REAL,
+                current_sl REAL,
+                exit_price REAL,
+                exit_reason TEXT,
+                max_gain_r REAL NOT NULL DEFAULT 0,
+                max_drawdown_r REAL NOT NULL DEFAULT 0,
+                bars_in_trade INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_executor_outcomes_symbol
+            ON executor_outcomes(symbol, updated_at)
+            """
+        )
+        self.conn.commit()
+
+    def upsert_executor_decision(
+        self,
+        *,
+        signal_key: str,
+        symbol: str,
+        side: str,
+        state: str,
+        action: str,
+        reason: str,
+        entry_price: float | None = None,
+        current_sl: float | None = None,
+        exit_price: float | None = None,
+        exit_reason: str | None = None,
+        max_gain_r: float = 0.0,
+        max_drawdown_r: float = 0.0,
+        bars_in_trade: int = 0,
+    ) -> sqlite3.Row:
+        self.ensure_executor_schema()
+        now = _utc_now()
+        cur = self.conn.cursor()
+        cur.execute("SELECT created_at FROM executor_outcomes WHERE signal_key = ?", (signal_key,))
+        existing = cur.fetchone()
+        created_at = str(existing["created_at"]) if existing is not None else now
+        cur.execute(
+            """
+            INSERT INTO executor_outcomes (
+                signal_key,
+                symbol,
+                side,
+                state,
+                action,
+                reason,
+                entry_price,
+                current_sl,
+                exit_price,
+                exit_reason,
+                max_gain_r,
+                max_drawdown_r,
+                bars_in_trade,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_key) DO UPDATE SET
+                symbol=excluded.symbol,
+                side=excluded.side,
+                state=excluded.state,
+                action=excluded.action,
+                reason=excluded.reason,
+                entry_price=excluded.entry_price,
+                current_sl=excluded.current_sl,
+                exit_price=excluded.exit_price,
+                exit_reason=excluded.exit_reason,
+                max_gain_r=excluded.max_gain_r,
+                max_drawdown_r=excluded.max_drawdown_r,
+                bars_in_trade=excluded.bars_in_trade,
+                updated_at=excluded.updated_at
+            """,
+            (
+                signal_key,
+                symbol,
+                side,
+                state,
+                action,
+                reason,
+                entry_price,
+                current_sl,
+                exit_price,
+                exit_reason,
+                float(max_gain_r or 0.0),
+                float(max_drawdown_r or 0.0),
+                int(bars_in_trade or 0),
+                created_at,
+                now,
+            ),
+        )
+        self.conn.commit()
+        row = self.get_executor_outcome(signal_key)
+        if row is None:
+            raise RuntimeError(f"executor outcome was not stored: {signal_key}")
+        return row
+
+    def get_executor_outcome(self, signal_key: str) -> sqlite3.Row | None:
+        self.ensure_executor_schema()
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM executor_outcomes WHERE signal_key = ?", (signal_key,))
+        return cur.fetchone()
+
+    def ensure_trade_learning_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_lifecycle_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_key TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT,
+                side TEXT,
+                event_type TEXT NOT NULL,
+                status TEXT,
+                action TEXT,
+                reason TEXT,
+                price REAL,
+                score REAL,
+                btc_regime TEXT,
+                market_regime TEXT,
+                features_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_signal_key
+            ON trade_lifecycle_events(signal_key)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_symbol_timeframe
+            ON trade_lifecycle_events(symbol, timeframe)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_event_type
+            ON trade_lifecycle_events(event_type)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_created_at
+            ON trade_lifecycle_events(created_at)
+            """
+        )
+        self.conn.commit()
+
+    def add_trade_lifecycle_event(self, event: Any) -> None:
+        self.ensure_trade_learning_schema()
+        payload = self._trade_lifecycle_payload(event)
+        features_json = self._json_dumps_safe(payload.get("features") or {})
+        created_at = str(payload.get("created_at") or _utc_now())
+        self.conn.execute(
+            """
+            INSERT INTO trade_lifecycle_events (
+                signal_key,
+                symbol,
+                timeframe,
+                side,
+                event_type,
+                status,
+                action,
+                reason,
+                price,
+                score,
+                btc_regime,
+                market_regime,
+                features_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(payload.get("signal_key") or ""),
+                str(payload.get("symbol") or ""),
+                self._optional_text(payload.get("timeframe")),
+                self._optional_text(payload.get("side")),
+                str(payload.get("event_type") or ""),
+                self._optional_text(payload.get("status")),
+                self._optional_text(payload.get("action")),
+                self._optional_text(payload.get("reason")),
+                self._optional_float(payload.get("price")),
+                self._optional_float(payload.get("score")),
+                self._optional_text(payload.get("btc_regime")),
+                self._optional_text(payload.get("market_regime")),
+                features_json,
+                created_at,
+            ),
+        )
+        self.conn.commit()
+
+    def get_trade_lifecycle_events(self, signal_key: str) -> list[dict[str, Any]]:
+        self.ensure_trade_learning_schema()
+        rows = self.conn.execute(
+            """
+            SELECT * FROM trade_lifecycle_events
+            WHERE signal_key = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (signal_key,),
+        ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            features_raw = item.pop("features_json", None)
+            try:
+                item["features"] = json.loads(features_raw or "{}")
+            except json.JSONDecodeError:
+                item["features"] = {}
+            events.append(item)
+        return events
+
+    @staticmethod
+    def _trade_lifecycle_payload(event: Any) -> dict[str, Any]:
+        if isinstance(event, dict):
+            return dict(event)
+        if is_dataclass(event):
+            return asdict(event)
+        return dict(getattr(event, "__dict__", {}) or {})
+
+    @classmethod
+    def _json_dumps_safe(cls, value: Any) -> str:
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return json.dumps(cls._stringify_json_value(value), ensure_ascii=False)
+
+    @classmethod
+    def _stringify_json_value(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(k): cls._stringify_json_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [cls._stringify_json_value(v) for v in value]
+        try:
+            json.dumps(value)
+            return value
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _optional_text(value: Any) -> str | None:
+        if value is None:
+            return None
+        return str(value)
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def add_event(
         self,
