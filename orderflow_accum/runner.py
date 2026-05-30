@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import logging
+import os
 import time
 
 from dashboard.ingest_client import DashboardIngestClient
@@ -18,6 +19,19 @@ from .signal_logger import RejectionCsvLogger, SignalCsvLogger
 from .signal_store import SignalStore
 from .confirmed_promoter import ConfirmedPromoter
 from .telegram_notify import TelegramNotifier
+from .trade_executor import (
+    ENTERED,
+    ENTER_LONG,
+    ENTER_SHORT,
+    PROTECT_BREAKEVEN,
+    TRAILING_PROFIT,
+    WATCH,
+    OrderflowSnapshot,
+    SmartTradeExecutor,
+    TradeDecision,
+    TradePosition,
+    TradeSetup,
+)
 from .ws_clients import MarketStream
 
 
@@ -40,6 +54,12 @@ class AccumulationRunner:
         self.csv_logger = SignalCsvLogger("accumulation_signals.csv")
         self.rejection_logger = RejectionCsvLogger("rejection_reasons.csv")
         self.signal_store = SignalStore()
+        self.trade_executor_mode = os.getenv("TRADE_EXECUTOR_MODE", "paper").strip().lower()
+        self.trade_executor_enabled = (
+            os.getenv("RUN_TRADE_EXECUTOR", "false").strip().lower() == "true"
+            and self.trade_executor_mode == "paper"
+        )
+        self.trade_executor = SmartTradeExecutor() if self.trade_executor_enabled else None
         self.dashboard = DashboardIngestClient()
         self.promoter = ConfirmedPromoter()
         self._cooldowns: dict[str, float] = {}
@@ -241,7 +261,7 @@ class AccumulationRunner:
                             signal.meta["tf"] = interval
                             signal.meta["market"] = target.market
 
-                            await self._emit_signal(rest, signal)
+                            await self._emit_signal(rest, signal, state=state)
 
                 except Exception as exc:
                     self.logger.warning("Realtime scan failed for %s: %r", symbol, exc)
@@ -381,7 +401,201 @@ class AccumulationRunner:
 
         return changed, decision.target_status, decision.reasons
 
-    async def _emit_signal(self, rest: BybitRestClient, signal) -> None:
+    def _signal_key(self, signal, market: str) -> str:
+        timeframe = str(signal.meta.get("tf") or "1")
+        return f"{signal.symbol}|{market}|{timeframe}|{signal.kind}|{signal.side}"
+
+    def _paper_executor_setup(self, signal) -> TradeSetup:
+        return TradeSetup(
+            symbol=str(signal.symbol),
+            side=str(signal.side),
+            entry_hint=float(signal.entry or 0.0),
+            stop_loss=float(signal.stop_loss or 0.0),
+            score=float(signal.score or 0.0),
+            timeframe=str(signal.meta.get("tf") or "1"),
+            btc_regime=str(signal.meta.get("btc_regime") or "BTC_NEUTRAL"),
+            reasons=list(signal.reasons or []),
+        )
+
+    def _paper_executor_snapshot(self, signal, state=None) -> tuple[OrderflowSnapshot, bool]:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        override = meta.get("executor_snapshot")
+        if isinstance(override, dict):
+            data = dict(override)
+            price = float(data.get("price") or signal.entry or 0.0)
+            return (
+                OrderflowSnapshot(
+                    price=price,
+                    spread_bps=float(data.get("spread_bps", 0.0)),
+                    buy_flow=float(data.get("buy_flow", 1.0)),
+                    sell_flow=float(data.get("sell_flow", 1.0)),
+                    bid_wall_strength=float(data.get("bid_wall_strength", 0.0)),
+                    ask_wall_strength=float(data.get("ask_wall_strength", 0.0)),
+                    volume_impulse=float(data.get("volume_impulse", 1.0)),
+                    support=self._optional_float(data.get("support", meta.get("support"))),
+                    resistance=self._optional_float(
+                        data.get(
+                            "resistance",
+                            meta.get("resistance") or meta.get("resistance_1") or meta.get("corridor_high"),
+                        )
+                    ),
+                    ema20=self._optional_float(data.get("ema20", meta.get("ema20"))),
+                    vwap=self._optional_float(data.get("vwap", meta.get("vwap"))),
+                    bars_since_entry=int(data.get("bars_since_entry", 0) or 0),
+                ),
+                price <= 0,
+            )
+
+        weak = state is None
+        latest_book = state.snapshots[-1] if state is not None and getattr(state, "snapshots", None) else None
+        price = float(getattr(latest_book, "mid", 0.0) or signal.entry or 0.0)
+        spread_bps = float(getattr(latest_book, "spread_bps", 0.0) if latest_book is not None else 0.0)
+
+        trades = list(getattr(state, "trades", []) or []) if state is not None else []
+        buy_flow = sum(
+            float(getattr(t, "notional", 0.0) or 0.0)
+            for t in trades
+            if str(getattr(t, "side", "")).lower() == "buy"
+        )
+        sell_flow = sum(
+            float(getattr(t, "notional", 0.0) or 0.0)
+            for t in trades
+            if str(getattr(t, "side", "")).lower() == "sell"
+        )
+        if buy_flow <= 0 and sell_flow <= 0:
+            weak = True
+            buy_flow = sell_flow = 1.0
+
+        bid_wall_strength = min(len(getattr(state, "bid_walls", []) or []) / 6.0, 1.0) if state is not None else 0.0
+        ask_wall_strength = min(len(getattr(state, "ask_walls", []) or []) / 6.0, 1.0) if state is not None else 0.0
+
+        support = self._optional_float(meta.get("support"))
+        resistance = self._optional_float(meta.get("resistance") or meta.get("resistance_1") or meta.get("corridor_high"))
+        if support is None and str(signal.side).lower() == "buy":
+            support = float(signal.stop_loss or 0.0) or None
+        if resistance is None and str(signal.side).lower() == "sell":
+            resistance = float(signal.stop_loss or 0.0) or None
+
+        volume_impulse = float(meta.get("volume_impulse", 1.0) or 1.0)
+        return (
+            OrderflowSnapshot(
+                price=price,
+                spread_bps=spread_bps,
+                buy_flow=buy_flow,
+                sell_flow=sell_flow,
+                bid_wall_strength=bid_wall_strength,
+                ask_wall_strength=ask_wall_strength,
+                volume_impulse=volume_impulse,
+                support=support,
+                resistance=resistance,
+                ema20=self._optional_float(meta.get("ema20")),
+                vwap=self._optional_float(meta.get("vwap")),
+                bars_since_entry=0,
+            ),
+            weak or price <= 0,
+        )
+
+    @staticmethod
+    def _optional_float(value) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _position_from_executor_row(self, signal, row) -> TradePosition:
+        side = str(row["side"] or signal.side)
+        entry = float(row["entry_price"] or signal.entry or 0.0)
+        stop = float(signal.stop_loss or row["current_sl"] or 0.0)
+        initial_risk = abs(entry - stop) or max(abs(entry) * 0.01, 1e-9)
+        max_gain_r = float(row["max_gain_r"] or 0.0)
+        max_drawdown_r = float(row["max_drawdown_r"] or 0.0)
+        if side == "Sell":
+            max_price = entry + max_drawdown_r * initial_risk
+            min_price = entry - max_gain_r * initial_risk
+        else:
+            max_price = entry + max_gain_r * initial_risk
+            min_price = entry - max_drawdown_r * initial_risk
+        return TradePosition(
+            symbol=str(row["symbol"] or signal.symbol),
+            side=side,
+            state=str(row["state"] or ENTERED),
+            entry_price=entry,
+            stop_loss=stop,
+            current_sl=float(row["current_sl"] or stop),
+            max_price=max(max_price, entry),
+            min_price=min(min_price, entry),
+            max_gain_r=max_gain_r,
+            max_drawdown_r=max_drawdown_r,
+            bars_in_trade=int(row["bars_in_trade"] or 0),
+            exit_price=self._optional_float(row["exit_price"]),
+            exit_reason=row["exit_reason"],
+            initial_risk=initial_risk,
+        )
+
+    def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None):
+        row = self.signal_store.upsert_executor_decision(
+            signal_key=signal_key,
+            symbol=str(signal.symbol),
+            side=str(signal.side),
+            state=str(decision.next_state),
+            action=str(decision.action),
+            reason=str(decision.reason),
+            entry_price=float(position.entry_price) if position is not None else self._optional_float(signal.entry),
+            current_sl=float(position.current_sl) if position is not None else self._optional_float(signal.stop_loss),
+            exit_price=float(position.exit_price) if position is not None and position.exit_price is not None else None,
+            exit_reason=position.exit_reason if position is not None else None,
+            max_gain_r=float(position.max_gain_r) if position is not None else 0.0,
+            max_drawdown_r=float(position.max_drawdown_r) if position is not None else 0.0,
+            bars_in_trade=int(position.bars_in_trade) if position is not None else 0,
+        )
+        self.logger.info(
+            "Paper executor decision symbol=%s side=%s action=%s reason=%s state=%s max_gain_r=%.4f max_drawdown_r=%.4f",
+            signal.symbol,
+            signal.side,
+            row["action"],
+            row["reason"],
+            row["state"],
+            float(row["max_gain_r"] or 0.0),
+            float(row["max_drawdown_r"] or 0.0),
+        )
+        return row
+
+    def _process_paper_executor(self, signal, market: str, confirmed_status: str | None, state=None) -> None:
+        if not self.trade_executor_enabled or self.trade_executor is None:
+            return
+        if confirmed_status not in {"CONFIRMED_LONG", "CONFIRMED_SHORT"}:
+            return
+
+        signal_key = self._signal_key(signal, market)
+        existing = self.signal_store.get_executor_outcome(signal_key)
+        snapshot, weak = self._paper_executor_snapshot(signal, state)
+        setup = self._paper_executor_setup(signal)
+
+        if weak:
+            current_state = str(existing["state"]) if existing is not None else "TRADE_WATCH"
+            decision = TradeDecision(WATCH, "paper_executor_missing_snapshot_data", current_state, None)
+            self._store_paper_executor_decision(signal_key, signal, decision, None)
+            return
+
+        if existing is not None and str(existing["state"]) in {ENTERED, PROTECT_BREAKEVEN, TRAILING_PROFIT}:
+            position = self._position_from_executor_row(signal, existing)
+            decision = self.trade_executor.update_position(position, snapshot)
+            self._store_paper_executor_decision(signal_key, signal, decision, decision.position)
+            return
+
+        entry_decision = self.trade_executor.evaluate_entry(setup, snapshot)
+        if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
+            position = self.trade_executor.open_position(setup, snapshot)
+            entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
+            self._store_paper_executor_decision(signal_key, signal, entry_decision, position)
+            return
+
+        watch_decision = TradeDecision(WATCH, entry_decision.reason, "TRADE_WATCH", None)
+        self._store_paper_executor_decision(signal_key, signal, watch_decision, None)
+
+    async def _emit_signal(self, rest: BybitRestClient, signal, state=None) -> None:
         market = str(
             signal.meta.get(
                 "market",
@@ -391,6 +605,8 @@ class AccumulationRunner:
 
         upsert = self.signal_store.upsert_signal(signal, market=market)
         promoted, promoted_to, promoted_reasons = self._maybe_promote_confirmed(signal, upsert, market)
+        confirmed_status = promoted_to or upsert.to_status
+        self._process_paper_executor(signal, market, confirmed_status, state)
 
         now = time.time()
         cooldown = self._cooldown_seconds(signal)

@@ -171,10 +171,133 @@ class SignalStore:
             """
         )
 
+        self.ensure_executor_schema()
+
         if user_version < self.SCHEMA_VERSION:
             cur.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
 
         self.conn.commit()
+
+
+    def ensure_executor_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS executor_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_key TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                state TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                entry_price REAL,
+                current_sl REAL,
+                exit_price REAL,
+                exit_reason TEXT,
+                max_gain_r REAL NOT NULL DEFAULT 0,
+                max_drawdown_r REAL NOT NULL DEFAULT 0,
+                bars_in_trade INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_executor_outcomes_symbol
+            ON executor_outcomes(symbol, updated_at)
+            """
+        )
+        self.conn.commit()
+
+    def upsert_executor_decision(
+        self,
+        *,
+        signal_key: str,
+        symbol: str,
+        side: str,
+        state: str,
+        action: str,
+        reason: str,
+        entry_price: float | None = None,
+        current_sl: float | None = None,
+        exit_price: float | None = None,
+        exit_reason: str | None = None,
+        max_gain_r: float = 0.0,
+        max_drawdown_r: float = 0.0,
+        bars_in_trade: int = 0,
+    ) -> sqlite3.Row:
+        self.ensure_executor_schema()
+        now = _utc_now()
+        cur = self.conn.cursor()
+        cur.execute("SELECT created_at FROM executor_outcomes WHERE signal_key = ?", (signal_key,))
+        existing = cur.fetchone()
+        created_at = str(existing["created_at"]) if existing is not None else now
+        cur.execute(
+            """
+            INSERT INTO executor_outcomes (
+                signal_key,
+                symbol,
+                side,
+                state,
+                action,
+                reason,
+                entry_price,
+                current_sl,
+                exit_price,
+                exit_reason,
+                max_gain_r,
+                max_drawdown_r,
+                bars_in_trade,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_key) DO UPDATE SET
+                symbol=excluded.symbol,
+                side=excluded.side,
+                state=excluded.state,
+                action=excluded.action,
+                reason=excluded.reason,
+                entry_price=excluded.entry_price,
+                current_sl=excluded.current_sl,
+                exit_price=excluded.exit_price,
+                exit_reason=excluded.exit_reason,
+                max_gain_r=excluded.max_gain_r,
+                max_drawdown_r=excluded.max_drawdown_r,
+                bars_in_trade=excluded.bars_in_trade,
+                updated_at=excluded.updated_at
+            """,
+            (
+                signal_key,
+                symbol,
+                side,
+                state,
+                action,
+                reason,
+                entry_price,
+                current_sl,
+                exit_price,
+                exit_reason,
+                float(max_gain_r or 0.0),
+                float(max_drawdown_r or 0.0),
+                int(bars_in_trade or 0),
+                created_at,
+                now,
+            ),
+        )
+        self.conn.commit()
+        row = self.get_executor_outcome(signal_key)
+        if row is None:
+            raise RuntimeError(f"executor outcome was not stored: {signal_key}")
+        return row
+
+    def get_executor_outcome(self, signal_key: str) -> sqlite3.Row | None:
+        self.ensure_executor_schema()
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM executor_outcomes WHERE signal_key = ?", (signal_key,))
+        return cur.fetchone()
 
     def add_event(
         self,
