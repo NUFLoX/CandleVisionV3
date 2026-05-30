@@ -1,0 +1,326 @@
+from __future__ import annotations
+
+import csv
+import json
+import sqlite3
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+from tools.learning_report import (
+    DIAGNOSIS_SUMMARY_HEADERS,
+    EXECUTOR_BLOCKERS_HEADERS,
+    RECOMMENDATIONS_HEADERS,
+    SYMBOL_EDGE_HEADERS,
+    TIMEFRAME_EDGE_HEADERS,
+    generate_learning_report,
+)
+
+OUTPUT_FILES = [
+    "learning_summary.json",
+    "learning_symbol_edge.csv",
+    "learning_timeframe_edge.csv",
+    "learning_executor_blockers.csv",
+    "learning_diagnosis_summary.csv",
+    "learning_recommendations.csv",
+]
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def create_diagnoses_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE trade_diagnoses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_key TEXT NOT NULL UNIQUE,
+            symbol TEXT NOT NULL,
+            timeframe TEXT,
+            side TEXT,
+            outcome TEXT NOT NULL,
+            diagnosis TEXT NOT NULL,
+            recommendation TEXT,
+            r_result REAL,
+            max_gain_pct REAL,
+            max_drawdown_pct REAL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def insert_diagnosis(
+    conn: sqlite3.Connection,
+    *,
+    signal_key: str,
+    symbol: str,
+    timeframe: str,
+    outcome: str,
+    r_result: float | None = None,
+    max_gain_pct: float | None = None,
+    max_drawdown_pct: float | None = None,
+    recommendation: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO trade_diagnoses (
+            signal_key, symbol, timeframe, side, outcome, diagnosis, recommendation,
+            r_result, max_gain_pct, max_drawdown_pct, created_at, updated_at
+        ) VALUES (?, ?, ?, 'Buy', ?, 'diagnosis', ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            signal_key,
+            symbol,
+            timeframe,
+            outcome,
+            recommendation,
+            r_result,
+            max_gain_pct,
+            max_drawdown_pct,
+            now_iso(),
+            now_iso(),
+        ),
+    )
+
+
+def create_executor_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE executor_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_key TEXT NOT NULL UNIQUE,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            state TEXT NOT NULL,
+            action TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            max_gain_r REAL,
+            max_drawdown_r REAL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def insert_executor(
+    conn: sqlite3.Connection,
+    *,
+    signal_key: str,
+    symbol: str,
+    action: str,
+    reason: str,
+    max_gain_r: float = 0.0,
+    max_drawdown_r: float = 0.0,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO executor_outcomes (
+            signal_key, symbol, side, state, action, reason, max_gain_r, max_drawdown_r, created_at, updated_at
+        ) VALUES (?, ?, 'Buy', 'WATCHING', ?, ?, ?, ?, ?, ?)
+        """,
+        (signal_key, symbol, action, reason, max_gain_r, max_drawdown_r, now_iso(), now_iso()),
+    )
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def test_empty_database_does_not_crash_and_writes_all_output_files(tmp_path: Path) -> None:
+    db_path = tmp_path / "empty.db"
+    sqlite3.connect(db_path).close()
+
+    generate_learning_report(db_path, tmp_path / "reports")
+
+    for filename in OUTPUT_FILES:
+        assert (tmp_path / "reports" / filename).exists()
+    summary = json.loads((tmp_path / "reports" / "learning_summary.json").read_text(encoding="utf-8"))
+    assert summary["total_signals"] == 0
+    assert summary["total_diagnoses"] == 0
+
+
+def test_missing_optional_tables_does_not_crash(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals_only.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE signals (id INTEGER PRIMARY KEY, symbol TEXT, first_seen TEXT)")
+    conn.execute("INSERT INTO signals (symbol, first_seen) VALUES ('BTCUSDT', ?)", (now_iso(),))
+    conn.commit()
+    conn.close()
+
+    summary = generate_learning_report(db_path, tmp_path / "reports")
+
+    assert summary["total_signals"] == 1
+    assert summary["total_diagnoses"] == 0
+    assert summary["total_executor_decisions"] == 0
+
+
+def test_diagnoses_produce_symbol_report(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_diagnoses_table(conn)
+    insert_diagnosis(conn, signal_key="eth-1", symbol="ETHUSDT", timeframe="5", outcome="TP1", r_result=1.0)
+    insert_diagnosis(conn, signal_key="eth-2", symbol="ETHUSDT", timeframe="5", outcome="SL", r_result=-1.0)
+    conn.commit()
+    conn.close()
+
+    generate_learning_report(db_path, tmp_path / "reports", min_sample=2)
+
+    rows = read_csv(tmp_path / "reports" / "learning_symbol_edge.csv")
+    assert rows == [
+        {
+            "symbol": "ETHUSDT",
+            "total_diagnoses": "2",
+            "tp_count": "1",
+            "sl_count": "1",
+            "expired_count": "0",
+            "ambiguous_count": "0",
+            "tp_rate": "0.5",
+            "sl_rate": "0.5",
+            "avg_r_result": "0",
+            "avg_max_gain_pct": "0",
+            "avg_max_drawdown_pct": "0",
+            "recommendation": "review symbol: high SL rate",
+        }
+    ]
+
+
+def test_diagnoses_produce_timeframe_report(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_diagnoses_table(conn)
+    insert_diagnosis(conn, signal_key="one", symbol="BTCUSDT", timeframe="15", outcome="TP2", r_result=2.0)
+    insert_diagnosis(conn, signal_key="two", symbol="ETHUSDT", timeframe="15", outcome="EXPIRED", r_result=0.0)
+    conn.commit()
+    conn.close()
+
+    generate_learning_report(db_path, tmp_path / "reports", min_sample=2)
+
+    rows = read_csv(tmp_path / "reports" / "learning_timeframe_edge.csv")
+    assert rows[0]["timeframe"] == "15"
+    assert rows[0]["tp_count"] == "1"
+    assert rows[0]["expired_count"] == "1"
+    assert rows[0]["avg_r_result"] == "1"
+
+
+def test_executor_outcomes_produce_blocker_report(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_executor_table(conn)
+    insert_executor(conn, signal_key="a", symbol="BTCUSDT", action="BLOCK", reason="entry_blocked_volume_impulse", max_gain_r=0.5, max_drawdown_r=-0.2)
+    insert_executor(conn, signal_key="b", symbol="ETHUSDT", action="BLOCK", reason="entry_blocked_volume_impulse", max_gain_r=1.5, max_drawdown_r=-0.4)
+    conn.commit()
+    conn.close()
+
+    generate_learning_report(db_path, tmp_path / "reports")
+
+    rows = read_csv(tmp_path / "reports" / "learning_executor_blockers.csv")
+    assert rows[0]["reason"] == "entry_blocked_volume_impulse"
+    assert rows[0]["total"] == "2"
+    assert rows[0]["symbols_count"] == "2"
+    assert rows[0]["avg_max_gain_r"] == "1"
+    assert rows[0]["avg_max_drawdown_r"] == "-0.3"
+
+
+def test_recommendations_are_generated_for_high_sl_symbol(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_diagnoses_table(conn)
+    for idx in range(5):
+        insert_diagnosis(conn, signal_key=f"sl-{idx}", symbol="SOLUSDT", timeframe="5", outcome="SL", r_result=-1.0)
+    conn.commit()
+    conn.close()
+
+    generate_learning_report(db_path, tmp_path / "reports", min_sample=5)
+
+    rows = read_csv(tmp_path / "reports" / "learning_recommendations.csv")
+    assert any(row["scope"] == "SYMBOL" and row["symbol"] == "SOLUSDT" and row["suggested_direction"] == "review" for row in rows)
+
+
+def test_recommendations_are_generated_for_high_tp_but_low_avg_r_symbol(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_diagnoses_table(conn)
+    for idx in range(7):
+        insert_diagnosis(conn, signal_key=f"tp-{idx}", symbol="XRPUSDT", timeframe="1", outcome="TP1", r_result=0.1)
+    for idx in range(3):
+        insert_diagnosis(conn, signal_key=f"amb-{idx}", symbol="XRPUSDT", timeframe="1", outcome="AMBIGUOUS", r_result=0.0)
+    conn.commit()
+    conn.close()
+
+    generate_learning_report(db_path, tmp_path / "reports", min_sample=5)
+
+    rows = read_csv(tmp_path / "reports" / "learning_recommendations.csv")
+    assert any(row["symbol"] == "XRPUSDT" and row["parameter"] == "trailing / exit" for row in rows)
+
+
+def test_json_summary_includes_required_keys(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    sqlite3.connect(db_path).close()
+
+    generate_learning_report(db_path, tmp_path / "reports", since_hours=12)
+
+    summary = json.loads((tmp_path / "reports" / "learning_summary.json").read_text(encoding="utf-8"))
+    assert set(summary) == {
+        "generated_at",
+        "since_hours",
+        "total_signals",
+        "total_diagnoses",
+        "total_executor_decisions",
+        "total_lifecycle_events",
+        "outcome_counts",
+        "executor_action_counts",
+        "top_tp_symbols",
+        "top_sl_symbols",
+        "top_executor_blockers",
+        "high_level_notes",
+    }
+    assert summary["since_hours"] == 12
+
+
+def test_csv_files_have_stable_headers(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    sqlite3.connect(db_path).close()
+
+    generate_learning_report(db_path, tmp_path / "reports")
+
+    expected = {
+        "learning_symbol_edge.csv": SYMBOL_EDGE_HEADERS,
+        "learning_timeframe_edge.csv": TIMEFRAME_EDGE_HEADERS,
+        "learning_executor_blockers.csv": EXECUTOR_BLOCKERS_HEADERS,
+        "learning_diagnosis_summary.csv": DIAGNOSIS_SUMMARY_HEADERS,
+        "learning_recommendations.csv": RECOMMENDATIONS_HEADERS,
+    }
+    for filename, headers in expected.items():
+        with (tmp_path / "reports" / filename).open(newline="", encoding="utf-8") as handle:
+            assert next(csv.reader(handle)) == headers
+
+
+def test_cli_main_can_run_against_temp_db(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    sqlite3.connect(db_path).close()
+    out_dir = tmp_path / "reports"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.learning_report",
+            "--db",
+            str(db_path),
+            "--out-dir",
+            str(out_dir),
+            "--since-hours",
+            "24",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert (out_dir / "learning_summary.json").exists()
