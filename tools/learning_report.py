@@ -50,6 +50,14 @@ EXECUTOR_BLOCKERS_HEADERS = [
     "symbols_count",
     "avg_max_gain_r",
     "avg_max_drawdown_r",
+    "avg_volume_impulse",
+    "avg_required_volume_impulse",
+    "avg_buy_flow",
+    "avg_sell_flow",
+    "avg_required_buy_flow",
+    "avg_spread_bps",
+    "avg_ask_wall_strength",
+    "avg_bid_wall_strength",
     "recommendation",
 ]
 DIAGNOSIS_SUMMARY_HEADERS = [
@@ -217,6 +225,30 @@ def build_edge_rows(rows: list[dict[str, Any]], group_col: str, headers: list[st
     return result
 
 
+def executor_blocker_recommendation(reason: str, metrics: dict[str, float]) -> str:
+    if reason == "entry_blocked_volume_impulse":
+        avg_volume = metrics.get("avg_volume_impulse", 0.0)
+        avg_required = metrics.get("avg_required_volume_impulse", 0.0)
+        if avg_required > 0 and avg_volume >= avg_required * 0.85:
+            return "review volume_impulse threshold sensitivity: average is close to required"
+        if avg_required > 0:
+            return "review snapshot mapping or confirm market weakness: average is far below required"
+        return "review volume_impulse threshold or snapshot mapping"
+
+    if reason == "entry_blocked_buy_flow":
+        avg_buy_flow = metrics.get("avg_buy_flow", 0.0)
+        avg_required = metrics.get("avg_required_buy_flow", 0.0)
+        if avg_required > 0 and avg_buy_flow >= avg_required * 0.85:
+            return "review flow_ratio sensitivity: average buy flow is close to required"
+        if avg_required > 0:
+            return "keep strict flow filter: average buy flow is far below required"
+        return "review buy_flow/sell_flow ratio"
+
+    if reason in BLOCKER_REASONS:
+        return BLOCKER_REASONS[reason][1]
+    return "review blocker frequency" if reason.startswith("entry_blocked") else "keep monitoring"
+
+
 def build_executor_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -225,9 +257,17 @@ def build_executor_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
 
     result: list[dict[str, Any]] = []
     for reason, items in sorted(grouped.items(), key=lambda pair: (-len(pair[1]), pair[0])):
-        recommendation = "review blocker frequency" if reason.startswith("entry_blocked") else "keep monitoring"
-        if reason in BLOCKER_REASONS:
-            recommendation = BLOCKER_REASONS[reason][1]
+        metrics = {
+            "avg_volume_impulse": safe_avg(item.get("volume_impulse") for item in items),
+            "avg_required_volume_impulse": safe_avg(item.get("required_volume_impulse") for item in items),
+            "avg_buy_flow": safe_avg(item.get("buy_flow") for item in items),
+            "avg_sell_flow": safe_avg(item.get("sell_flow") for item in items),
+            "avg_required_buy_flow": safe_avg(item.get("required_buy_flow") for item in items),
+            "avg_spread_bps": safe_avg(item.get("spread_bps") for item in items),
+            "avg_ask_wall_strength": safe_avg(item.get("ask_wall_strength") for item in items),
+            "avg_bid_wall_strength": safe_avg(item.get("bid_wall_strength") for item in items),
+        }
+        recommendation = executor_blocker_recommendation(reason, metrics)
         result.append(
             {
                 "reason": reason,
@@ -235,6 +275,7 @@ def build_executor_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
                 "symbols_count": str(len({str(item.get("symbol") or "UNKNOWN") for item in items})),
                 "avg_max_gain_r": fmt_float(safe_avg(item.get("max_gain_r") for item in items)),
                 "avg_max_drawdown_r": fmt_float(safe_avg(item.get("max_drawdown_r") for item in items)),
+                **{key: fmt_float(value) for key, value in metrics.items()},
                 "recommendation": recommendation,
             }
         )
