@@ -5,6 +5,8 @@ from pathlib import Path
 from types import ModuleType
 import sys
 
+import pytest
+
 from orderflow_accum.models import Signal
 from orderflow_accum.signal_store import SignalStore
 from orderflow_accum.trade_learning import TradeLearningEngine
@@ -38,49 +40,55 @@ def make_signal(**overrides) -> Signal:
     return Signal(**data)
 
 
-def _install_runner_import_stubs() -> None:
+def _install_runner_import_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     dashboard_ingest = ModuleType("dashboard.ingest_client")
     dashboard_ingest.DashboardIngestClient = type("DashboardIngestClient", (), {})
-    sys.modules.setdefault("dashboard.ingest_client", dashboard_ingest)
+    monkeypatch.setitem(sys.modules, "dashboard.ingest_client", dashboard_ingest)
 
     bybit_rest = ModuleType("orderflow_accum.bybit_rest")
     bybit_rest.BybitRestClient = type("BybitRestClient", (), {})
     bybit_rest.ScanTarget = type("ScanTarget", (), {})
-    sys.modules.setdefault("orderflow_accum.bybit_rest", bybit_rest)
+    monkeypatch.setitem(sys.modules, "orderflow_accum.bybit_rest", bybit_rest)
 
     console_ui = ModuleType("orderflow_accum.console_ui")
     console_ui.ConsoleUI = type("ConsoleUI", (), {})
-    sys.modules.setdefault("orderflow_accum.console_ui", console_ui)
+    monkeypatch.setitem(sys.modules, "orderflow_accum.console_ui", console_ui)
 
     engines = ModuleType("orderflow_accum.engines")
     engines.MacroAccumulationEngine = type("MacroAccumulationEngine", (), {})
     engines.RealtimeAccumulationEngine = type("RealtimeAccumulationEngine", (), {})
-    sys.modules.setdefault("orderflow_accum.engines", engines)
+    monkeypatch.setitem(sys.modules, "orderflow_accum.engines", engines)
 
     short_engine = ModuleType("orderflow_accum.short_engine")
     short_engine.DistributionShortEngine = type("DistributionShortEngine", (), {})
-    sys.modules.setdefault("orderflow_accum.short_engine", short_engine)
+    monkeypatch.setitem(sys.modules, "orderflow_accum.short_engine", short_engine)
 
     market_regime = ModuleType("orderflow_accum.market_regime")
     market_regime.MarketRegimeAnalyzer = type("MarketRegimeAnalyzer", (), {})
-    sys.modules.setdefault("orderflow_accum.market_regime", market_regime)
+    monkeypatch.setitem(sys.modules, "orderflow_accum.market_regime", market_regime)
 
     chart_render = ModuleType("orderflow_accum.chart_render")
     chart_render.render_signal_chart = lambda *args, **kwargs: None
-    sys.modules.setdefault("orderflow_accum.chart_render", chart_render)
+    monkeypatch.setitem(sys.modules, "orderflow_accum.chart_render", chart_render)
 
     signal_logger = ModuleType("orderflow_accum.signal_logger")
     signal_logger.RejectionCsvLogger = type("RejectionCsvLogger", (), {})
     signal_logger.SignalCsvLogger = type("SignalCsvLogger", (), {})
-    sys.modules.setdefault("orderflow_accum.signal_logger", signal_logger)
+    monkeypatch.setitem(sys.modules, "orderflow_accum.signal_logger", signal_logger)
 
     telegram_notify = ModuleType("orderflow_accum.telegram_notify")
     telegram_notify.TelegramNotifier = type("TelegramNotifier", (), {})
-    sys.modules.setdefault("orderflow_accum.telegram_notify", telegram_notify)
+    monkeypatch.setitem(sys.modules, "orderflow_accum.telegram_notify", telegram_notify)
 
     ws_clients = ModuleType("orderflow_accum.ws_clients")
     ws_clients.MarketStream = type("MarketStream", (), {})
-    sys.modules.setdefault("orderflow_accum.ws_clients", ws_clients)
+    monkeypatch.setitem(sys.modules, "orderflow_accum.ws_clients", ws_clients)
+
+
+@pytest.fixture(autouse=True)
+def runner_import_stubs(monkeypatch: pytest.MonkeyPatch):
+    _install_runner_import_stubs(monkeypatch)
+    yield
 
 
 def test_trade_learning_engine_records_signal_created_and_updated(tmp_path: Path) -> None:
@@ -133,7 +141,6 @@ def test_trade_learning_engine_swallows_store_failures() -> None:
 
 
 def test_runner_lifecycle_helper_uses_fake_learning_without_touching_signal_state() -> None:
-    _install_runner_import_stubs()
     from orderflow_accum.runner import AccumulationRunner
 
     class FakeLearning:

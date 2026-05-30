@@ -81,6 +81,14 @@ if "%RUN_OUTCOME_TRACKER%"=="" (
     set "RUN_OUTCOME_TRACKER=false"
 )
 
+if "%RUN_LEARNING_REPORT%"=="" (
+    set "RUN_LEARNING_REPORT=false"
+)
+
+if "%RUN_WATCHLIST_REPORT%"=="" (
+    set "RUN_WATCHLIST_REPORT=false"
+)
+
 if "%RUN_TRADE_EXECUTOR%"=="" (
     set "RUN_TRADE_EXECUTOR=true"
 )
@@ -117,6 +125,38 @@ if "%OUTCOME_TRACKER_INTERVAL_MINUTES%"=="" (
     set "OUTCOME_TRACKER_INTERVAL_MINUTES=10"
 )
 
+if "%LEARNING_REPORT_INTERVAL_SECONDS%"=="" (
+    set "LEARNING_REPORT_INTERVAL_SECONDS=3600"
+)
+
+if "%LEARNING_REPORT_DB%"=="" (
+    set "LEARNING_REPORT_DB=data\signals.db"
+)
+
+if "%LEARNING_REPORT_OUT_DIR%"=="" (
+    set "LEARNING_REPORT_OUT_DIR=reports_learning"
+)
+
+if "%LEARNING_REPORT_SINCE_HOURS%"=="" (
+    set "LEARNING_REPORT_SINCE_HOURS=24"
+)
+
+if "%LEARNING_REPORT_MIN_SAMPLE%"=="" (
+    set "LEARNING_REPORT_MIN_SAMPLE=5"
+)
+
+if "%WATCHLIST_REPORT_INTERVAL_SECONDS%"=="" (
+    set "WATCHLIST_REPORT_INTERVAL_SECONDS=3600"
+)
+
+if "%WATCHLIST_REPORT_DB%"=="" (
+    set "WATCHLIST_REPORT_DB=data\signals.db"
+)
+
+if "%WATCHLIST_REPORT_OUT_DIR%"=="" (
+    set "WATCHLIST_REPORT_OUT_DIR=reports_watchlist"
+)
+
 set "PYTHONPATH=%CD%"
 
 echo.
@@ -127,6 +167,8 @@ echo PROJECT_DIR=%CD%
 echo RUN_DASHBOARD=%RUN_DASHBOARD%
 echo RUN_SCANNER=%RUN_SCANNER%
 echo RUN_OUTCOME_TRACKER=%RUN_OUTCOME_TRACKER%
+echo RUN_LEARNING_REPORT=%RUN_LEARNING_REPORT%
+echo RUN_WATCHLIST_REPORT=%RUN_WATCHLIST_REPORT%
 echo RUN_TRADE_EXECUTOR=%RUN_TRADE_EXECUTOR%
 echo TRADE_EXECUTOR_MODE=%TRADE_EXECUTOR_MODE%
 echo DASHBOARD_HOST=%DASHBOARD_HOST%
@@ -135,6 +177,14 @@ echo DASHBOARD_API_URL=%DASHBOARD_API_URL%
 echo SIGNALS_ONLY=%SIGNALS_ONLY%
 echo TRADING_ENABLED=%TRADING_ENABLED%
 echo OUTCOME_TRACKER_INTERVAL_MINUTES=%OUTCOME_TRACKER_INTERVAL_MINUTES%
+echo LEARNING_REPORT_INTERVAL_SECONDS=%LEARNING_REPORT_INTERVAL_SECONDS%
+echo LEARNING_REPORT_DB=%LEARNING_REPORT_DB%
+echo LEARNING_REPORT_OUT_DIR=%LEARNING_REPORT_OUT_DIR%
+echo LEARNING_REPORT_SINCE_HOURS=%LEARNING_REPORT_SINCE_HOURS%
+echo LEARNING_REPORT_MIN_SAMPLE=%LEARNING_REPORT_MIN_SAMPLE%
+echo WATCHLIST_REPORT_INTERVAL_SECONDS=%WATCHLIST_REPORT_INTERVAL_SECONDS%
+echo WATCHLIST_REPORT_DB=%WATCHLIST_REPORT_DB%
+echo WATCHLIST_REPORT_OUT_DIR=%WATCHLIST_REPORT_OUT_DIR%
 echo PYTHONPATH=%PYTHONPATH%
 echo ==================================================
 echo.
@@ -160,6 +210,30 @@ if /I "%RUN_OUTCOME_TRACKER%"=="true" (
     start "CandleVision Outcome Tracker" cmd /k python tools\outcome_tracker.py --db data\signals.db --loop --interval-minutes %OUTCOME_TRACKER_INTERVAL_MINUTES%
     timeout /t 1 >nul
     echo Outcome tracker started.
+    echo.
+)
+
+REM ==================================================
+REM Optional learning report sidecar
+REM ==================================================
+
+if /I "%RUN_LEARNING_REPORT%"=="true" (
+    echo Starting learning report sidecar...
+    start "CandleVision Learning Report" cmd /k "echo CandleVision Learning Report loop started. & for /l %%G in (0,0,1) do (python -m tools.learning_report --db %LEARNING_REPORT_DB% --out-dir %LEARNING_REPORT_OUT_DIR% --since-hours %LEARNING_REPORT_SINCE_HOURS% --min-sample %LEARNING_REPORT_MIN_SAMPLE% ^& timeout /t %LEARNING_REPORT_INTERVAL_SECONDS% /nobreak ^>nul)"
+    timeout /t 1 >nul
+    echo Learning report started.
+    echo.
+)
+
+REM ==================================================
+REM Optional watchlist transition study sidecar
+REM ==================================================
+
+if /I "%RUN_WATCHLIST_REPORT%"=="true" (
+    echo Starting watchlist transition report sidecar...
+    start "CandleVision Watchlist Report" cmd /k "echo CandleVision Watchlist Report loop started. & for /l %%G in (0,0,1) do (python .\tools\watchlist_transition_study.py --db %WATCHLIST_REPORT_DB% --out-dir %WATCHLIST_REPORT_OUT_DIR% ^& timeout /t %WATCHLIST_REPORT_INTERVAL_SECONDS% /nobreak ^>nul)"
+    timeout /t 1 >nul
+    echo Watchlist transition report started.
     echo.
 )
 
