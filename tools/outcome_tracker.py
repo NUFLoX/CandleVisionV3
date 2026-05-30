@@ -156,8 +156,9 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
     settings = Settings()
     store = SignalStore(db_path=db_path)
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
 
     placeholders = ",".join("?" * len(ACTIVE_STATUSES))
     rows = conn.execute(
@@ -195,6 +196,8 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                         row["id"],
                     ),
                 )
+
+                conn.commit()
 
                 if prev_status != "EXPIRED":
                     store.add_event(
@@ -266,6 +269,8 @@ async def run_once(db_path: str, lookahead_bars: int, expires_hours: int) -> int
                     row["id"],
                 ),
             )
+            
+            conn.commit()
 
             if status != prev_status:
                 store.add_event(
