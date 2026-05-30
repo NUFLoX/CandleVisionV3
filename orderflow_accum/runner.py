@@ -19,6 +19,7 @@ from .signal_logger import RejectionCsvLogger, SignalCsvLogger
 from .signal_store import SignalStore
 from .confirmed_promoter import ConfirmedPromoter
 from .telegram_notify import TelegramNotifier
+from .trade_learning import TradeLearningEngine
 from .trade_executor import (
     ENTERED,
     ENTER_LONG,
@@ -60,6 +61,7 @@ class AccumulationRunner:
             and self.trade_executor_mode == "paper"
         )
         self.trade_executor = SmartTradeExecutor() if self.trade_executor_enabled else None
+        self.trade_learning = TradeLearningEngine(self.signal_store, logger=self.logger)
         self.dashboard = DashboardIngestClient()
         self.promoter = ConfirmedPromoter()
         self._cooldowns: dict[str, float] = {}
@@ -405,6 +407,34 @@ class AccumulationRunner:
         timeframe = str(signal.meta.get("tf") or "1")
         return f"{signal.symbol}|{market}|{timeframe}|{signal.kind}|{signal.side}"
 
+    def _record_signal_lifecycle(self, signal, signal_key: str, upsert, confirmed_status: str | None) -> None:
+        event_type = "SIGNAL_CREATED" if upsert.is_new else "SIGNAL_UPDATED"
+        self.trade_learning.record_signal(
+            signal=signal,
+            signal_key=signal_key,
+            event_type=event_type,
+            status=upsert.to_status,
+            features={
+                "repeat_count": upsert.repeat_count,
+                "status_changed": upsert.status_changed,
+                "score_jump": upsert.score_jump,
+                "from_status": upsert.from_status,
+                "to_status": upsert.to_status,
+            },
+        )
+
+        if confirmed_status in {"CONFIRMED_LONG", "CONFIRMED_SHORT"}:
+            self.trade_learning.record_signal(
+                signal=signal,
+                signal_key=signal_key,
+                event_type="CONFIRMED",
+                status=confirmed_status,
+                features={
+                    "promotion_status": signal.meta.get("promotion_status"),
+                    "promotion_reasons": signal.meta.get("promotion_reasons", []),
+                },
+            )
+
     def _paper_executor_setup(self, signal) -> TradeSetup:
         return TradeSetup(
             symbol=str(signal.symbol),
@@ -560,6 +590,26 @@ class AccumulationRunner:
             float(row["max_gain_r"] or 0.0),
             float(row["max_drawdown_r"] or 0.0),
         )
+        trade_learning = getattr(self, "trade_learning", None)
+
+        if trade_learning is not None:
+            trade_learning.record_executor_decision(
+                signal=signal,
+                signal_key=signal_key,
+                state=str(row["state"]),
+                action=str(row["action"]),
+                reason=str(row["reason"]),
+                price=self._optional_float(row["exit_price"]) or self._optional_float(row["entry_price"]),
+                features={
+                    "current_sl": self._optional_float(row["current_sl"]),
+                    "exit_price": self._optional_float(row["exit_price"]),
+                    "exit_reason": row["exit_reason"],
+                    "max_gain_r": float(row["max_gain_r"] or 0.0),
+                    "max_drawdown_r": float(row["max_drawdown_r"] or 0.0),
+                    "bars_in_trade": int(row["bars_in_trade"] or 0),
+                },
+            )
+
         return row
 
     def _process_paper_executor(self, signal, market: str, confirmed_status: str | None, state=None) -> None:
@@ -606,6 +656,13 @@ class AccumulationRunner:
         upsert = self.signal_store.upsert_signal(signal, market=market)
         promoted, promoted_to, promoted_reasons = self._maybe_promote_confirmed(signal, upsert, market)
         confirmed_status = promoted_to or upsert.to_status
+        upsert = self.signal_store.upsert_signal(signal, market=market)
+        promoted, promoted_to, promoted_reasons = self._maybe_promote_confirmed(signal, upsert, market)
+        confirmed_status = promoted_to or upsert.to_status
+
+        signal_key = self._signal_key(signal, market)
+        self._record_signal_lifecycle(signal, signal_key, upsert, confirmed_status)
+
         self._process_paper_executor(signal, market, confirmed_status, state)
 
         now = time.time()
