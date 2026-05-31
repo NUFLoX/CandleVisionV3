@@ -229,3 +229,58 @@ def test_missing_snapshot_diagnostics_do_not_crash_and_store_nulls(tmp_path: Pat
     assert row["volume_impulse"] is None
     assert row["required_volume_impulse"] == runner.trade_executor.min_entry_volume_impulse
     runner.signal_store.close()
+
+
+def test_meta_volume_impulse_fields_drive_snapshot_and_diagnostics(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "volume_impulse": 1.45})
+
+    snapshot, weak = runner._paper_executor_snapshot(signal)
+    diagnostics = runner._paper_executor_diagnostics(signal, snapshot)
+
+    assert weak is True
+    assert snapshot.volume_impulse == 1.45
+    assert diagnostics["volume_impulse"] == 1.45
+    assert diagnostics["diagnostics_json"]["volume_impulse_source"] == "meta.volume_impulse"
+    assert diagnostics["diagnostics_json"]["volume_impulse_missing"] is False
+    assert diagnostics["diagnostics_json"]["volume_impulse_ratio_to_required"] == pytest.approx(1.45 / 1.2)
+
+
+@pytest.mark.parametrize("field", ["volume_spike", "v_spike", "vspike", "volume_ratio", "volume_expansion"])
+def test_meta_volume_aliases_map_to_volume_impulse(field: str, tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", field: 1.33})
+
+    snapshot, _weak = runner._paper_executor_snapshot(signal)
+    diagnostics = runner._paper_executor_diagnostics(signal, snapshot)
+
+    assert snapshot.volume_impulse == 1.33
+    assert diagnostics["diagnostics_json"]["volume_impulse_source"] == f"meta.{field}"
+    assert diagnostics["diagnostics_json"]["volume_impulse_missing"] is False
+
+
+def test_missing_volume_data_marks_missing_default_and_root_cause(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "executor_snapshot": make_snapshot(volume_impulse=None, buy_flow=140.0, sell_flow=90.0),
+        },
+        reasons=["long_promotion_rules_met"],
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["volume_impulse_source"] == "missing_default"
+    assert diagnostics["volume_impulse_missing"] is True
+    assert diagnostics["volume_impulse_ratio_to_required"] == pytest.approx(1.0 / 1.2)
+    assert diagnostics["blocker_root_cause"] == "missing_volume_impulse_mapping"
+    features = runner.trade_learning.events[0]["features"]
+    assert features["volume_impulse_source"] == "missing_default"
+    assert features["volume_impulse_missing"] is True
+    assert features["blocker_root_cause"] == "missing_volume_impulse_mapping"
+    runner.signal_store.close()

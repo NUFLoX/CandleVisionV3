@@ -52,6 +52,10 @@ EXECUTOR_BLOCKERS_HEADERS = [
     "avg_max_drawdown_r",
     "avg_volume_impulse",
     "avg_required_volume_impulse",
+    "volume_impulse_source_distribution",
+    "missing_default_volume_impulse_count",
+    "missing_default_volume_impulse_share",
+    "avg_volume_impulse_ratio_to_required",
     "avg_buy_flow",
     "avg_sell_flow",
     "avg_required_buy_flow",
@@ -120,6 +124,24 @@ def safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
 
+
+
+def parse_diagnostics_json(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value in (None, ""):
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def diagnostic_value(row: dict[str, Any], key: str) -> Any:
+    if key in row and row.get(key) not in (None, ""):
+        return row.get(key)
+    return parse_diagnostics_json(row.get("diagnostics_json")).get(key)
 
 def safe_avg(values: Iterable[Any]) -> float:
     numbers = [item for item in (safe_float(value) for value in values) if item is not None]
@@ -227,12 +249,18 @@ def build_edge_rows(rows: list[dict[str, Any]], group_col: str, headers: list[st
 
 def executor_blocker_recommendation(reason: str, metrics: dict[str, float]) -> str:
     if reason == "entry_blocked_volume_impulse":
+        missing_share = metrics.get("missing_default_volume_impulse_share", 0.0)
+        if missing_share >= 0.5:
+            return "fix snapshot mapping before changing thresholds: missing_default volume_impulse dominates"
+        avg_ratio = metrics.get("avg_volume_impulse_ratio_to_required", 0.0)
         avg_volume = metrics.get("avg_volume_impulse", 0.0)
         avg_required = metrics.get("avg_required_volume_impulse", 0.0)
-        if avg_required > 0 and avg_volume >= avg_required * 0.85:
+        if avg_ratio >= 0.85 or (avg_required > 0 and avg_volume >= avg_required * 0.85):
             return "review volume_impulse threshold sensitivity: average is close to required"
-        if avg_required > 0:
-            return "review snapshot mapping or confirm market weakness: average is far below required"
+        if avg_required > 0 or avg_ratio > 0:
+            if metrics.get("known_volume_impulse_source_share", 0.0) <= 0:
+                return "review snapshot mapping or confirm market weakness: average is far below required"
+            return "confirm market weakness before changing thresholds: real volume impulse is far below required"
         return "review volume_impulse threshold or snapshot mapping"
 
     if reason == "entry_blocked_buy_flow":
@@ -257,9 +285,18 @@ def build_executor_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
 
     result: list[dict[str, Any]] = []
     for reason, items in sorted(grouped.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+        source_counts = Counter(str(diagnostic_value(item, "volume_impulse_source") or "UNKNOWN") for item in items)
+        missing_default_count = source_counts.get("missing_default", 0)
         metrics = {
             "avg_volume_impulse": safe_avg(item.get("volume_impulse") for item in items),
             "avg_required_volume_impulse": safe_avg(item.get("required_volume_impulse") for item in items),
+            "missing_default_volume_impulse_count": float(missing_default_count),
+            "missing_default_volume_impulse_share": rate(missing_default_count, len(items)),
+            "avg_volume_impulse_ratio_to_required": safe_avg(diagnostic_value(item, "volume_impulse_ratio_to_required") for item in items),
+            "known_volume_impulse_source_share": rate(
+                sum(1 for item in items if diagnostic_value(item, "volume_impulse_source") not in (None, "")),
+                len(items),
+            ),
             "avg_buy_flow": safe_avg(item.get("buy_flow") for item in items),
             "avg_sell_flow": safe_avg(item.get("sell_flow") for item in items),
             "avg_required_buy_flow": safe_avg(item.get("required_buy_flow") for item in items),
@@ -275,6 +312,9 @@ def build_executor_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
                 "symbols_count": str(len({str(item.get("symbol") or "UNKNOWN") for item in items})),
                 "avg_max_gain_r": fmt_float(safe_avg(item.get("max_gain_r") for item in items)),
                 "avg_max_drawdown_r": fmt_float(safe_avg(item.get("max_drawdown_r") for item in items)),
+                "volume_impulse_source_distribution": ";".join(
+                    f"{source}:{count}" for source, count in sorted(source_counts.items())
+                ),
                 **{key: fmt_float(value) for key, value in metrics.items()},
                 "recommendation": recommendation,
             }
@@ -415,6 +455,8 @@ def build_recommendation_rows(
         sample_size = int(row["total"] or 0)
         if reason in BLOCKER_REASONS and total_executor > 0 and sample_size / total_executor >= 0.5:
             parameter, recommendation = BLOCKER_REASONS[reason]
+            if reason == "entry_blocked_volume_impulse":
+                recommendation = str(row.get("recommendation") or recommendation)
             result.append(
                 recommendation_row(
                     scope="EXECUTOR",
