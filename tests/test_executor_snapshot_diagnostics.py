@@ -244,6 +244,28 @@ def test_meta_volume_impulse_fields_drive_snapshot_and_diagnostics(tmp_path: Pat
     assert diagnostics["diagnostics_json"]["volume_impulse_source"] == "meta.volume_impulse"
     assert diagnostics["diagnostics_json"]["volume_impulse_missing"] is False
     assert diagnostics["diagnostics_json"]["volume_impulse_ratio_to_required"] == pytest.approx(1.45 / 1.2)
+    assert diagnostics["diagnostics_json"]["volume_impulse_capped"] == 1.45
+    assert diagnostics["diagnostics_json"]["volume_impulse_cap"] == 50.0
+    assert diagnostics["diagnostics_json"]["volume_impulse_was_capped"] is False
+    assert diagnostics["diagnostics_json"]["volume_impulse_ratio_to_required_capped"] == pytest.approx(1.45 / 1.2)
+
+
+def test_huge_volume_impulse_adds_capped_reporting_diagnostics(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "volume_impulse": 31890.0})
+
+    snapshot, _weak = runner._paper_executor_snapshot(signal)
+    diagnostics = runner._paper_executor_diagnostics(signal, snapshot)
+
+    assert snapshot.volume_impulse == 31890.0
+    assert diagnostics["volume_impulse"] == 31890.0
+    diagnostics_json = diagnostics["diagnostics_json"]
+    assert diagnostics_json["volume_impulse_raw"] == 31890.0
+    assert diagnostics_json["volume_impulse_ratio_to_required"] == pytest.approx(31890.0 / 1.2)
+    assert diagnostics_json["volume_impulse_capped"] == 50.0
+    assert diagnostics_json["volume_impulse_cap"] == 50.0
+    assert diagnostics_json["volume_impulse_was_capped"] is True
+    assert diagnostics_json["volume_impulse_ratio_to_required_capped"] == pytest.approx(50.0 / 1.2)
 
 
 @pytest.mark.parametrize("field", ["volume_spike", "v_spike", "vspike", "volume_ratio", "volume_expansion"])

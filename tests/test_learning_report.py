@@ -276,6 +276,56 @@ def test_executor_outcomes_produce_blocker_report(tmp_path: Path) -> None:
         assert header in rows[0]
 
 
+def test_executor_blocker_report_uses_capped_volume_impulse_for_reporting(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_executor_table(conn)
+    insert_executor(
+        conn,
+        signal_key="huge",
+        symbol="BTCUSDT",
+        action="WATCH",
+        reason="entry_blocked_volume_impulse",
+        volume_impulse=31890.0,
+        required_volume_impulse=1.2,
+        diagnostics_json={
+            "volume_impulse_capped": 50.0,
+            "volume_impulse_cap": 50.0,
+            "volume_impulse_was_capped": True,
+            "volume_impulse_ratio_to_required": 31890.0 / 1.2,
+            "volume_impulse_ratio_to_required_capped": 50.0 / 1.2,
+        },
+    )
+    insert_executor(
+        conn,
+        signal_key="normal",
+        symbol="ETHUSDT",
+        action="WATCH",
+        reason="entry_blocked_volume_impulse",
+        volume_impulse=1.0,
+        required_volume_impulse=1.2,
+        diagnostics_json={
+            "volume_impulse_capped": 1.0,
+            "volume_impulse_cap": 50.0,
+            "volume_impulse_was_capped": False,
+            "volume_impulse_ratio_to_required": 1.0 / 1.2,
+            "volume_impulse_ratio_to_required_capped": 1.0 / 1.2,
+        },
+    )
+    conn.commit()
+    conn.close()
+
+    generate_learning_report(db_path, tmp_path / "reports", min_sample=1)
+
+    rows = read_csv(tmp_path / "reports" / "learning_executor_blockers.csv")
+    assert rows[0]["avg_volume_impulse"] == "25.5"
+    assert rows[0]["avg_volume_impulse_ratio_to_required"] == "21.25"
+    assert rows[0]["volume_impulse_capped_count"] == "1"
+    assert rows[0]["volume_impulse_capped_share"] == "0.5"
+    assert rows[0]["avg_volume_impulse_raw"] == "15945.5"
+    assert rows[0]["max_volume_impulse_raw"] == "31890"
+    assert "outliers were capped" in rows[0]["recommendation"]
+
 
 def test_executor_blocker_report_recommends_mapping_fix_when_missing_default_dominates(tmp_path: Path) -> None:
     db_path = tmp_path / "signals.db"
