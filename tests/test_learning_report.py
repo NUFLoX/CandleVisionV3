@@ -11,6 +11,7 @@ from pathlib import Path
 from tools.learning_report import (
     DIAGNOSIS_SUMMARY_HEADERS,
     EXECUTOR_BLOCKERS_HEADERS,
+    EXECUTOR_TRADES_HEADERS,
     RECOMMENDATIONS_HEADERS,
     SYMBOL_EDGE_HEADERS,
     TIMEFRAME_EDGE_HEADERS,
@@ -22,6 +23,7 @@ OUTPUT_FILES = [
     "learning_symbol_edge.csv",
     "learning_timeframe_edge.csv",
     "learning_executor_blockers.csv",
+    "learning_executor_trades.csv",
     "learning_diagnosis_summary.csv",
     "learning_recommendations.csv",
 ]
@@ -164,6 +166,66 @@ def insert_executor(
         ),
     )
 
+
+
+def create_executor_trades_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE executor_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_key TEXT NOT NULL UNIQUE,
+            signal_key TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timeframe TEXT,
+            side TEXT NOT NULL,
+            exit_reason TEXT,
+            r_result REAL,
+            max_gain_r REAL,
+            max_drawdown_r REAL,
+            moved_to_breakeven INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def insert_executor_trade(
+    conn: sqlite3.Connection,
+    *,
+    trade_key: str,
+    signal_key: str,
+    symbol: str,
+    timeframe: str = "5",
+    side: str = "Buy",
+    exit_reason: str = "exit_sell_flow_dominance",
+    r_result: float | None = None,
+    max_gain_r: float | None = None,
+    max_drawdown_r: float | None = None,
+    moved_to_breakeven: int = 0,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO executor_trades (
+            trade_key, signal_key, symbol, timeframe, side, exit_reason, r_result,
+            max_gain_r, max_drawdown_r, moved_to_breakeven, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trade_key,
+            signal_key,
+            symbol,
+            timeframe,
+            side,
+            exit_reason,
+            r_result,
+            max_gain_r,
+            max_drawdown_r,
+            moved_to_breakeven,
+            now_iso(),
+            now_iso(),
+        ),
+    )
 
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:
@@ -422,6 +484,51 @@ def test_executor_blocker_report_recommends_snapshot_review_when_volume_far_belo
     assert "far below required" in rows[0]["recommendation"]
 
 
+def test_executor_trades_report_and_summary_are_generated(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_executor_trades_table(conn)
+    insert_executor_trade(
+        conn,
+        trade_key="t1",
+        signal_key="s1",
+        symbol="BTCUSDT",
+        r_result=1.0,
+        max_gain_r=1.4,
+        max_drawdown_r=-0.2,
+        moved_to_breakeven=1,
+    )
+    insert_executor_trade(
+        conn,
+        trade_key="t2",
+        signal_key="s2",
+        symbol="BTCUSDT",
+        r_result=-0.5,
+        max_gain_r=0.2,
+        max_drawdown_r=-0.7,
+        exit_reason="exit_stop_loss_hit",
+    )
+    conn.commit()
+    conn.close()
+
+    summary = generate_learning_report(db_path, tmp_path / "reports", min_sample=2)
+
+    rows = read_csv(tmp_path / "reports" / "learning_executor_trades.csv")
+    assert rows[0]["symbol"] == "BTCUSDT"
+    assert rows[0]["total_trades"] == "2"
+    assert rows[0]["wins"] == "1"
+    assert rows[0]["losses"] == "1"
+    assert rows[0]["breakeven_moves"] == "1"
+    assert rows[0]["total_r_result"] == "0.5"
+    assert summary["total_executor_trades"] == 2
+    assert summary["executor_trades_total_r"] == 0.5
+    assert summary["executor_trades_avg_r"] == 0.25
+    assert summary["executor_trade_exit_reason_counts"] == {
+        "exit_sell_flow_dominance": 1,
+        "exit_stop_loss_hit": 1,
+    }
+
+
 def test_recommendations_are_generated_for_high_sl_symbol(tmp_path: Path) -> None:
     db_path = tmp_path / "signals.db"
     conn = sqlite3.connect(db_path)
@@ -468,6 +575,10 @@ def test_json_summary_includes_required_keys(tmp_path: Path) -> None:
         "total_diagnoses",
         "total_executor_decisions",
         "total_lifecycle_events",
+        "total_executor_trades",
+        "executor_trades_total_r",
+        "executor_trades_avg_r",
+        "executor_trade_exit_reason_counts",
         "outcome_counts",
         "executor_action_counts",
         "top_tp_symbols",
@@ -488,6 +599,7 @@ def test_csv_files_have_stable_headers(tmp_path: Path) -> None:
         "learning_symbol_edge.csv": SYMBOL_EDGE_HEADERS,
         "learning_timeframe_edge.csv": TIMEFRAME_EDGE_HEADERS,
         "learning_executor_blockers.csv": EXECUTOR_BLOCKERS_HEADERS,
+        "learning_executor_trades.csv": EXECUTOR_TRADES_HEADERS,
         "learning_diagnosis_summary.csv": DIAGNOSIS_SUMMARY_HEADERS,
         "learning_recommendations.csv": RECOMMENDATIONS_HEADERS,
     }

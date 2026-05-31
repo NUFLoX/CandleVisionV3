@@ -13,6 +13,7 @@ SUMMARY_FILE = "learning_summary.json"
 SYMBOL_EDGE_FILE = "learning_symbol_edge.csv"
 TIMEFRAME_EDGE_FILE = "learning_timeframe_edge.csv"
 EXECUTOR_BLOCKERS_FILE = "learning_executor_blockers.csv"
+EXECUTOR_TRADES_FILE = "learning_executor_trades.csv"
 DIAGNOSIS_SUMMARY_FILE = "learning_diagnosis_summary.csv"
 RECOMMENDATIONS_FILE = "learning_recommendations.csv"
 
@@ -66,6 +67,23 @@ EXECUTOR_BLOCKERS_HEADERS = [
     "avg_spread_bps",
     "avg_ask_wall_strength",
     "avg_bid_wall_strength",
+    "recommendation",
+]
+EXECUTOR_TRADES_HEADERS = [
+    "symbol",
+    "timeframe",
+    "side",
+    "total_trades",
+    "wins",
+    "losses",
+    "breakeven_or_flat",
+    "win_rate",
+    "avg_r_result",
+    "total_r_result",
+    "avg_max_gain_r",
+    "avg_max_drawdown_r",
+    "breakeven_moves",
+    "top_exit_reason",
     "recommendation",
 ]
 DIAGNOSIS_SUMMARY_HEADERS = [
@@ -370,6 +388,69 @@ def build_executor_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
     return result
 
 
+
+def executor_trade_recommendation(items: list[dict[str, Any]], min_sample: int) -> str:
+    sample = len(items)
+    avg_r = safe_avg(item.get("r_result") for item in items)
+    breakeven_moves = sum(1 for item in items if int(item.get("moved_to_breakeven") or 0) == 1)
+    near_flat = sum(1 for item in items if abs(safe_float(item.get("r_result")) or 0.0) <= 0.1)
+    exit_reasons = Counter(str(item.get("exit_reason") or "UNKNOWN") for item in items)
+    top_reason, top_count = exit_reasons.most_common(1)[0] if exit_reasons else ("", 0)
+
+    if top_reason == "exit_ask_wall_pressure" and top_count > 0:
+        stopped_count = exit_reasons.get("exit_stop_loss_hit", 0)
+        if stopped_count == 0 or top_count >= stopped_count:
+            return "useful protective exit: ask wall pressure often exits before SL"
+    if sample >= min_sample and top_reason == "exit_stop_loss_hit" and top_count / sample >= 0.5:
+        return "review SL placement: exit_stop_loss_hit dominates"
+    if sample >= min_sample and breakeven_moves / sample >= 0.5 and near_flat / sample >= 0.5:
+        return "review trailing logic: many breakeven moves exit near 0R"
+    if sample >= min_sample and avg_r < 0:
+        return "review exit/entry timing: average R is negative"
+    if sample < min_sample:
+        return "collect more samples"
+    return "keep monitoring"
+
+
+def build_executor_trade_rows(rows: list[dict[str, Any]], min_sample: int) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        key = (
+            str(row.get("symbol") or "UNKNOWN"),
+            str(row.get("timeframe") or "UNKNOWN"),
+            str(row.get("side") or "UNKNOWN"),
+        )
+        grouped[key].append(row)
+
+    result: list[dict[str, Any]] = []
+    for (symbol, timeframe, side), items in sorted(grouped.items()):
+        r_values = [safe_float(item.get("r_result")) for item in items]
+        wins = sum(1 for value in r_values if value is not None and value > 0)
+        losses = sum(1 for value in r_values if value is not None and value < 0)
+        breakeven_or_flat = sum(1 for value in r_values if value is None or value == 0)
+        total_r = sum(value for value in r_values if value is not None)
+        exit_reasons = Counter(str(item.get("exit_reason") or "UNKNOWN") for item in items)
+        top_exit_reason = exit_reasons.most_common(1)[0][0] if exit_reasons else ""
+        output = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "side": side,
+            "total_trades": str(len(items)),
+            "wins": str(wins),
+            "losses": str(losses),
+            "breakeven_or_flat": str(breakeven_or_flat),
+            "win_rate": fmt_float(rate(wins, len(items))),
+            "avg_r_result": fmt_float(safe_avg(item.get("r_result") for item in items)),
+            "total_r_result": fmt_float(total_r),
+            "avg_max_gain_r": fmt_float(safe_avg(item.get("max_gain_r") for item in items)),
+            "avg_max_drawdown_r": fmt_float(safe_avg(item.get("max_drawdown_r") for item in items)),
+            "breakeven_moves": str(sum(1 for item in items if int(item.get("moved_to_breakeven") or 0) == 1)),
+            "top_exit_reason": top_exit_reason,
+            "recommendation": executor_trade_recommendation(items, min_sample),
+        }
+        result.append({header: output.get(header, "") for header in EXECUTOR_TRADES_HEADERS})
+    return result
+
 def build_diagnosis_summary_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -536,9 +617,12 @@ def build_summary(
     executor_outcomes: list[dict[str, Any]],
     lifecycle_events: list[dict[str, Any]],
     executor_rows: list[dict[str, Any]],
+    executor_trades: list[dict[str, Any]],
 ) -> dict[str, Any]:
     outcome_counts = Counter(str(row.get("outcome") or "UNKNOWN").upper() for row in diagnoses)
     executor_action_counts = Counter(str(row.get("action") or "UNKNOWN") for row in executor_outcomes)
+    executor_trade_exit_reason_counts = Counter(str(row.get("exit_reason") or "UNKNOWN") for row in executor_trades)
+    executor_trade_r_values = [value for value in (safe_float(row.get("r_result")) for row in executor_trades) if value is not None]
     symbol_outcomes: dict[str, Counter[str]] = defaultdict(Counter)
     for row in diagnoses:
         symbol_outcomes[str(row.get("symbol") or "UNKNOWN")][classify_outcome(row.get("outcome"))] += 1
@@ -562,6 +646,10 @@ def build_summary(
         "total_diagnoses": len(diagnoses),
         "total_executor_decisions": len(executor_outcomes),
         "total_lifecycle_events": len(lifecycle_events),
+        "total_executor_trades": len(executor_trades),
+        "executor_trades_total_r": sum(executor_trade_r_values),
+        "executor_trades_avg_r": safe_avg(executor_trade_r_values),
+        "executor_trade_exit_reason_counts": dict(sorted(executor_trade_exit_reason_counts.items())),
         "outcome_counts": dict(sorted(outcome_counts.items())),
         "executor_action_counts": dict(sorted(executor_action_counts.items())),
         "top_tp_symbols": top_tp_symbols,
@@ -585,6 +673,7 @@ def generate_learning_report(db_path: str | Path, out_dir: str | Path, since_hou
             diagnoses = select_rows(conn, "trade_diagnoses", since)
             executor_outcomes = select_rows(conn, "executor_outcomes", since)
             lifecycle_events = select_rows(conn, "trade_lifecycle_events", since)
+            executor_trades = select_rows(conn, "executor_trades", since)
         finally:
             conn.close()
     else:
@@ -592,11 +681,13 @@ def generate_learning_report(db_path: str | Path, out_dir: str | Path, since_hou
         diagnoses = []
         executor_outcomes = []
         lifecycle_events = []
+        executor_trades = []
 
     symbol_rows = build_edge_rows(diagnoses, "symbol", SYMBOL_EDGE_HEADERS, min_sample)
     timeframe_rows = build_edge_rows(diagnoses, "timeframe", TIMEFRAME_EDGE_HEADERS, min_sample)
     executor_rows = build_executor_blocker_rows(executor_outcomes)
     diagnosis_rows = build_diagnosis_summary_rows(diagnoses)
+    executor_trade_rows = build_executor_trade_rows(executor_trades, min_sample)
     recommendation_rows = build_recommendation_rows(symbol_rows, timeframe_rows, executor_rows, min_sample)
     summary = build_summary(
         since_hours=since_hours,
@@ -605,12 +696,14 @@ def generate_learning_report(db_path: str | Path, out_dir: str | Path, since_hou
         executor_outcomes=executor_outcomes,
         lifecycle_events=lifecycle_events,
         executor_rows=executor_rows,
+        executor_trades=executor_trades,
     )
 
     (out_path / SUMMARY_FILE).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_csv(out_path / SYMBOL_EDGE_FILE, SYMBOL_EDGE_HEADERS, symbol_rows)
     write_csv(out_path / TIMEFRAME_EDGE_FILE, TIMEFRAME_EDGE_HEADERS, timeframe_rows)
     write_csv(out_path / EXECUTOR_BLOCKERS_FILE, EXECUTOR_BLOCKERS_HEADERS, executor_rows)
+    write_csv(out_path / EXECUTOR_TRADES_FILE, EXECUTOR_TRADES_HEADERS, executor_trade_rows)
     write_csv(out_path / DIAGNOSIS_SUMMARY_FILE, DIAGNOSIS_SUMMARY_HEADERS, diagnosis_rows)
     write_csv(out_path / RECOMMENDATIONS_FILE, RECOMMENDATIONS_HEADERS, recommendation_rows)
     return summary

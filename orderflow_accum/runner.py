@@ -5,6 +5,7 @@ import fnmatch
 import logging
 import os
 import time
+from datetime import UTC, datetime
 
 from dashboard.ingest_client import DashboardIngestClient
 
@@ -23,7 +24,9 @@ from .trade_learning import TradeLearningEngine
 from .trade_executor import (
     ENTERED,
     ENTER_LONG,
+    EXIT,
     ENTER_SHORT,
+    MOVE_SL_TO_BREAKEVEN,
     PROTECT_BREAKEVEN,
     TRAILING_PROFIT,
     WATCH,
@@ -821,6 +824,7 @@ class AccumulationRunner:
         return values
 
     def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None, snapshot=None):
+        previous_row = self.signal_store.get_executor_outcome(signal_key)
         diagnostics = self._paper_executor_diagnostics(signal, snapshot)
         diagnostics_json = diagnostics.get("diagnostics_json")
         if (
@@ -855,6 +859,9 @@ class AccumulationRunner:
             float(row["max_gain_r"] or 0.0),
             float(row["max_drawdown_r"] or 0.0),
         )
+        if str(row["action"]) == EXIT:
+            self._best_effort_store_executor_trade(signal_key, signal, decision, position, row, previous_row, diagnostics_json)
+
         trade_learning = getattr(self, "trade_learning", None)
 
         if trade_learning is not None:
@@ -892,6 +899,137 @@ class AccumulationRunner:
             )
 
         return row
+
+
+    @staticmethod
+    def _parse_executor_time(value) -> datetime | None:
+        if value in (None, ""):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    @classmethod
+    def _duration_minutes(cls, entry_time, exit_time) -> float | None:
+        entry_dt = cls._parse_executor_time(entry_time)
+        exit_dt = cls._parse_executor_time(exit_time)
+        if entry_dt is None or exit_dt is None:
+            return None
+        return max((exit_dt - entry_dt).total_seconds() / 60.0, 0.0)
+
+    @classmethod
+    def _executor_r_result(cls, *, side, entry_price, exit_price, initial_sl, current_sl) -> float | None:
+        entry = cls._optional_float(entry_price)
+        exit_value = cls._optional_float(exit_price)
+        stop = cls._optional_float(initial_sl)
+        if stop is None:
+            stop = cls._optional_float(current_sl)
+        if entry is None or exit_value is None or stop is None:
+            return None
+        risk = abs(entry - stop)
+        if risk <= 0:
+            return None
+        if str(side) == "Sell":
+            return (entry - exit_value) / risk
+        return (exit_value - entry) / risk
+
+    @staticmethod
+    def _stable_executor_trade_key(signal_key: str, entry_time, exit_time, exit_price, exit_reason) -> str:
+        parts = [signal_key, str(entry_time or "no_entry_time"), str(exit_time or "no_exit_time")]
+        if not exit_time:
+            parts.extend([str(exit_price or "no_exit_price"), str(exit_reason or "no_exit_reason")])
+        return "|".join(parts)
+
+    def _best_effort_store_executor_trade(
+        self,
+        signal_key: str,
+        signal,
+        decision,
+        position,
+        row,
+        previous_row,
+        diagnostics_json,
+    ) -> None:
+        try:
+            entry_time = previous_row["created_at"] if previous_row is not None else row["created_at"]
+            exit_time = row["updated_at"]
+            initial_sl = self._optional_float(position.stop_loss) if position is not None else self._optional_float(signal.stop_loss)
+            current_sl = self._optional_float(row["current_sl"])
+            exit_price = self._optional_float(row["exit_price"])
+            entry_price = self._optional_float(row["entry_price"])
+            r_result = self._executor_r_result(
+                side=row["side"],
+                entry_price=entry_price,
+                exit_price=exit_price,
+                initial_sl=initial_sl,
+                current_sl=current_sl,
+            )
+            moved_to_breakeven = bool(
+                (position is not None and str(getattr(position, "state", "")) in {PROTECT_BREAKEVEN, TRAILING_PROFIT})
+                or (previous_row is not None and str(previous_row["state"]) in {PROTECT_BREAKEVEN, TRAILING_PROFIT})
+                or (previous_row is not None and str(previous_row["action"]) == MOVE_SL_TO_BREAKEVEN)
+            )
+            breakeven_time = None
+            if moved_to_breakeven:
+                events = self.signal_store.get_trade_lifecycle_events(signal_key)
+                breakeven_event = next(
+                    (
+                        event
+                        for event in events
+                        if str(event.get("action")) == MOVE_SL_TO_BREAKEVEN
+                        or str(event.get("status")) in {PROTECT_BREAKEVEN, TRAILING_PROFIT}
+                    ),
+                    None,
+                )
+                breakeven_time = breakeven_event.get("created_at") if breakeven_event else None
+                if breakeven_time is None and previous_row is not None and str(previous_row["action"]) == MOVE_SL_TO_BREAKEVEN:
+                    breakeven_time = previous_row["updated_at"]
+
+            entry_action = ENTER_SHORT if str(row["side"]) == "Sell" else ENTER_LONG
+            if previous_row is not None and str(previous_row["action"]) in {ENTER_LONG, ENTER_SHORT}:
+                entry_action = str(previous_row["action"])
+
+            self.signal_store.upsert_executor_trade(
+                {
+                    "trade_key": self._stable_executor_trade_key(signal_key, entry_time, exit_time, exit_price, row["exit_reason"]),
+                    "signal_key": signal_key,
+                    "symbol": str(signal.symbol),
+                    "timeframe": str(signal.meta.get("tf") or "1"),
+                    "side": str(row["side"]),
+                    "state": str(row["state"]),
+                    "entry_action": entry_action,
+                    "exit_action": str(row["action"]),
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "initial_sl": initial_sl,
+                    "final_sl": current_sl,
+                    "current_sl": current_sl,
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "exit_reason": row["exit_reason"] or decision.reason,
+                    "r_result": r_result,
+                    "max_gain_r": self._optional_float(row["max_gain_r"]),
+                    "max_drawdown_r": self._optional_float(row["max_drawdown_r"]),
+                    "bars_in_trade": int(row["bars_in_trade"] or 0),
+                    "duration_minutes": self._duration_minutes(entry_time, exit_time),
+                    "moved_to_breakeven": moved_to_breakeven,
+                    "breakeven_time": breakeven_time,
+                    "diagnostics_json": diagnostics_json or {},
+                    "created_at": entry_time,
+                    "updated_at": exit_time,
+                }
+            )
+        except Exception:
+            self.logger.exception("Failed to write executor_trades row for %s", signal_key)
 
     def _process_paper_executor(self, signal, market: str, confirmed_status: str | None, state=None) -> None:
         if not self.trade_executor_enabled or self.trade_executor is None:
