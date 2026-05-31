@@ -55,6 +55,10 @@ EXECUTOR_BLOCKERS_HEADERS = [
     "volume_impulse_source_distribution",
     "missing_default_volume_impulse_count",
     "missing_default_volume_impulse_share",
+    "volume_impulse_capped_count",
+    "volume_impulse_capped_share",
+    "avg_volume_impulse_raw",
+    "max_volume_impulse_raw",
     "avg_volume_impulse_ratio_to_required",
     "avg_buy_flow",
     "avg_sell_flow",
@@ -125,7 +129,6 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
-
 def parse_diagnostics_json(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -149,6 +152,43 @@ def safe_avg(values: Iterable[Any]) -> float:
         return 0.0
     return sum(numbers) / len(numbers)
 
+
+def diagnostic_float(row: dict[str, Any], key: str) -> float | None:
+    return safe_float(diagnostic_value(row, key))
+
+
+def report_volume_impulse(row: dict[str, Any]) -> float | None:
+    capped = diagnostic_float(row, "volume_impulse_capped")
+    if capped is not None:
+        return capped
+    value = safe_float(row.get("volume_impulse"))
+    if value is not None:
+        return value
+    return diagnostic_float(row, "volume_impulse")
+
+
+def raw_volume_impulse(row: dict[str, Any]) -> float | None:
+    value = safe_float(row.get("volume_impulse"))
+    if value is not None:
+        return value
+    value = diagnostic_float(row, "volume_impulse")
+    if value is not None:
+        return value
+    return diagnostic_float(row, "volume_impulse_raw")
+
+
+def report_volume_impulse_ratio(row: dict[str, Any]) -> float | None:
+    capped = diagnostic_float(row, "volume_impulse_ratio_to_required_capped")
+    if capped is not None:
+        return capped
+    return diagnostic_float(row, "volume_impulse_ratio_to_required")
+
+
+def safe_max(values: Iterable[Any]) -> float:
+    numbers = [item for item in (safe_float(value) for value in values) if item is not None]
+    if not numbers:
+        return 0.0
+    return max(numbers)
 
 def fmt_float(value: float) -> str:
     return f"{value:.6f}".rstrip("0").rstrip(".") if value else "0"
@@ -252,6 +292,9 @@ def executor_blocker_recommendation(reason: str, metrics: dict[str, float]) -> s
         missing_share = metrics.get("missing_default_volume_impulse_share", 0.0)
         if missing_share >= 0.5:
             return "fix snapshot mapping before changing thresholds: missing_default volume_impulse dominates"
+        capped_share = metrics.get("volume_impulse_capped_share", 0.0)
+        if capped_share >= 0.25:
+            return "volume impulse outliers were capped for reporting; review baseline stability"
         avg_ratio = metrics.get("avg_volume_impulse_ratio_to_required", 0.0)
         avg_volume = metrics.get("avg_volume_impulse", 0.0)
         avg_required = metrics.get("avg_required_volume_impulse", 0.0)
@@ -287,12 +330,17 @@ def build_executor_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
     for reason, items in sorted(grouped.items(), key=lambda pair: (-len(pair[1]), pair[0])):
         source_counts = Counter(str(diagnostic_value(item, "volume_impulse_source") or "UNKNOWN") for item in items)
         missing_default_count = source_counts.get("missing_default", 0)
+        capped_count = sum(1 for item in items if diagnostic_value(item, "volume_impulse_was_capped") is True)
         metrics = {
-            "avg_volume_impulse": safe_avg(item.get("volume_impulse") for item in items),
+            "avg_volume_impulse": safe_avg(report_volume_impulse(item) for item in items),
             "avg_required_volume_impulse": safe_avg(item.get("required_volume_impulse") for item in items),
             "missing_default_volume_impulse_count": float(missing_default_count),
             "missing_default_volume_impulse_share": rate(missing_default_count, len(items)),
-            "avg_volume_impulse_ratio_to_required": safe_avg(diagnostic_value(item, "volume_impulse_ratio_to_required") for item in items),
+            "volume_impulse_capped_count": float(capped_count),
+            "volume_impulse_capped_share": rate(capped_count, len(items)),
+            "avg_volume_impulse_raw": safe_avg(raw_volume_impulse(item) for item in items),
+            "max_volume_impulse_raw": safe_max(raw_volume_impulse(item) for item in items),
+            "avg_volume_impulse_ratio_to_required": safe_avg(report_volume_impulse_ratio(item) for item in items),
             "known_volume_impulse_source_share": rate(
                 sum(1 for item in items if diagnostic_value(item, "volume_impulse_source") not in (None, "")),
                 len(items),

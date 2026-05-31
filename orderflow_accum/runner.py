@@ -37,6 +37,8 @@ from .ws_clients import MarketStream
 
 
 class AccumulationRunner:
+    VOLUME_IMPULSE_REPORT_CAP = 50.0
+
     def __init__(self, settings: Settings, ui: ConsoleUI | None = None, version: str = "ACCUM V1.4.2 DIAG"):
         self.settings = settings
         self.ui = ui or ConsoleUI()
@@ -673,6 +675,31 @@ class AccumulationRunner:
             weak or price <= 0,
         )
 
+    def _volume_impulse_report_cap_fields(
+        self,
+        volume_impulse: float | None,
+        required_volume_impulse: float | None,
+    ) -> dict[str, object]:
+        cap = self.VOLUME_IMPULSE_REPORT_CAP
+        if volume_impulse is None:
+            return {
+                "volume_impulse_capped": None,
+                "volume_impulse_cap": cap,
+                "volume_impulse_was_capped": False,
+                "volume_impulse_ratio_to_required_capped": None,
+            }
+
+        capped = min(volume_impulse, cap)
+        ratio_capped = None
+        if required_volume_impulse is not None and required_volume_impulse > 0:
+            ratio_capped = capped / required_volume_impulse
+        return {
+            "volume_impulse_capped": capped,
+            "volume_impulse_cap": cap,
+            "volume_impulse_was_capped": volume_impulse > cap,
+            "volume_impulse_ratio_to_required_capped": ratio_capped,
+        }
+
     @staticmethod
     def _optional_float(value) -> float | None:
         if value is None:
@@ -788,6 +815,7 @@ class AccumulationRunner:
             "volume_baseline": self._optional_float(volume_diagnostics.get("volume_baseline")),
             "volume_current": self._optional_float(volume_diagnostics.get("volume_current")),
             "volume_impulse_ratio_to_required": volume_ratio_to_required,
+            **self._volume_impulse_report_cap_fields(volume_impulse, required_volume),
         }
         values["diagnostics_json"] = diagnostics_json
         return values
