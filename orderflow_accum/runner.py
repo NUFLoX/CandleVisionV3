@@ -447,21 +447,168 @@ class AccumulationRunner:
             reasons=list(signal.reasons or []),
         )
 
+    _VOLUME_IMPULSE_META_FIELDS = (
+        "volume_impulse",
+        "volume_spike",
+        "v_spike",
+        "vspike",
+        "volume_ratio",
+        "volume_expansion",
+    )
+    _VOLUME_BASELINE_META_FIELDS = (
+        "volume_baseline",
+        "avg_volume",
+        "average_volume",
+        "baseline_volume",
+        "avg_tape_notional",
+        "tape_baseline",
+    )
+    _VOLUME_CURRENT_META_FIELDS = ("volume_current", "current_volume", "tape_total", "turnover_build")
+
+    def _record_volume_impulse_diagnostics(self, signal, diagnostics: dict[str, object]) -> None:
+        meta = getattr(signal, "meta", None)
+        if isinstance(meta, dict):
+            meta["_paper_volume_impulse_diagnostics"] = diagnostics
+
+    def _volume_impulse_from_meta(self, meta: dict[str, object], source_prefix: str) -> dict[str, object] | None:
+        for field in self._VOLUME_IMPULSE_META_FIELDS:
+            value = self._optional_float(meta.get(field))
+            if value is not None and value > 0:
+                return {
+                    "volume_impulse": value,
+                    "volume_impulse_source": f"{source_prefix}.{field}",
+                    "volume_impulse_missing": False,
+                    "volume_impulse_raw": meta.get(field),
+                    "volume_baseline": None,
+                    "volume_current": None,
+                }
+        return None
+
+    def _volume_impulse_from_baseline_meta(self, meta: dict[str, object]) -> dict[str, object] | None:
+        current = next(
+            (value for field in self._VOLUME_CURRENT_META_FIELDS if (value := self._optional_float(meta.get(field))) is not None),
+            None,
+        )
+        baseline = next(
+            (value for field in self._VOLUME_BASELINE_META_FIELDS if (value := self._optional_float(meta.get(field))) is not None),
+            None,
+        )
+        if current is not None and current > 0 and baseline is not None and baseline > 0:
+            return {
+                "volume_impulse": current / baseline,
+                "volume_impulse_source": "meta.volume_current_baseline",
+                "volume_impulse_missing": False,
+                "volume_impulse_raw": current / baseline,
+                "volume_baseline": baseline,
+                "volume_current": current,
+            }
+        return None
+
+    def _volume_impulse_from_state(self, state, buy_flow: float, sell_flow: float) -> dict[str, object] | None:
+        current = buy_flow + sell_flow
+        baseline = None
+        if state is not None:
+            for field in self._VOLUME_BASELINE_META_FIELDS:
+                baseline = self._optional_float(getattr(state, field, None))
+                if baseline is not None and baseline > 0:
+                    break
+            else:
+                baseline = None
+
+            trades = sorted(
+                list(getattr(state, "trades", []) or []),
+                key=lambda item: float(getattr(item, "ts", 0.0) or 0.0),
+            )
+            if baseline is None and len(trades) >= 4:
+                first_ts = float(getattr(trades[0], "ts", 0.0) or 0.0)
+                last_ts = float(getattr(trades[-1], "ts", 0.0) or 0.0)
+                if last_ts > first_ts:
+                    midpoint = first_ts + (last_ts - first_ts) / 2.0
+                    older = [trade for trade in trades if float(getattr(trade, "ts", 0.0) or 0.0) < midpoint]
+                    recent = [trade for trade in trades if float(getattr(trade, "ts", 0.0) or 0.0) >= midpoint]
+                    older_notional = sum(float(getattr(trade, "notional", 0.0) or 0.0) for trade in older)
+                    recent_notional = sum(float(getattr(trade, "notional", 0.0) or 0.0) for trade in recent)
+                    if older_notional > 0 and recent_notional > 0:
+                        current = recent_notional
+                        baseline = older_notional
+
+        if current > 0 and baseline is not None and baseline > 0:
+            return {
+                "volume_impulse": current / baseline,
+                "volume_impulse_source": "orderflow_tape_baseline",
+                "volume_impulse_missing": False,
+                "volume_impulse_raw": current / baseline,
+                "volume_baseline": baseline,
+                "volume_current": current,
+            }
+        return None
+
+    def _volume_impulse_from_reasons(self, signal) -> dict[str, object] | None:
+        reasons = [str(reason).lower() for reason in (getattr(signal, "reasons", []) or [])]
+        volume_reason_tokens = ("volume", "turnover", "tape", "flow", "impulse", "breakout")
+        if not any(any(token in reason for token in volume_reason_tokens) for reason in reasons):
+            return None
+        score = max(float(getattr(signal, "score", 0.0) or 0.0), 0.0)
+        impulse = 1.0 + min(score / 40.0, 0.25)
+        return {
+            "volume_impulse": impulse,
+            "volume_impulse_source": "score_reasons_weak_approx",
+            "volume_impulse_missing": False,
+            "volume_impulse_raw": ",".join(str(reason) for reason in (getattr(signal, "reasons", []) or [])),
+            "volume_baseline": None,
+            "volume_current": None,
+        }
+
+    def _derive_volume_impulse(self, signal, state, buy_flow: float, sell_flow: float, override=None) -> dict[str, object]:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        source_items = [(meta, "meta")]
+        if isinstance(override, dict):
+            source_items.append((dict(override), "meta.executor_snapshot"))
+        for source_meta, prefix in source_items:
+            derived = self._volume_impulse_from_meta(source_meta, prefix)
+            if derived is not None:
+                return derived
+
+        derived = self._volume_impulse_from_baseline_meta(meta)
+        if derived is not None:
+            return derived
+
+        derived = self._volume_impulse_from_state(state, buy_flow, sell_flow)
+        if derived is not None:
+            return derived
+
+        derived = self._volume_impulse_from_reasons(signal)
+        if derived is not None:
+            return derived
+
+        return {
+            "volume_impulse": 1.0,
+            "volume_impulse_source": "missing_default",
+            "volume_impulse_missing": True,
+            "volume_impulse_raw": None,
+            "volume_baseline": None,
+            "volume_current": buy_flow + sell_flow if buy_flow + sell_flow > 0 else None,
+        }
+
     def _paper_executor_snapshot(self, signal, state=None) -> tuple[OrderflowSnapshot, bool]:
         meta = dict(getattr(signal, "meta", {}) or {})
         override = meta.get("executor_snapshot")
         if isinstance(override, dict):
             data = dict(override)
             price = self._float_or_default(data.get("price"), self._optional_float(signal.entry) or 0.0)
+            buy_flow = self._float_or_default(data.get("buy_flow"), 1.0)
+            sell_flow = self._float_or_default(data.get("sell_flow"), 1.0)
+            volume_diagnostics = self._derive_volume_impulse(signal, state, buy_flow, sell_flow, override=data)
+            self._record_volume_impulse_diagnostics(signal, volume_diagnostics)
             return (
                 OrderflowSnapshot(
                     price=price,
                     spread_bps=self._float_or_default(data.get("spread_bps"), 0.0),
-                    buy_flow=self._float_or_default(data.get("buy_flow"), 1.0),
-                    sell_flow=self._float_or_default(data.get("sell_flow"), 1.0),
+                    buy_flow=buy_flow,
+                    sell_flow=sell_flow,
                     bid_wall_strength=self._float_or_default(data.get("bid_wall_strength"), 0.0),
                     ask_wall_strength=self._float_or_default(data.get("ask_wall_strength"), 0.0),
-                    volume_impulse=self._float_or_default(data.get("volume_impulse"), 1.0),
+                    volume_impulse=float(volume_diagnostics["volume_impulse"]),
                     support=self._optional_float(data.get("support", meta.get("support"))),
                     resistance=self._optional_float(
                         data.get(
@@ -506,7 +653,8 @@ class AccumulationRunner:
         if resistance is None and str(signal.side).lower() == "sell":
             resistance = float(signal.stop_loss or 0.0) or None
 
-        volume_impulse = float(meta.get("volume_impulse", 1.0) or 1.0)
+        volume_diagnostics = self._derive_volume_impulse(signal, state, buy_flow, sell_flow)
+        self._record_volume_impulse_diagnostics(signal, volume_diagnostics)
         return (
             OrderflowSnapshot(
                 price=price,
@@ -515,7 +663,7 @@ class AccumulationRunner:
                 sell_flow=sell_flow,
                 bid_wall_strength=bid_wall_strength,
                 ask_wall_strength=ask_wall_strength,
-                volume_impulse=volume_impulse,
+                volume_impulse=float(volume_diagnostics["volume_impulse"]),
                 support=support,
                 resistance=resistance,
                 ema20=self._optional_float(meta.get("ema20")),
@@ -616,11 +764,43 @@ class AccumulationRunner:
         values["required_buy_flow"] = required_buy_flow
         values["required_sell_flow"] = required_sell_flow
         values["required_volume_impulse"] = thresholds["min_entry_volume_impulse"]
-        values["diagnostics_json"] = thresholds
+
+        volume_diagnostics = dict(meta.get("_paper_volume_impulse_diagnostics") or {})
+        if volume_diagnostics and not (
+            isinstance(override, dict) and volume_diagnostics.get("volume_impulse_source") == "missing_default"
+        ):
+            values["volume_impulse"] = self._optional_float(volume_diagnostics.get("volume_impulse"))
+        required_volume = thresholds["min_entry_volume_impulse"]
+        volume_impulse = self._optional_float(values.get("volume_impulse"))
+        diagnostic_volume_impulse = self._optional_float(volume_diagnostics.get("volume_impulse"))
+        volume_ratio_to_required = None
+        if required_volume is not None and required_volume > 0:
+            if volume_impulse is not None:
+                volume_ratio_to_required = volume_impulse / required_volume
+            elif diagnostic_volume_impulse is not None:
+                volume_ratio_to_required = diagnostic_volume_impulse / required_volume
+
+        diagnostics_json = {
+            **thresholds,
+            "volume_impulse_source": volume_diagnostics.get("volume_impulse_source"),
+            "volume_impulse_missing": bool(volume_diagnostics.get("volume_impulse_missing", False)),
+            "volume_impulse_raw": volume_diagnostics.get("volume_impulse_raw"),
+            "volume_baseline": self._optional_float(volume_diagnostics.get("volume_baseline")),
+            "volume_current": self._optional_float(volume_diagnostics.get("volume_current")),
+            "volume_impulse_ratio_to_required": volume_ratio_to_required,
+        }
+        values["diagnostics_json"] = diagnostics_json
         return values
 
     def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None, snapshot=None):
         diagnostics = self._paper_executor_diagnostics(signal, snapshot)
+        diagnostics_json = diagnostics.get("diagnostics_json")
+        if (
+            isinstance(diagnostics_json, dict)
+            and str(decision.reason) == "entry_blocked_volume_impulse"
+            and diagnostics_json.get("volume_impulse_source") == "missing_default"
+        ):
+            diagnostics_json["blocker_root_cause"] = "missing_volume_impulse_mapping"
         row = self.signal_store.upsert_executor_decision(
             signal_key=signal_key,
             symbol=str(signal.symbol),
@@ -673,6 +853,13 @@ class AccumulationRunner:
                     "spread_bps": self._optional_float(row["spread_bps"]),
                     "ask_wall_strength": self._optional_float(row["ask_wall_strength"]),
                     "bid_wall_strength": self._optional_float(row["bid_wall_strength"]),
+                    "volume_impulse_source": diagnostics_json.get("volume_impulse_source") if isinstance(diagnostics_json, dict) else None,
+                    "volume_impulse_missing": diagnostics_json.get("volume_impulse_missing") if isinstance(diagnostics_json, dict) else None,
+                    "volume_impulse_raw": diagnostics_json.get("volume_impulse_raw") if isinstance(diagnostics_json, dict) else None,
+                    "volume_baseline": diagnostics_json.get("volume_baseline") if isinstance(diagnostics_json, dict) else None,
+                    "volume_current": diagnostics_json.get("volume_current") if isinstance(diagnostics_json, dict) else None,
+                    "volume_impulse_ratio_to_required": diagnostics_json.get("volume_impulse_ratio_to_required") if isinstance(diagnostics_json, dict) else None,
+                    "blocker_root_cause": diagnostics_json.get("blocker_root_cause") if isinstance(diagnostics_json, dict) else None,
                 },
             )
 

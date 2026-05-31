@@ -108,6 +108,7 @@ def create_executor_table(conn: sqlite3.Connection) -> None:
             spread_bps REAL,
             ask_wall_strength REAL,
             bid_wall_strength REAL,
+            diagnostics_json TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -132,14 +133,15 @@ def insert_executor(
     spread_bps: float | None = None,
     ask_wall_strength: float | None = None,
     bid_wall_strength: float | None = None,
+    diagnostics_json: dict | str | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO executor_outcomes (
             signal_key, symbol, side, state, action, reason, max_gain_r, max_drawdown_r,
             volume_impulse, required_volume_impulse, buy_flow, sell_flow, required_buy_flow,
-            spread_bps, ask_wall_strength, bid_wall_strength, created_at, updated_at
-        ) VALUES (?, ?, 'Buy', 'WATCHING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            spread_bps, ask_wall_strength, bid_wall_strength, diagnostics_json, created_at, updated_at
+        ) VALUES (?, ?, 'Buy', 'WATCHING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             signal_key,
@@ -156,6 +158,7 @@ def insert_executor(
             spread_bps,
             ask_wall_strength,
             bid_wall_strength,
+            json.dumps(diagnostics_json) if isinstance(diagnostics_json, dict) else diagnostics_json,
             now_iso(),
             now_iso(),
         ),
@@ -272,6 +275,55 @@ def test_executor_outcomes_produce_blocker_report(tmp_path: Path) -> None:
     ):
         assert header in rows[0]
 
+
+
+def test_executor_blocker_report_recommends_mapping_fix_when_missing_default_dominates(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_executor_table(conn)
+    for idx in range(4):
+        insert_executor(
+            conn,
+            signal_key=f"missing-{idx}",
+            symbol="BTCUSDT",
+            action="WATCH",
+            reason="entry_blocked_volume_impulse",
+            volume_impulse=1.0,
+            required_volume_impulse=1.2,
+            diagnostics_json={
+                "volume_impulse_source": "missing_default",
+                "volume_impulse_missing": True,
+                "volume_impulse_ratio_to_required": 1.0 / 1.2,
+            },
+        )
+    insert_executor(
+        conn,
+        signal_key="real",
+        symbol="ETHUSDT",
+        action="WATCH",
+        reason="entry_blocked_volume_impulse",
+        volume_impulse=1.18,
+        required_volume_impulse=1.2,
+        diagnostics_json={
+            "volume_impulse_source": "meta.volume_spike",
+            "volume_impulse_missing": False,
+            "volume_impulse_ratio_to_required": 1.18 / 1.2,
+        },
+    )
+    conn.commit()
+    conn.close()
+
+    generate_learning_report(db_path, tmp_path / "reports", min_sample=1)
+
+    blockers = read_csv(tmp_path / "reports" / "learning_executor_blockers.csv")
+    assert blockers[0]["volume_impulse_source_distribution"] == "meta.volume_spike:1;missing_default:4"
+    assert blockers[0]["missing_default_volume_impulse_count"] == "4"
+    assert blockers[0]["missing_default_volume_impulse_share"] == "0.8"
+    assert blockers[0]["avg_volume_impulse_ratio_to_required"] != "0"
+    assert "fix snapshot mapping" in blockers[0]["recommendation"]
+
+    recommendations = read_csv(tmp_path / "reports" / "learning_recommendations.csv")
+    assert any("fix snapshot mapping" in row["reason"] for row in recommendations)
 
 def test_executor_blocker_report_recommends_volume_threshold_sensitivity_when_close(tmp_path: Path) -> None:
     db_path = tmp_path / "signals.db"
