@@ -172,6 +172,7 @@ class SignalStore:
         )
 
         self.ensure_executor_schema()
+        self.ensure_executor_trade_schema()
         self.ensure_trade_learning_schema()
         self.ensure_trade_diagnosis_schema()
 
@@ -389,6 +390,180 @@ class SignalStore:
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM executor_outcomes WHERE signal_key = ?", (signal_key,))
         return cur.fetchone()
+
+
+    def ensure_executor_trade_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS executor_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_key TEXT NOT NULL UNIQUE,
+                signal_key TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT,
+                side TEXT NOT NULL,
+                state TEXT,
+                entry_action TEXT,
+                exit_action TEXT,
+                entry_price REAL,
+                exit_price REAL,
+                initial_sl REAL,
+                final_sl REAL,
+                current_sl REAL,
+                entry_time TEXT,
+                exit_time TEXT,
+                exit_reason TEXT,
+                r_result REAL,
+                max_gain_r REAL,
+                max_drawdown_r REAL,
+                bars_in_trade INTEGER,
+                duration_minutes REAL,
+                moved_to_breakeven INTEGER DEFAULT 0,
+                breakeven_time TEXT,
+                diagnostics_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        for name, columns in (
+            ("idx_executor_trades_signal_key", "signal_key"),
+            ("idx_executor_trades_symbol_timeframe", "symbol, timeframe"),
+            ("idx_executor_trades_exit_reason", "exit_reason"),
+            ("idx_executor_trades_exit_time", "exit_time"),
+            ("idx_executor_trades_r_result", "r_result"),
+        ):
+            cur.execute(f"CREATE INDEX IF NOT EXISTS {name} ON executor_trades({columns})")
+        self.conn.commit()
+
+    def upsert_executor_trade(self, trade: dict[str, Any]) -> None:
+        self.ensure_executor_trade_schema()
+        now = _utc_now()
+        trade_key = str(trade.get("trade_key") or "").strip()
+        signal_key = str(trade.get("signal_key") or "").strip()
+        symbol = str(trade.get("symbol") or "").strip()
+        side = str(trade.get("side") or "").strip()
+        if not trade_key or not signal_key or not symbol or not side:
+            raise ValueError("executor trade requires trade_key, signal_key, symbol, and side")
+
+        existing = self.conn.execute(
+            "SELECT created_at FROM executor_trades WHERE trade_key = ?",
+            (trade_key,),
+        ).fetchone()
+        created_at = str(existing["created_at"]) if existing is not None else str(trade.get("created_at") or now)
+        updated_at = str(trade.get("updated_at") or now)
+        diagnostics_json = trade.get("diagnostics_json")
+        if diagnostics_json is not None and not isinstance(diagnostics_json, str):
+            diagnostics_json = self._json_dumps_safe(diagnostics_json)
+
+        self.conn.execute(
+            """
+            INSERT INTO executor_trades (
+                trade_key,
+                signal_key,
+                symbol,
+                timeframe,
+                side,
+                state,
+                entry_action,
+                exit_action,
+                entry_price,
+                exit_price,
+                initial_sl,
+                final_sl,
+                current_sl,
+                entry_time,
+                exit_time,
+                exit_reason,
+                r_result,
+                max_gain_r,
+                max_drawdown_r,
+                bars_in_trade,
+                duration_minutes,
+                moved_to_breakeven,
+                breakeven_time,
+                diagnostics_json,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_key) DO UPDATE SET
+                signal_key=excluded.signal_key,
+                symbol=excluded.symbol,
+                timeframe=excluded.timeframe,
+                side=excluded.side,
+                state=excluded.state,
+                entry_action=excluded.entry_action,
+                exit_action=excluded.exit_action,
+                entry_price=excluded.entry_price,
+                exit_price=excluded.exit_price,
+                initial_sl=excluded.initial_sl,
+                final_sl=excluded.final_sl,
+                current_sl=excluded.current_sl,
+                entry_time=excluded.entry_time,
+                exit_time=excluded.exit_time,
+                exit_reason=excluded.exit_reason,
+                r_result=excluded.r_result,
+                max_gain_r=excluded.max_gain_r,
+                max_drawdown_r=excluded.max_drawdown_r,
+                bars_in_trade=excluded.bars_in_trade,
+                duration_minutes=excluded.duration_minutes,
+                moved_to_breakeven=excluded.moved_to_breakeven,
+                breakeven_time=excluded.breakeven_time,
+                diagnostics_json=excluded.diagnostics_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                trade_key,
+                signal_key,
+                symbol,
+                self._optional_text(trade.get("timeframe")),
+                side,
+                self._optional_text(trade.get("state")),
+                self._optional_text(trade.get("entry_action")),
+                self._optional_text(trade.get("exit_action")),
+                self._optional_float(trade.get("entry_price")),
+                self._optional_float(trade.get("exit_price")),
+                self._optional_float(trade.get("initial_sl")),
+                self._optional_float(trade.get("final_sl")),
+                self._optional_float(trade.get("current_sl")),
+                self._optional_text(trade.get("entry_time")),
+                self._optional_text(trade.get("exit_time")),
+                self._optional_text(trade.get("exit_reason")),
+                self._optional_float(trade.get("r_result")),
+                self._optional_float(trade.get("max_gain_r")),
+                self._optional_float(trade.get("max_drawdown_r")),
+                int(trade["bars_in_trade"]) if trade.get("bars_in_trade") not in (None, "") else None,
+                self._optional_float(trade.get("duration_minutes")),
+                1 if trade.get("moved_to_breakeven") else 0,
+                self._optional_text(trade.get("breakeven_time")),
+                diagnostics_json,
+                created_at,
+                updated_at,
+            ),
+        )
+        self.conn.commit()
+
+    def get_executor_trade(self, trade_key: str) -> dict[str, Any] | None:
+        self.ensure_executor_trade_schema()
+        row = self.conn.execute("SELECT * FROM executor_trades WHERE trade_key = ?", (trade_key,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_executor_trades(self, limit: int = 100, symbol: str | None = None) -> list[dict[str, Any]]:
+        self.ensure_executor_trade_schema()
+        safe_limit = max(1, int(limit or 100))
+        if symbol:
+            rows = self.conn.execute(
+                "SELECT * FROM executor_trades WHERE symbol = ? ORDER BY exit_time DESC, id DESC LIMIT ?",
+                (symbol, safe_limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM executor_trades ORDER BY exit_time DESC, id DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def ensure_trade_learning_schema(self) -> None:
         cur = self.conn.cursor()

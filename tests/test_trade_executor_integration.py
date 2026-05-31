@@ -145,6 +145,28 @@ def test_sell_flow_dominance_exits_long_paper_position(tmp_path: Path) -> None:
     assert row["action"] == "EXIT"
     assert row["state"] == "EXITED"
     assert row["exit_reason"] == "exit_sell_flow_dominance"
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["signal_key"] == key
+    assert trades[0]["exit_action"] == "EXIT"
+    assert round(float(trades[0]["r_result"]), 6) == 0.1
+    runner.signal_store.close()
+
+
+def test_breakeven_exit_stores_moved_to_breakeven_in_executor_trade(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.6, buy_flow=150.0, sell_flow=90.0, volume_impulse=1.1)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.2, buy_flow=80.0, sell_flow=130.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["moved_to_breakeven"] == 1
     runner.signal_store.close()
 
 
