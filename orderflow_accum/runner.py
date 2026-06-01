@@ -832,9 +832,7 @@ class AccumulationRunner:
         if not isinstance(diagnostics_json, dict):
             diagnostics_json = self._parse_executor_diagnostics(diagnostics_json)
             diagnostics["diagnostics_json"] = diagnostics_json
-        previous_entry_snapshot = self._executor_entry_snapshot_from_row(previous_row)
-        if previous_entry_snapshot:
-            diagnostics_json.update(previous_entry_snapshot)
+        self._preserve_executor_entry_diagnostics(diagnostics_json, previous_row)
         if position is not None and str(decision.action) in {ENTER_LONG, ENTER_SHORT}:
             diagnostics_json.update(
                 {
@@ -846,6 +844,8 @@ class AccumulationRunner:
                     "executor_timeframe": str(signal.meta.get("tf") or "1"),
                 }
             )
+        elif str(decision.action) == MOVE_SL_TO_BREAKEVEN and not diagnostics_json.get("breakeven_time"):
+            diagnostics_json["breakeven_time"] = datetime.now(UTC).isoformat()
         if (
             str(decision.reason) == "entry_blocked_volume_impulse"
             and diagnostics_json.get("volume_impulse_source") == "missing_default"
@@ -964,6 +964,10 @@ class AccumulationRunner:
             diagnostics = cls._parse_executor_diagnostics(row["diagnostics_json"])
         except (KeyError, IndexError):
             return {}
+        return cls._executor_entry_snapshot_from_diagnostics(diagnostics)
+
+    @classmethod
+    def _executor_entry_snapshot_from_diagnostics(cls, diagnostics: dict[str, object]) -> dict[str, object]:
         return {
             key: diagnostics.get(key)
             for key in (
@@ -973,9 +977,41 @@ class AccumulationRunner:
                 "executor_side",
                 "executor_signal_key",
                 "executor_timeframe",
+                "breakeven_time",
             )
             if diagnostics.get(key) not in (None, "")
         }
+
+    @classmethod
+    def _preserve_executor_entry_diagnostics(cls, diagnostics: dict[str, object], previous_row) -> None:
+        """Preserve executor entry snapshot fields across HOLD/BREAKEVEN/EXIT diagnostic rewrites."""
+        for key, value in cls._executor_entry_snapshot_from_row(previous_row).items():
+            if diagnostics.get(key) in (None, ""):
+                diagnostics[key] = value
+
+    def _executor_entry_snapshot_from_lifecycle(self, signal_key: str, exit_time) -> dict[str, object]:
+        events = self.signal_store.get_trade_lifecycle_events(signal_key)
+        exit_dt = self._parse_executor_time(exit_time)
+        enter_events = []
+        for event in events:
+            if str(event.get("event_type")) != "EXECUTOR_ENTER":
+                continue
+            created_at = event.get("created_at")
+            event_dt = self._parse_executor_time(created_at)
+            if exit_dt is not None and event_dt is not None and event_dt > exit_dt:
+                continue
+            enter_events.append(event)
+        if not enter_events:
+            return {}
+        event = enter_events[-1]
+        snapshot = {
+            "executor_entry_time": event.get("created_at"),
+            "executor_entry_price": event.get("price"),
+            "executor_side": event.get("side"),
+            "executor_signal_key": signal_key,
+            "executor_timeframe": event.get("timeframe"),
+        }
+        return {key: value for key, value in snapshot.items() if value not in (None, "")}
 
     @classmethod
     def _executor_initial_sl_invalid(cls, *, side, entry_price, initial_sl) -> bool:
@@ -1022,21 +1058,34 @@ class AccumulationRunner:
     ) -> None:
         try:
             diagnostics_payload = self._parse_executor_diagnostics(diagnostics_json)
-            diagnostics_payload.update(self._executor_entry_snapshot_from_row(row))
-            diagnostics_payload.update(self._executor_entry_snapshot_from_row(previous_row))
+            for snapshot in (
+                self._executor_entry_snapshot_from_row(row),
+                self._executor_entry_snapshot_from_row(previous_row),
+            ):
+                for key, value in snapshot.items():
+                    if diagnostics_payload.get(key) in (None, ""):
+                        diagnostics_payload[key] = value
+            exit_time = row["updated_at"]
+            if not diagnostics_payload.get("executor_entry_time") or not diagnostics_payload.get("executor_entry_price"):
+                lifecycle_snapshot = self._executor_entry_snapshot_from_lifecycle(signal_key, exit_time)
+                for key, value in lifecycle_snapshot.items():
+                    if diagnostics_payload.get(key) in (None, ""):
+                        diagnostics_payload[key] = value
             entry_time = diagnostics_payload.get("executor_entry_time") or (
                 previous_row["created_at"] if previous_row is not None else row["created_at"]
             )
-            exit_time = row["updated_at"]
-            initial_sl = self._optional_float(diagnostics_payload.get("executor_initial_sl"))
-            if initial_sl is None:
-                initial_sl = self._optional_float(position.stop_loss) if position is not None else self._optional_float(signal.stop_loss)
             current_sl = self._optional_float(row["current_sl"])
             exit_price = self._optional_float(row["exit_price"])
             entry_price = self._optional_float(diagnostics_payload.get("executor_entry_price"))
             if entry_price is None:
                 entry_price = self._optional_float(row["entry_price"])
             side = str(diagnostics_payload.get("executor_side") or row["side"])
+            initial_sl = self._optional_float(diagnostics_payload.get("executor_initial_sl"))
+            if initial_sl is None:
+                fallback_sl = self._optional_float(position.stop_loss) if position is not None else current_sl
+                if not self._executor_initial_sl_invalid(side=side, entry_price=entry_price, initial_sl=fallback_sl):
+                    initial_sl = fallback_sl
+                    diagnostics_payload["executor_initial_sl"] = initial_sl
             invalid_initial_sl = self._executor_initial_sl_invalid(side=side, entry_price=entry_price, initial_sl=initial_sl)
             diagnostics_payload["invalid_initial_sl"] = bool(invalid_initial_sl)
             if invalid_initial_sl:
@@ -1071,9 +1120,13 @@ class AccumulationRunner:
                     ),
                     None,
                 )
-                breakeven_time = breakeven_event.get("created_at") if breakeven_event else None
+                breakeven_time = diagnostics_payload.get("breakeven_time")
+                if breakeven_time is None:
+                    breakeven_time = breakeven_event.get("created_at") if breakeven_event else None
                 if breakeven_time is None and previous_row is not None and str(previous_row["action"]) == MOVE_SL_TO_BREAKEVEN:
                     breakeven_time = previous_row["updated_at"]
+                if breakeven_time is not None:
+                    diagnostics_payload["breakeven_time"] = breakeven_time
 
             entry_action = ENTER_SHORT if str(row["side"]) == "Sell" else ENTER_LONG
             if previous_row is not None and str(previous_row["action"]) in {ENTER_LONG, ENTER_SHORT}:
