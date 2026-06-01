@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -102,15 +103,23 @@ def test_confirmed_long_missing_snapshot_creates_trade_watch_row(tmp_path: Path)
 def test_valid_long_snapshot_enters_paper_state(tmp_path: Path) -> None:
     runner = make_runner(tmp_path)
     signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
 
     runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
 
-    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    row = runner.signal_store.get_executor_outcome(key)
     assert row is not None
     assert row["state"] == "ENTERED"
     assert row["action"] == "ENTER_LONG"
     assert row["reason"] == "entry_allowed_long"
     assert row["entry_price"] == 100.0
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["executor_entry_time"]
+    assert diagnostics["executor_entry_price"] == 100.0
+    assert diagnostics["executor_initial_sl"] == 99.0
+    assert diagnostics["executor_side"] == "Buy"
+    assert diagnostics["executor_signal_key"] == key
+    assert diagnostics["executor_timeframe"] == "5"
     runner.signal_store.close()
 
 
@@ -149,6 +158,8 @@ def test_sell_flow_dominance_exits_long_paper_position(tmp_path: Path) -> None:
     assert len(trades) == 1
     assert trades[0]["signal_key"] == key
     assert trades[0]["exit_action"] == "EXIT"
+    assert trades[0]["entry_price"] == 100.0
+    assert trades[0]["initial_sl"] == 99.0
     assert round(float(trades[0]["r_result"]), 6) == 0.1
     runner.signal_store.close()
 
@@ -167,7 +178,73 @@ def test_breakeven_exit_stores_moved_to_breakeven_in_executor_trade(tmp_path: Pa
     trades = runner.signal_store.list_executor_trades()
     assert len(trades) == 1
     assert trades[0]["moved_to_breakeven"] == 1
+    assert trades[0]["breakeven_time"]
     runner.signal_store.close()
+
+
+def test_exit_ledger_uses_executor_entry_time_not_outcome_created_at(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+    entry_row = runner.signal_store.get_executor_outcome(key)
+    assert entry_row is not None
+    executor_entry_time = json.loads(entry_row["diagnostics_json"])["executor_entry_time"]
+    stale_signal_time = "2020-01-01T00:00:00+00:00"
+    runner.signal_store.conn.execute(
+        "UPDATE executor_outcomes SET created_at = ? WHERE signal_key = ?",
+        (stale_signal_time, key),
+    )
+    runner.signal_store.conn.commit()
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.1, buy_flow=80.0, sell_flow=130.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["entry_time"] == executor_entry_time
+    assert trades[0]["entry_time"] != stale_signal_time
+    runner.signal_store.close()
+
+
+def test_invalid_long_executor_initial_sl_does_not_inflate_r_result(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+    row = runner.signal_store.get_executor_outcome(key)
+    assert row is not None
+    diagnostics = json.loads(row["diagnostics_json"])
+    diagnostics["executor_initial_sl"] = 101.0
+    runner.signal_store.conn.execute(
+        "UPDATE executor_outcomes SET diagnostics_json = ? WHERE signal_key = ?",
+        (json.dumps(diagnostics), key),
+    )
+    runner.signal_store.conn.commit()
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.1, buy_flow=80.0, sell_flow=130.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["initial_sl"] == 101.0
+    assert trades[0]["r_result"] is None
+    trade_diagnostics = json.loads(trades[0]["diagnostics_json"])
+    assert trade_diagnostics["invalid_initial_sl"] is True
+    runner.signal_store.close()
+
+
+def test_invalid_short_initial_sl_does_not_calculate_r_result() -> None:
+    assert (
+        AccumulationRunner._executor_r_result(
+            side="Sell",
+            entry_price=100.0,
+            exit_price=99.0,
+            initial_sl=99.5,
+            current_sl=99.5,
+        )
+        is None
+    )
 
 
 def test_confirmed_short_runs_only_in_paper_mode(tmp_path: Path) -> None:

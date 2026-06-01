@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import json
 import logging
 import os
 import time
@@ -719,8 +720,9 @@ class AccumulationRunner:
 
     def _position_from_executor_row(self, signal, row) -> TradePosition:
         side = str(row["side"] or signal.side)
-        entry = float(row["entry_price"] or signal.entry or 0.0)
-        stop = float(signal.stop_loss or row["current_sl"] or 0.0)
+        entry_snapshot = self._executor_entry_snapshot_from_row(row)
+        entry = float(entry_snapshot.get("executor_entry_price") or row["entry_price"] or signal.entry or 0.0)
+        stop = float(entry_snapshot.get("executor_initial_sl") or signal.stop_loss or row["current_sl"] or 0.0)
         initial_risk = abs(entry - stop) or max(abs(entry) * 0.01, 1e-9)
         max_gain_r = float(row["max_gain_r"] or 0.0)
         max_drawdown_r = float(row["max_drawdown_r"] or 0.0)
@@ -827,9 +829,25 @@ class AccumulationRunner:
         previous_row = self.signal_store.get_executor_outcome(signal_key)
         diagnostics = self._paper_executor_diagnostics(signal, snapshot)
         diagnostics_json = diagnostics.get("diagnostics_json")
+        if not isinstance(diagnostics_json, dict):
+            diagnostics_json = self._parse_executor_diagnostics(diagnostics_json)
+            diagnostics["diagnostics_json"] = diagnostics_json
+        previous_entry_snapshot = self._executor_entry_snapshot_from_row(previous_row)
+        if previous_entry_snapshot:
+            diagnostics_json.update(previous_entry_snapshot)
+        if position is not None and str(decision.action) in {ENTER_LONG, ENTER_SHORT}:
+            diagnostics_json.update(
+                {
+                    "executor_entry_time": datetime.now(UTC).isoformat(),
+                    "executor_entry_price": float(position.entry_price),
+                    "executor_initial_sl": float(position.stop_loss),
+                    "executor_side": str(position.side),
+                    "executor_signal_key": signal_key,
+                    "executor_timeframe": str(signal.meta.get("tf") or "1"),
+                }
+            )
         if (
-            isinstance(diagnostics_json, dict)
-            and str(decision.reason) == "entry_blocked_volume_impulse"
+            str(decision.reason) == "entry_blocked_volume_impulse"
             and diagnostics_json.get("volume_impulse_source") == "missing_default"
         ):
             diagnostics_json["blocker_root_cause"] = "missing_volume_impulse_mapping"
@@ -926,14 +944,57 @@ class AccumulationRunner:
             return None
         return max((exit_dt - entry_dt).total_seconds() / 60.0, 0.0)
 
+    @staticmethod
+    def _parse_executor_diagnostics(value) -> dict[str, object]:
+        if isinstance(value, dict):
+            return dict(value)
+        if value in (None, ""):
+            return {}
+        try:
+            parsed = json.loads(str(value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _executor_entry_snapshot_from_row(cls, row) -> dict[str, object]:
+        if row is None:
+            return {}
+        try:
+            diagnostics = cls._parse_executor_diagnostics(row["diagnostics_json"])
+        except (KeyError, IndexError):
+            return {}
+        return {
+            key: diagnostics.get(key)
+            for key in (
+                "executor_entry_time",
+                "executor_entry_price",
+                "executor_initial_sl",
+                "executor_side",
+                "executor_signal_key",
+                "executor_timeframe",
+            )
+            if diagnostics.get(key) not in (None, "")
+        }
+
+    @classmethod
+    def _executor_initial_sl_invalid(cls, *, side, entry_price, initial_sl) -> bool:
+        entry = cls._optional_float(entry_price)
+        stop = cls._optional_float(initial_sl)
+        if entry is None or stop is None:
+            return False
+        if str(side) == "Sell":
+            return stop <= entry
+        return stop >= entry
+
     @classmethod
     def _executor_r_result(cls, *, side, entry_price, exit_price, initial_sl, current_sl) -> float | None:
         entry = cls._optional_float(entry_price)
         exit_value = cls._optional_float(exit_price)
         stop = cls._optional_float(initial_sl)
-        if stop is None:
-            stop = cls._optional_float(current_sl)
         if entry is None or exit_value is None or stop is None:
+            return None
+        if cls._executor_initial_sl_invalid(side=side, entry_price=entry, initial_sl=stop):
             return None
         risk = abs(entry - stop)
         if risk <= 0:
@@ -960,14 +1021,34 @@ class AccumulationRunner:
         diagnostics_json,
     ) -> None:
         try:
-            entry_time = previous_row["created_at"] if previous_row is not None else row["created_at"]
+            diagnostics_payload = self._parse_executor_diagnostics(diagnostics_json)
+            diagnostics_payload.update(self._executor_entry_snapshot_from_row(row))
+            diagnostics_payload.update(self._executor_entry_snapshot_from_row(previous_row))
+            entry_time = diagnostics_payload.get("executor_entry_time") or (
+                previous_row["created_at"] if previous_row is not None else row["created_at"]
+            )
             exit_time = row["updated_at"]
-            initial_sl = self._optional_float(position.stop_loss) if position is not None else self._optional_float(signal.stop_loss)
+            initial_sl = self._optional_float(diagnostics_payload.get("executor_initial_sl"))
+            if initial_sl is None:
+                initial_sl = self._optional_float(position.stop_loss) if position is not None else self._optional_float(signal.stop_loss)
             current_sl = self._optional_float(row["current_sl"])
             exit_price = self._optional_float(row["exit_price"])
-            entry_price = self._optional_float(row["entry_price"])
+            entry_price = self._optional_float(diagnostics_payload.get("executor_entry_price"))
+            if entry_price is None:
+                entry_price = self._optional_float(row["entry_price"])
+            side = str(diagnostics_payload.get("executor_side") or row["side"])
+            invalid_initial_sl = self._executor_initial_sl_invalid(side=side, entry_price=entry_price, initial_sl=initial_sl)
+            diagnostics_payload["invalid_initial_sl"] = bool(invalid_initial_sl)
+            if invalid_initial_sl:
+                self.logger.debug(
+                    "Executor trade %s has invalid_initial_sl side=%s entry_price=%s initial_sl=%s",
+                    signal_key,
+                    side,
+                    entry_price,
+                    initial_sl,
+                )
             r_result = self._executor_r_result(
-                side=row["side"],
+                side=side,
                 entry_price=entry_price,
                 exit_price=exit_price,
                 initial_sl=initial_sl,
@@ -1003,8 +1084,8 @@ class AccumulationRunner:
                     "trade_key": self._stable_executor_trade_key(signal_key, entry_time, exit_time, exit_price, row["exit_reason"]),
                     "signal_key": signal_key,
                     "symbol": str(signal.symbol),
-                    "timeframe": str(signal.meta.get("tf") or "1"),
-                    "side": str(row["side"]),
+                    "timeframe": str(diagnostics_payload.get("executor_timeframe") or signal.meta.get("tf") or "1"),
+                    "side": side,
                     "state": str(row["state"]),
                     "entry_action": entry_action,
                     "exit_action": str(row["action"]),
@@ -1023,7 +1104,7 @@ class AccumulationRunner:
                     "duration_minutes": self._duration_minutes(entry_time, exit_time),
                     "moved_to_breakeven": moved_to_breakeven,
                     "breakeven_time": breakeven_time,
-                    "diagnostics_json": diagnostics_json or {},
+                    "diagnostics_json": diagnostics_payload,
                     "created_at": entry_time,
                     "updated_at": exit_time,
                 }
