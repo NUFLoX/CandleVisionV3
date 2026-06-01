@@ -6,9 +6,44 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-chart_render_stub = ModuleType("orderflow_accum.chart_render")
-chart_render_stub.render_signal_chart = lambda *args, **kwargs: None
-sys.modules.setdefault("orderflow_accum.chart_render", chart_render_stub)
+
+def _stub_module(name: str, **attrs) -> None:
+    module = ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    sys.modules.setdefault(name, module)
+
+
+class _StubService:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class _StubBybitRestClient(_StubService):
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        pass
+
+
+class _StubScanTarget:
+    def __init__(self, symbol: str = "", market: str = "") -> None:
+        self.symbol = symbol
+        self.market = market
+
+
+_stub_module("dashboard.ingest_client", DashboardIngestClient=_StubService)
+_stub_module("orderflow_accum.bybit_rest", BybitRestClient=_StubBybitRestClient, ScanTarget=_StubScanTarget)
+_stub_module("orderflow_accum.console_ui", ConsoleUI=_StubService)
+_stub_module("orderflow_accum.engines", MacroAccumulationEngine=_StubService, RealtimeAccumulationEngine=_StubService)
+_stub_module("orderflow_accum.short_engine", DistributionShortEngine=_StubService)
+_stub_module("orderflow_accum.market_regime", MarketRegimeAnalyzer=_StubService)
+_stub_module("orderflow_accum.signal_logger", RejectionCsvLogger=_StubService, SignalCsvLogger=_StubService)
+_stub_module("orderflow_accum.confirmed_promoter", ConfirmedPromoter=_StubService)
+_stub_module("orderflow_accum.telegram_notify", TelegramNotifier=_StubService)
+_stub_module("orderflow_accum.ws_clients", MarketStream=_StubService)
+_stub_module("orderflow_accum.chart_render", render_signal_chart=lambda *args, **kwargs: None)
 
 from orderflow_accum.models import Signal
 from orderflow_accum.runner import AccumulationRunner
@@ -161,6 +196,8 @@ def test_sell_flow_dominance_exits_long_paper_position(tmp_path: Path) -> None:
     assert trades[0]["entry_price"] == 100.0
     assert trades[0]["initial_sl"] == 99.0
     assert round(float(trades[0]["r_result"]), 6) == 0.1
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["executor_entry_time"] == trades[0]["entry_time"]
     runner.signal_store.close()
 
 
@@ -179,6 +216,86 @@ def test_breakeven_exit_stores_moved_to_breakeven_in_executor_trade(tmp_path: Pa
     assert len(trades) == 1
     assert trades[0]["moved_to_breakeven"] == 1
     assert trades[0]["breakeven_time"]
+    runner.signal_store.close()
+
+
+def test_hold_preserves_executor_entry_snapshot(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+    entry_row = runner.signal_store.get_executor_outcome(key)
+    assert entry_row is not None
+    entry_diagnostics = json.loads(entry_row["diagnostics_json"])
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.2, buy_flow=130.0, sell_flow=100.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    assert row is not None
+    assert row["action"] == "HOLD"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["executor_entry_time"] == entry_diagnostics["executor_entry_time"]
+    assert diagnostics["executor_initial_sl"] == entry_diagnostics["executor_initial_sl"]
+    runner.signal_store.close()
+
+
+def test_breakeven_preserves_entry_snapshot_and_adds_breakeven_time(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+    entry_row = runner.signal_store.get_executor_outcome(key)
+    assert entry_row is not None
+    entry_diagnostics = json.loads(entry_row["diagnostics_json"])
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.6, buy_flow=150.0, sell_flow=90.0, volume_impulse=1.1)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    assert row is not None
+    assert row["action"] == "MOVE_SL_TO_BREAKEVEN"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["executor_entry_time"] == entry_diagnostics["executor_entry_time"]
+    assert diagnostics["executor_initial_sl"] == entry_diagnostics["executor_initial_sl"]
+    assert diagnostics["breakeven_time"]
+    runner.signal_store.close()
+
+
+def test_exit_uses_lifecycle_enter_fallback_when_diagnostics_snapshot_missing(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+    fallback_entry_time = "2026-05-01T00:00:00+00:00"
+    runner.signal_store.add_trade_lifecycle_event(
+        {
+            "signal_key": key,
+            "symbol": signal.symbol,
+            "timeframe": "5",
+            "side": "Buy",
+            "event_type": "EXECUTOR_ENTER",
+            "status": "ENTERED",
+            "action": "ENTER_LONG",
+            "reason": "entry_allowed_long",
+            "price": 100.0,
+            "created_at": fallback_entry_time,
+        }
+    )
+    runner.signal_store.conn.execute(
+        "UPDATE executor_outcomes SET diagnostics_json = ? WHERE signal_key = ?",
+        (json.dumps({}), key),
+    )
+    runner.signal_store.conn.commit()
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.1, buy_flow=80.0, sell_flow=130.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["entry_time"] == fallback_entry_time
+    assert trades[0]["entry_price"] == 100.0
+    assert trades[0]["initial_sl"] == 99.0
     runner.signal_store.close()
 
 
