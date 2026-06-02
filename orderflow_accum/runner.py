@@ -1075,7 +1075,9 @@ class AccumulationRunner:
                 previous_row["created_at"] if previous_row is not None else row["created_at"]
             )
             current_sl = self._optional_float(row["current_sl"])
-            exit_price = self._optional_float(row["exit_price"])
+            observed_exit_price = self._optional_float(row["exit_price"])
+            exit_reason = row["exit_reason"] or decision.reason
+            exit_price = observed_exit_price
             entry_price = self._optional_float(diagnostics_payload.get("executor_entry_price"))
             if entry_price is None:
                 entry_price = self._optional_float(row["entry_price"])
@@ -1086,6 +1088,23 @@ class AccumulationRunner:
                 if not self._executor_initial_sl_invalid(side=side, entry_price=entry_price, initial_sl=fallback_sl):
                     initial_sl = fallback_sl
                     diagnostics_payload["executor_initial_sl"] = initial_sl
+            if str(exit_reason) == "exit_stop_loss_hit":
+                final_sl = self._optional_float(diagnostics_payload.get("final_sl"))
+                if final_sl is None and position is not None:
+                    final_sl = self._optional_float(getattr(position, "current_sl", None))
+                effective_stop_price = next(
+                    (
+                        stop_price
+                        for stop_price in (current_sl, final_sl, initial_sl)
+                        if stop_price is not None
+                    ),
+                    None,
+                )
+                if effective_stop_price is not None:
+                    diagnostics_payload["observed_exit_price"] = observed_exit_price
+                    diagnostics_payload["stop_execution_price"] = effective_stop_price
+                    exit_price = effective_stop_price
+
             invalid_initial_sl = self._executor_initial_sl_invalid(side=side, entry_price=entry_price, initial_sl=initial_sl)
             diagnostics_payload["invalid_initial_sl"] = bool(invalid_initial_sl)
             if invalid_initial_sl:
@@ -1134,7 +1153,7 @@ class AccumulationRunner:
 
             self.signal_store.upsert_executor_trade(
                 {
-                    "trade_key": self._stable_executor_trade_key(signal_key, entry_time, exit_time, exit_price, row["exit_reason"]),
+                    "trade_key": self._stable_executor_trade_key(signal_key, entry_time, exit_time, exit_price, exit_reason),
                     "signal_key": signal_key,
                     "symbol": str(signal.symbol),
                     "timeframe": str(diagnostics_payload.get("executor_timeframe") or signal.meta.get("tf") or "1"),
@@ -1149,7 +1168,7 @@ class AccumulationRunner:
                     "current_sl": current_sl,
                     "entry_time": entry_time,
                     "exit_time": exit_time,
-                    "exit_reason": row["exit_reason"] or decision.reason,
+                    "exit_reason": exit_reason,
                     "r_result": r_result,
                     "max_gain_r": self._optional_float(row["max_gain_r"]),
                     "max_drawdown_r": self._optional_float(row["max_drawdown_r"]),

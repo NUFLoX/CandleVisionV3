@@ -201,6 +201,74 @@ def test_sell_flow_dominance_exits_long_paper_position(tmp_path: Path) -> None:
     runner.signal_store.close()
 
 
+def test_long_stop_loss_exit_uses_current_sl_for_ledger_price_and_r(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=95.0, buy_flow=140.0, sell_flow=90.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    assert row is not None
+    assert row["exit_reason"] == "exit_stop_loss_hit"
+    assert row["exit_price"] == 95.0
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["exit_price"] == 99.0
+    assert trades[0]["current_sl"] == 99.0
+    assert round(float(trades[0]["r_result"]), 6) == -1.0
+    diagnostics = json.loads(trades[0]["diagnostics_json"])
+    assert diagnostics["observed_exit_price"] == 95.0
+    assert diagnostics["stop_execution_price"] == 99.0
+    runner.signal_store.close()
+
+
+def test_long_stop_loss_after_breakeven_uses_current_sl_and_not_minus_one_r(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.6, buy_flow=150.0, sell_flow=90.0, volume_impulse=1.1)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+    breakeven_row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert breakeven_row is not None
+    breakeven_sl = float(breakeven_row["current_sl"])
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=99.0, buy_flow=140.0, sell_flow=90.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "exit_stop_loss_hit"
+    assert trades[0]["exit_price"] == breakeven_sl
+    assert float(trades[0]["r_result"]) > 0.0
+    assert round(float(trades[0]["r_result"]), 6) != -1.0
+    diagnostics = json.loads(trades[0]["diagnostics_json"])
+    assert diagnostics["observed_exit_price"] == 99.0
+    assert diagnostics["stop_execution_price"] == breakeven_sl
+    runner.signal_store.close()
+
+
+def test_non_stop_exit_uses_observed_exit_price_in_ledger(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.1, buy_flow=80.0, sell_flow=130.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "exit_sell_flow_dominance"
+    assert trades[0]["exit_price"] == 100.1
+    diagnostics = json.loads(trades[0]["diagnostics_json"])
+    assert "observed_exit_price" not in diagnostics
+    assert "stop_execution_price" not in diagnostics
+    runner.signal_store.close()
+
+
 def test_breakeven_exit_stores_moved_to_breakeven_in_executor_trade(tmp_path: Path) -> None:
     runner = make_runner(tmp_path)
     signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
