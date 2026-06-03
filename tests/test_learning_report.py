@@ -5,7 +5,7 @@ import json
 import sqlite3
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tools.learning_report import (
@@ -185,6 +185,8 @@ def create_executor_trades_table(conn: sqlite3.Connection) -> None:
             max_gain_r REAL,
             max_drawdown_r REAL,
             moved_to_breakeven INTEGER DEFAULT 0,
+            entry_time TEXT,
+            exit_time TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -205,13 +207,17 @@ def insert_executor_trade(
     max_gain_r: float | None = None,
     max_drawdown_r: float | None = None,
     moved_to_breakeven: int = 0,
+    entry_time: str | None = None,
+    exit_time: str | None = None,
+    created_at: str | None = None,
+    updated_at: str | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO executor_trades (
             trade_key, signal_key, symbol, timeframe, side, exit_reason, r_result,
-            max_gain_r, max_drawdown_r, moved_to_breakeven, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            max_gain_r, max_drawdown_r, moved_to_breakeven, entry_time, exit_time, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trade_key,
@@ -224,8 +230,10 @@ def insert_executor_trade(
             max_gain_r,
             max_drawdown_r,
             moved_to_breakeven,
-            now_iso(),
-            now_iso(),
+            entry_time,
+            exit_time,
+            created_at or now_iso(),
+            updated_at or now_iso(),
         ),
     )
 
@@ -529,6 +537,59 @@ def test_executor_trades_report_and_summary_are_generated(tmp_path: Path) -> Non
         "exit_sell_flow_dominance": 1,
         "exit_stop_loss_hit": 1,
     }
+
+
+def test_executor_trades_since_filter_uses_exit_time_before_created_at(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    create_executor_trades_table(conn)
+    current_time = datetime.now(UTC).replace(microsecond=0)
+    old_time = (current_time - timedelta(hours=30)).isoformat()
+    recent_exit_time = (current_time - timedelta(hours=1)).isoformat()
+    insert_executor_trade(
+        conn,
+        trade_key="xlm-closed",
+        signal_key="xlm-signal",
+        symbol="XLMUSDT",
+        timeframe="15m",
+        side="Buy",
+        exit_reason="exit_sell_flow_dominance",
+        r_result=0.08134592949530138,
+        entry_time=old_time,
+        exit_time=recent_exit_time,
+        created_at=old_time,
+        updated_at=old_time,
+    )
+    insert_executor_trade(
+        conn,
+        trade_key="old-closed",
+        signal_key="old-signal",
+        symbol="BTCUSDT",
+        timeframe="15m",
+        side="Buy",
+        exit_reason="exit_stop_loss_hit",
+        r_result=-1.0,
+        entry_time=old_time,
+        exit_time=old_time,
+        created_at=old_time,
+        updated_at=old_time,
+    )
+    conn.commit()
+    conn.close()
+
+    summary = generate_learning_report(db_path, tmp_path / "reports", since_hours=24)
+
+    rows = read_csv(tmp_path / "reports" / "learning_executor_trades.csv")
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "XLMUSDT"
+    assert rows[0]["timeframe"] == "15m"
+    assert rows[0]["side"] == "Buy"
+    assert rows[0]["total_trades"] == "1"
+    assert rows[0]["total_r_result"] == "0.081346"
+    assert summary["total_executor_trades"] == 1
+    assert summary["executor_trades_total_r"] == 0.08134592949530138
+    assert summary["executor_trades_avg_r"] == 0.08134592949530138
+    assert summary["executor_trade_exit_reason_counts"] == {"exit_sell_flow_dominance": 1}
 
 
 def test_recommendations_are_generated_for_high_sl_symbol(tmp_path: Path) -> None:
