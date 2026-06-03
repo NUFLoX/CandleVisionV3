@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from .schemas import BotLog, Heartbeat, MarketState, Signal, Trade, WatchlistItem
 from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
+from .taxonomy import build_signal_taxonomy
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SIGNALS_DB_PATH = Path("data/signals.db")
@@ -183,7 +184,7 @@ def create_app() -> FastAPI:
     @app.get("/api/setup-performance")
     async def setup_performance():
         if not SIGNALS_DB_PATH.exists():
-            return {"by_reason": [], "by_score_bucket": [], "by_timeframe": [], "by_kind": [], "by_source": []}
+            return {"by_reason": [], "by_score_bucket": [], "by_timeframe": [], "by_kind": [], "by_source": [], "by_family": [], "by_focus_group": []}
 
         conn = sqlite3.connect(str(SIGNALS_DB_PATH))
         conn.row_factory = sqlite3.Row
@@ -218,6 +219,8 @@ def create_app() -> FastAPI:
         tf_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
         kind_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
         source_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
+        family_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
+        focus_stats = defaultdict(lambda: {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0})
 
         for row in rows:
             outcome = wl(str(row["status"] or ""))
@@ -225,6 +228,7 @@ def create_app() -> FastAPI:
             tf = str(row["timeframe"] or "1")
             kind = str(row["kind"] or "UNKNOWN") if "kind" in row.keys() else "UNKNOWN"
             source = str(row["source"] or "UNKNOWN") if "source" in row.keys() else "UNKNOWN"
+            taxonomy = build_signal_taxonomy(kind=kind, source=source, timeframe=tf)
             score_b = bucket(score)
             mfe = float(row["max_gain_pct"] or 0.0)
             mae = float(row["max_drawdown_pct"] or 0.0)
@@ -245,7 +249,15 @@ def create_app() -> FastAPI:
                 elif outcome == "SL":
                     entry["sl"] += 1
 
-            for group in (score_stats[score_b], tf_stats[tf], kind_stats[kind], source_stats[source]):
+            grouped_buckets = (
+                score_stats[score_b],
+                tf_stats[tf],
+                kind_stats[kind],
+                source_stats[source],
+                family_stats[taxonomy.signal_family],
+                focus_stats[taxonomy.signal_focus_group],
+            )
+            for group in grouped_buckets:
                 group["total"] += 1
                 group["mfe"] += mfe
                 group["mae"] += mae
@@ -283,6 +295,8 @@ def create_app() -> FastAPI:
             "by_timeframe": finalize(tf_stats, "timeframe"),
             "by_kind": finalize(kind_stats, "kind"),
             "by_source": finalize(source_stats, "source"),
+            "by_family": finalize(family_stats, "family"),
+            "by_focus_group": finalize(focus_stats, "focus_group"),
         }
 
     @app.get("/api/watchlist")

@@ -83,6 +83,11 @@ class Signal(BaseModel):
     reason: str = ""
     status: str = "ACTIVE"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    signal_kind: str = "SIGNAL"
+    signal_family: str = "unclassified"
+    signal_focus_group: str = "unclassified"
+    signal_source: str = "scanner"
+    signal_timeframe: str = "1h"
 
 
 class WatchlistItem(BaseModel):

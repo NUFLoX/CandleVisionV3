@@ -10,6 +10,8 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from .taxonomy import taxonomy_from_signal
+
 logger = logging.getLogger("CandleVision.DashboardIngest")
 
 
@@ -123,11 +125,13 @@ def signal_to_dashboard_payload(signal: Any, *, exchange: str = "Bybit", timefra
     side = str(getattr(signal, "side", ""))
     reasons = list(getattr(signal, "reasons", []) or [])
     meta = dict(getattr(signal, "meta", {}) or {})
+    signal_timeframe = _normalize_tf(meta.get("tf") or _timeframe_from_signal(source, kind, timeframe))
+    taxonomy = taxonomy_from_signal(signal, timeframe=signal_timeframe)
     return {
         "id": f"{source}-{kind}-{getattr(signal, 'symbol', 'UNKNOWN')}-{uuid4().hex[:10]}",
         "symbol": str(getattr(signal, "symbol", "UNKNOWN")),
         "exchange": exchange,
-        "timeframe": _normalize_tf(meta.get("tf") or _timeframe_from_signal(source, kind, timeframe)),
+        "timeframe": signal_timeframe,
         "score": score,
         "strength": _strength_from_score(score),
         "signal_type": _signal_type_from_signal(source, kind),
@@ -138,6 +142,11 @@ def signal_to_dashboard_payload(signal: Any, *, exchange: str = "Bybit", timefra
         "reason": _reason_text(side, kind, source, reasons, meta),
         "status": "ACTIVE",
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "signal_kind": taxonomy.signal_kind,
+        "signal_family": taxonomy.signal_family,
+        "signal_focus_group": taxonomy.signal_focus_group,
+        "signal_source": taxonomy.signal_source,
+        "signal_timeframe": taxonomy.signal_timeframe,
     }
 
 
