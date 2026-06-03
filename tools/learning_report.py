@@ -245,6 +245,21 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
+def row_event_timestamp(row: dict[str, Any], timestamp_columns: Iterable[str]) -> datetime | None:
+    for column in timestamp_columns:
+        parsed = parse_timestamp(row.get(column))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def timestamp_filter_columns(table: str, columns: set[str]) -> tuple[str, ...]:
+    if table == "executor_trades":
+        return tuple(col for col in ("exit_time", "updated_at", "created_at") if col in columns)
+    default_columns = ("created_at", "updated_at", "first_seen", "last_seen", "outcome_checked_at")
+    return tuple(col for col in default_columns if col in columns)
+
+
 def select_rows(conn: sqlite3.Connection, table: str, since: datetime | None) -> list[dict[str, Any]]:
     columns = table_columns(conn, table)
     if not columns:
@@ -254,13 +269,13 @@ def select_rows(conn: sqlite3.Connection, table: str, since: datetime | None) ->
     if since is None:
         return rows
 
-    timestamp_column = next((col for col in ("created_at", "updated_at", "first_seen", "last_seen", "outcome_checked_at") if col in columns), None)
-    if timestamp_column is None:
+    timestamp_columns = timestamp_filter_columns(table, columns)
+    if not timestamp_columns:
         return rows
 
     filtered: list[dict[str, Any]] = []
     for row in rows:
-        parsed = parse_timestamp(row.get(timestamp_column))
+        parsed = row_event_timestamp(row, timestamp_columns)
         if parsed is None or parsed >= since:
             filtered.append(row)
     return filtered
