@@ -15,10 +15,11 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .schemas import BotLog, Heartbeat, MarketState, Signal, Trade, WatchlistItem
+from .schemas import BotLog, Heartbeat, MarketState, Signal, SignalKindGroupStats, Trade, WatchlistItem
 from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
 from .taxonomy import build_signal_taxonomy
+from orderflow_accum.signal_taxonomy import normalize_signal_kind, signal_family, signal_focus_group
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SIGNALS_DB_PATH = Path("data/signals.db")
@@ -75,6 +76,59 @@ async def _live_refresh_loop(store: DashboardStore, hub: WebSocketHub) -> None:
             await store.add_log(BotLog(message=f"Live refresh failed: {exc}", source="dashboard", severity="error"))
             await hub.broadcast("snapshot", await store.snapshot())
         await asyncio.sleep(60)
+
+
+def _signal_kind_group_empty() -> dict[str, float | int]:
+    return {
+        "total": 0,
+        "tp2": 0,
+        "sl": 0,
+        "expired": 0,
+        "confirmed": 0,
+        "score_last_sum": 0.0,
+        "score_max_sum": 0.0,
+        "max_gain_sum": 0.0,
+        "max_drawdown_sum": 0.0,
+    }
+
+
+def _status_or_outcome(row: sqlite3.Row) -> str:
+    keys = set(row.keys())
+    outcome = str(row["outcome"] or "").strip().upper() if "outcome" in keys else ""
+    status = str(row["status"] or "").strip().upper() if "status" in keys else ""
+    return outcome or status
+
+
+def _is_confirmed_signal(row: sqlite3.Row) -> bool:
+    status = str(row["status"] or "").strip().upper() if "status" in row.keys() else ""
+    return status in {"CONFIRMED", "CONFIRMED_LONG", "CONFIRMED_SHORT"}
+
+
+def _finalize_signal_kind_groups(groups: dict[tuple[str, str, str, str, str], dict[str, float | int]]) -> list[SignalKindGroupStats]:
+    rows: list[SignalKindGroupStats] = []
+    for (kind, family, focus_group, timeframe, source), metrics in groups.items():
+        total = int(metrics["total"])
+        closed_total = int(metrics["tp2"]) + int(metrics["sl"]) + int(metrics["expired"])
+        rows.append(
+            SignalKindGroupStats(
+                kind=kind,
+                signal_family=family,
+                signal_focus_group=focus_group,
+                timeframe=timeframe,
+                source=source,
+                total=total,
+                tp2=int(metrics["tp2"]),
+                sl=int(metrics["sl"]),
+                expired=int(metrics["expired"]),
+                confirmed=int(metrics["confirmed"]),
+                tp2_rate_closed_pct=round((int(metrics["tp2"]) / closed_total) * 100.0, 2) if closed_total else 0.0,
+                avg_score_last=round(float(metrics["score_last_sum"]) / total, 4) if total else 0.0,
+                avg_score_max=round(float(metrics["score_max_sum"]) / total, 4) if total else 0.0,
+                avg_max_gain_pct=round(float(metrics["max_gain_sum"]) / total, 4) if total else 0.0,
+                avg_max_drawdown_pct=round(float(metrics["max_drawdown_sum"]) / total, 4) if total else 0.0,
+            )
+        )
+    return sorted(rows, key=lambda row: (row.signal_focus_group, row.kind, row.timeframe, row.source))
 
 
 def create_app() -> FastAPI:
@@ -180,6 +234,63 @@ def create_app() -> FastAPI:
             return [dict(row) for row in rows]
         finally:
             conn.close()
+
+
+    @app.get("/api/signal-kind-groups")
+    async def signal_kind_groups():
+        if not SIGNALS_DB_PATH.exists():
+            return {"groups": [], "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")}}
+
+        conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+        conn.row_factory = sqlite3.Row
+        try:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
+            optional_columns = [name for name in ("outcome",) if name in columns]
+            select_columns = [
+                "kind",
+                "timeframe",
+                "source",
+                "status",
+                "score_last",
+                "score_max",
+                "max_gain_pct",
+                "max_drawdown_pct",
+                *optional_columns,
+            ]
+            rows = conn.execute(f"SELECT {', '.join(select_columns)} FROM signals").fetchall()
+        finally:
+            conn.close()
+
+        grouped: dict[tuple[str, str, str, str, str], dict[str, float | int]] = defaultdict(_signal_kind_group_empty)
+        for row in rows:
+            kind = normalize_signal_kind(row["kind"]) or "UNKNOWN"
+            family = signal_family(kind)
+            focus_group = signal_focus_group(kind)
+            timeframe = str(row["timeframe"] or "UNKNOWN")
+            source = str(row["source"] or "UNKNOWN")
+            key = (kind, family, focus_group, timeframe, source)
+            metrics = grouped[key]
+            metrics["total"] = int(metrics["total"]) + 1
+            metrics["score_last_sum"] = float(metrics["score_last_sum"]) + float(row["score_last"] or 0.0)
+            metrics["score_max_sum"] = float(metrics["score_max_sum"]) + float(row["score_max"] or 0.0)
+            metrics["max_gain_sum"] = float(metrics["max_gain_sum"]) + float(row["max_gain_pct"] or 0.0)
+            metrics["max_drawdown_sum"] = float(metrics["max_drawdown_sum"]) + float(row["max_drawdown_pct"] or 0.0)
+
+            result = _status_or_outcome(row)
+            if result == "TP2":
+                metrics["tp2"] = int(metrics["tp2"]) + 1
+            elif result == "SL":
+                metrics["sl"] = int(metrics["sl"]) + 1
+            elif result == "EXPIRED":
+                metrics["expired"] = int(metrics["expired"]) + 1
+            if _is_confirmed_signal(row):
+                metrics["confirmed"] = int(metrics["confirmed"]) + 1
+
+        groups = _finalize_signal_kind_groups(grouped)
+        focus_groups = {focus_group: [] for focus_group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")}
+        for row in groups:
+            focus_groups.setdefault(row.signal_focus_group, []).append(row)
+        return {"groups": groups, "focus_groups": focus_groups}
 
     @app.get("/api/setup-performance")
     async def setup_performance():

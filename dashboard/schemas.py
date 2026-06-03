@@ -90,6 +90,24 @@ class Signal(BaseModel):
     signal_timeframe: str = "1h"
 
 
+class SignalKindGroupStats(BaseModel):
+    kind: str = "OTHER"
+    signal_family: str = "OTHER"
+    signal_focus_group: str = "OTHER"
+    timeframe: str = "UNKNOWN"
+    source: str = "UNKNOWN"
+    total: int = 0
+    tp2: int = 0
+    sl: int = 0
+    expired: int = 0
+    confirmed: int = 0
+    tp2_rate_closed_pct: float = 0.0
+    avg_score_last: float = 0.0
+    avg_score_max: float = 0.0
+    avg_max_gain_pct: float = 0.0
+    avg_max_drawdown_pct: float = 0.0
+
+
 class WatchlistItem(BaseModel):
     symbol: str = "UNKNOWN"
     exchange: str = "Bybit"
