@@ -107,6 +107,7 @@ class SignalKindGroupStats(BaseModel):
     avg_max_gain_pct: float = 0.0
     avg_max_drawdown_pct: float = 0.0
     recommended_management: str = ""
+    profit_potential: dict[str, float | None] | None = None
 
 
 class WatchlistItem(BaseModel):
