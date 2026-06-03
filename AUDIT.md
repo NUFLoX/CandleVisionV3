@@ -242,3 +242,18 @@ Still recommended for separate follow-up PRs:
 - `tests/test_execution_safety.py`
 - `tests/test_signal_outcomes.py`
 - `watchlist/watchlist_manager.py`
+
+## 2026-06-03 signal taxonomy metadata audit
+
+Scope: audited signal discovery, signal persistence, dashboard ingest, setup-performance grouping, signal outcome calculation, and `SmartTradeExecutor` entry decision paths for the requested taxonomy-only PR.
+
+Constraint honored: this change does **not** modify signal generation rules, scanner conditions, score formulas, thresholds, filters, confirmed promotion rules, watchlist selection, `SmartTradeExecutor` decisions, TP/SL logic, or orderflow calculations.
+
+Changes in this PR are metadata/dashboard grouping only:
+
+- Added dashboard-only taxonomy labels: `signal_kind`, `signal_family`, `signal_focus_group`, `signal_source`, and `signal_timeframe`.
+- Derived taxonomy labels from already-existing signal `kind`, `source`, and timeframe metadata; no scanner or executor code consumes these labels.
+- Added setup-performance dashboard groupings by taxonomy family and focus group, while keeping existing kind/source/timeframe score and outcome groupings unchanged.
+- Added invariance tests proving taxonomy labels do not change stored signal status, score fields, outcome calculation, or `SmartTradeExecutor` decisions.
+
+Audit result: for the same scanner/database input, signal keys, signal status transitions, scores, outcomes, and executor entry decisions remain based on the pre-existing fields and logic. Taxonomy labels are descriptive dashboard metadata only.
