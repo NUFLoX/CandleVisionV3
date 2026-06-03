@@ -173,6 +173,43 @@ class DashboardSnapshot(BaseModel):
 
 
 
+class ActiveExecutorTrade(BaseModel):
+    signal_key: str = ""
+    symbol: str = "UNKNOWN"
+    timeframe: str | None = None
+    side: str | None = None
+    state: str | None = None
+    action: str | None = None
+    reason: str | None = None
+    entry_price: float | None = None
+    current_sl: float | None = None
+    exit_price: float | None = None
+    max_gain_r: float | None = None
+    max_drawdown_r: float | None = None
+    bars_in_trade: int | None = None
+    updated_at: str | None = None
+    created_at: str | None = None
+    executor_entry_time: str | None = None
+    executor_initial_sl: float | None = None
+    breakeven_time: str | None = None
+    signal_kind: str | None = None
+    signal_family: str | None = None
+    signal_focus_group: str | None = None
+
+
+class ActiveExecutorTradesSummary(BaseModel):
+    total_open_trades: int = 0
+    protect_breakeven_count: int = 0
+    entered_count: int = 0
+    avg_max_gain_r: float | None = None
+    avg_max_drawdown_r: float | None = None
+
+
+class ActiveExecutorTradesResponse(BaseModel):
+    rows: list[ActiveExecutorTrade] = Field(default_factory=list)
+    summary: ActiveExecutorTradesSummary = Field(default_factory=ActiveExecutorTradesSummary)
+
+
 class SignalOutcome(BaseModel):
     signal_id: str = ""
     symbol: str = "UNKNOWN"

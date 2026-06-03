@@ -20,7 +20,18 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .health import HEARTBEAT_MAX_AGE_SECONDS
-from .schemas import BotLog, Heartbeat, MarketState, Signal, SignalKindGroupStats, Trade, WatchlistItem
+from .schemas import (
+    ActiveExecutorTrade,
+    ActiveExecutorTradesResponse,
+    ActiveExecutorTradesSummary,
+    BotLog,
+    Heartbeat,
+    MarketState,
+    Signal,
+    SignalKindGroupStats,
+    Trade,
+    WatchlistItem,
+)
 from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
 from orderflow_accum.signal_taxonomy import HIGH_POTENTIAL_KINDS, normalize_signal_kind, signal_family, signal_focus_group
@@ -298,6 +309,7 @@ def _executor_open_trades(conn: sqlite3.Connection) -> int:
         SELECT COUNT(*) AS total
         FROM executor_outcomes
         WHERE UPPER(COALESCE(state, '')) != 'EXITED'
+          AND UPPER(COALESCE(action, '')) != 'EXIT'
           AND (
               UPPER(COALESCE(state, '')) IN ('ENTERED', 'PROTECT_BREAKEVEN')
               OR UPPER(COALESCE(action, '')) = 'HOLD'
@@ -360,6 +372,144 @@ def _executor_status_fields(heartbeats: dict[str, Heartbeat]) -> dict[str, int |
         return fields
     finally:
         conn.close()
+
+
+def _safe_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        parsed = _safe_float(value)
+        return int(parsed) if parsed is not None else None
+
+
+def _safe_json_object(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    text = str(value).strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _diagnostic_value(diagnostics: dict[str, object], *names: str) -> object | None:
+    for name in names:
+        if name in diagnostics:
+            return diagnostics[name]
+    return None
+
+
+def _executor_select_expr(columns: set[str], name: str, alias: str | None = None) -> str:
+    output_name = alias or name
+    if name in columns:
+        return f"eo.{name} AS {output_name}"
+    return f"NULL AS {output_name}"
+
+
+def _read_executor_active_trades(limit: int = 500) -> ActiveExecutorTradesResponse:
+    if not SIGNALS_DB_PATH.exists():
+        return ActiveExecutorTradesResponse()
+
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        outcome_columns = _table_columns(conn, "executor_outcomes")
+        if not {"state", "action"}.issubset(outcome_columns):
+            return ActiveExecutorTradesResponse()
+
+        signal_columns = _table_columns(conn, "signals")
+        can_join_signals = {"signal_key", "timeframe"}.issubset(signal_columns)
+        join_sql = "LEFT JOIN signals s ON s.signal_key = eo.signal_key" if can_join_signals else ""
+        timeframe_expr = "s.timeframe AS timeframe" if can_join_signals else "NULL AS timeframe"
+        select_columns = [
+            _executor_select_expr(outcome_columns, "signal_key"),
+            _executor_select_expr(outcome_columns, "symbol"),
+            timeframe_expr,
+            _executor_select_expr(outcome_columns, "side"),
+            _executor_select_expr(outcome_columns, "state"),
+            _executor_select_expr(outcome_columns, "action"),
+            _executor_select_expr(outcome_columns, "reason"),
+            _executor_select_expr(outcome_columns, "entry_price"),
+            _executor_select_expr(outcome_columns, "current_sl"),
+            _executor_select_expr(outcome_columns, "exit_price"),
+            _executor_select_expr(outcome_columns, "max_gain_r"),
+            _executor_select_expr(outcome_columns, "max_drawdown_r"),
+            _executor_select_expr(outcome_columns, "bars_in_trade"),
+            _executor_select_expr(outcome_columns, "updated_at"),
+            _executor_select_expr(outcome_columns, "created_at"),
+            _executor_select_expr(outcome_columns, "diagnostics_json"),
+        ]
+        order_expr = "eo.updated_at" if "updated_at" in outcome_columns else "eo.rowid"
+        rows = conn.execute(
+            f"""
+            SELECT {", ".join(select_columns)}
+            FROM executor_outcomes eo
+            {join_sql}
+            WHERE UPPER(COALESCE(eo.state, '')) != 'EXITED'
+              AND UPPER(COALESCE(eo.action, '')) != 'EXIT'
+              AND (
+                  UPPER(COALESCE(eo.state, '')) IN ('ENTERED', 'PROTECT_BREAKEVEN')
+                  OR UPPER(COALESCE(eo.action, '')) = 'HOLD'
+              )
+            ORDER BY {order_expr} DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    trades: list[ActiveExecutorTrade] = []
+    for row in rows:
+        diagnostics = _safe_json_object(row["diagnostics_json"])
+        trade = ActiveExecutorTrade(
+            signal_key=str(row["signal_key"] or ""),
+            symbol=str(row["symbol"] or "UNKNOWN"),
+            timeframe=str(row["timeframe"]) if row["timeframe"] is not None else None,
+            side=str(row["side"]) if row["side"] is not None else None,
+            state=str(row["state"]) if row["state"] is not None else None,
+            action=str(row["action"]) if row["action"] is not None else None,
+            reason=str(row["reason"]) if row["reason"] is not None else None,
+            entry_price=_safe_float(row["entry_price"]),
+            current_sl=_safe_float(row["current_sl"]),
+            exit_price=_safe_float(row["exit_price"]),
+            max_gain_r=_safe_float(row["max_gain_r"]),
+            max_drawdown_r=_safe_float(row["max_drawdown_r"]),
+            bars_in_trade=_safe_int(row["bars_in_trade"]),
+            updated_at=str(row["updated_at"]) if row["updated_at"] is not None else None,
+            created_at=str(row["created_at"]) if row["created_at"] is not None else None,
+            executor_entry_time=(
+                str(value) if (value := _diagnostic_value(diagnostics, "executor_entry_time", "entry_time")) is not None else None
+            ),
+            executor_initial_sl=_safe_float(_diagnostic_value(diagnostics, "executor_initial_sl", "initial_sl")),
+            breakeven_time=(
+                str(value) if (value := _diagnostic_value(diagnostics, "breakeven_time")) is not None else None
+            ),
+            signal_kind=(str(value) if (value := _diagnostic_value(diagnostics, "signal_kind", "kind")) is not None else None),
+            signal_family=(str(value) if (value := _diagnostic_value(diagnostics, "signal_family")) is not None else None),
+            signal_focus_group=(
+                str(value) if (value := _diagnostic_value(diagnostics, "signal_focus_group", "focus_group")) is not None else None
+            ),
+        )
+        trades.append(trade)
+
+    max_gain_values = [trade.max_gain_r for trade in trades if trade.max_gain_r is not None]
+    max_drawdown_values = [trade.max_drawdown_r for trade in trades if trade.max_drawdown_r is not None]
+    summary = ActiveExecutorTradesSummary(
+        total_open_trades=len(trades),
+        protect_breakeven_count=sum(1 for trade in trades if (trade.state or "").upper() == "PROTECT_BREAKEVEN"),
+        entered_count=sum(1 for trade in trades if (trade.state or "").upper() == "ENTERED"),
+        avg_max_gain_r=round(sum(max_gain_values) / len(max_gain_values), 6) if max_gain_values else None,
+        avg_max_drawdown_r=round(sum(max_drawdown_values) / len(max_drawdown_values), 6) if max_drawdown_values else None,
+    )
+    return ActiveExecutorTradesResponse(rows=trades, summary=summary)
 
 
 def _signal_kind_group_empty() -> dict[str, float | int]:
@@ -728,6 +878,11 @@ def create_app() -> FastAPI:
             return [dict(row) for row in rows]
         finally:
             conn.close()
+
+
+    @app.get("/api/executor-active-trades", response_model=ActiveExecutorTradesResponse)
+    async def executor_active_trades(limit: Annotated[int, Query(ge=1, le=2000)] = 500) -> ActiveExecutorTradesResponse:
+        return _read_executor_active_trades(limit=limit)
 
 
     @app.get("/api/signal-profit-potential")
