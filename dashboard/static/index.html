@@ -68,6 +68,7 @@
         const [outcomes, setOutcomes] = useState([]);
         const [statsError, setStatsError] = useState('');
         const [activeSetups, setActiveSetups] = useState([]);
+        const [activeExecutorTrades, setActiveExecutorTrades] = useState({ rows: [], summary: {} });
         const emptySignalKindGroups = { groups: [], focus_groups: { HIGH_POTENTIAL: [], EXECUTION_STABLE: [], EXPERIMENTAL: [], OTHER: [] }, profit_potential: { available: false, by_kind: {}, key_kinds: [] } };
         const [setupPerf, setSetupPerf] = useState({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] });
         const [signalKindGroups, setSignalKindGroups] = useState(emptySignalKindGroups);
@@ -81,6 +82,7 @@
         };
         const refreshLive = async () => setSnapshot(await api('/api/refresh', { method: 'POST' }));
         const loadActiveSetups = async () => setActiveSetups(await api('/api/active-setups?limit=500'));
+        const loadActiveExecutorTrades = async () => setActiveExecutorTrades(await api('/api/executor-active-trades?limit=500'));
         const loadSetupPerformance = async () => setSetupPerf(await api('/api/setup-performance'));
         const loadSignalKindGroups = async () => setSignalKindGroups(await api('/api/signal-kind-groups'));
         const refreshStats = async () => {
@@ -97,6 +99,7 @@
           load();
           loadStats().catch((e) => setStatsError(e.message));
           loadActiveSetups().catch(() => setActiveSetups([]));
+          loadActiveExecutorTrades().catch(() => setActiveExecutorTrades({ rows: [], summary: {} }));
           loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] }));
           loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups));
           const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -105,9 +108,10 @@
           const timer = setInterval(load, 15000);
           const statsTimer = setInterval(() => loadStats().catch((e) => setStatsError(e.message)), 30000);
           const setupsTimer = setInterval(() => loadActiveSetups().catch(() => setActiveSetups([])), 30000);
+          const executorTradesTimer = setInterval(() => loadActiveExecutorTrades().catch(() => setActiveExecutorTrades({ rows: [], summary: {} })), 30000);
           const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] })), 30000);
           const kindGroupsTimer = setInterval(() => loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups)), 30000);
-          return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(perfTimer); clearInterval(kindGroupsTimer); ws.close(); };
+          return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(executorTradesTimer); clearInterval(perfTimer); clearInterval(kindGroupsTimer); ws.close(); };
         }, []);
 
         useEffect(() => {
@@ -212,6 +216,7 @@
 
           <SignalPerformancePanel stats={stats} outcomes={outcomes} error={statsError} onRefresh={refreshStats} />
           <ActiveSetupsPanel setups={activeSetups} onRefresh={loadActiveSetups} />
+          <ActiveExecutorTradesPanel payload={activeExecutorTrades} onRefresh={loadActiveExecutorTrades} />
           <SetupPerformancePanel perf={setupPerf} onRefresh={loadSetupPerformance} />
           <SignalIntelligencePanel data={signalKindGroups} onRefresh={loadSignalKindGroups} />
 
@@ -343,6 +348,62 @@
               </tbody>
             </table>
             {setups.length === 0 && <p className="p-4 text-sm text-slate-500">Нет активных setup'ов в signals.db</p>}
+          </div>
+        </Card>;
+      }
+
+
+      function ActiveExecutorTradesPanel({ payload, onRefresh }) {
+        const rows = payload?.rows || [];
+        const summary = payload?.summary || {};
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const fmtDate = (value) => value ? new Date(value).toLocaleString() : '-';
+        return <Card title="Active Executor Trades" action={<button onClick={onRefresh} className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-400/20">Refresh executor</button>}>
+          <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <Badge tone="blue">Paper executor state — no live orders.</Badge>
+            <span>Total: <b className="text-slate-200">{summary.total_open_trades || 0}</b></span>
+            <span>Entered: <b className="text-slate-200">{summary.entered_count || 0}</b></span>
+            <span>Breakeven: <b className="text-slate-200">{summary.protect_breakeven_count || 0}</b></span>
+            <span>Avg Max R: <b className="text-slate-200">{fmtNum(summary.avg_max_gain_r, 2)}</b></span>
+            <span>Avg DD R: <b className="text-slate-200">{fmtNum(summary.avg_max_drawdown_r, 2)}</b></span>
+          </div>
+          <div className="max-h-[560px] overflow-auto rounded-xl border border-slate-800">
+            <table className="min-w-full text-left text-sm">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500">
+                <tr>
+                  <th className="px-3 py-2">Symbol</th>
+                  <th className="px-3 py-2">TF</th>
+                  <th className="px-3 py-2">State</th>
+                  <th className="px-3 py-2">Side</th>
+                  <th className="px-3 py-2">Entry</th>
+                  <th className="px-3 py-2">SL</th>
+                  <th className="px-3 py-2">Max R</th>
+                  <th className="px-3 py-2">DD R</th>
+                  <th className="px-3 py-2">Kind / Focus</th>
+                  <th className="px-3 py-2">Entry time</th>
+                  <th className="px-3 py-2">Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.slice(0, 120).map((trade) => <tr key={trade.signal_key || `${trade.symbol}-${trade.updated_at}`} className="border-t border-slate-800">
+                  <td className="px-3 py-2 font-semibold">{trade.symbol}</td>
+                  <td className="px-3 py-2">{trade.timeframe || '-'}</td>
+                  <td className="px-3 py-2">{trade.state || trade.action || '-'}</td>
+                  <td className="px-3 py-2">{trade.side || '-'}</td>
+                  <td className="px-3 py-2">{fmtNum(trade.entry_price, 6)}</td>
+                  <td className="px-3 py-2">{fmtNum(trade.current_sl ?? trade.executor_initial_sl, 6)}</td>
+                  <td className="px-3 py-2 text-emerald-300">{fmtNum(trade.max_gain_r, 2)}</td>
+                  <td className="px-3 py-2 text-red-300">{fmtNum(trade.max_drawdown_r, 2)}</td>
+                  <td className="px-3 py-2">
+                    <div>{trade.signal_kind || '-'}</div>
+                    <div className="text-xs text-slate-500">{trade.signal_focus_group || trade.signal_family || '-'}</div>
+                  </td>
+                  <td className="px-3 py-2">{fmtDate(trade.executor_entry_time || trade.created_at)}</td>
+                  <td className="px-3 py-2">{fmtDate(trade.updated_at)}</td>
+                </tr>)}
+              </tbody>
+            </table>
+            {rows.length === 0 && <p className="p-4 text-sm text-slate-500">No active executor trades.</p>}
           </div>
         </Card>;
       }
