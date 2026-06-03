@@ -6,6 +6,8 @@ import json
 import os
 import sqlite3
 from collections import Counter, defaultdict
+from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, AsyncIterator
 
@@ -15,6 +17,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .health import HEARTBEAT_MAX_AGE_SECONDS
 from .schemas import BotLog, Heartbeat, MarketState, Signal, SignalKindGroupStats, Trade, WatchlistItem
 from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
@@ -76,6 +79,130 @@ async def _live_refresh_loop(store: DashboardStore, hub: WebSocketHub) -> None:
             await store.add_log(BotLog(message=f"Live refresh failed: {exc}", source="dashboard", severity="error"))
             await hub.broadcast("snapshot", await store.snapshot())
         await asyncio.sleep(60)
+
+
+def _parse_db_timestamp(value: object) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    candidates = [text]
+    if "+" not in text and "T" in text:
+        candidates.append(f"{text}+00:00")
+    if "+" not in text and " " in text:
+        candidates.append(f"{text.replace(' ', 'T')}+00:00")
+    for candidate in candidates:
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _latest_executor_event_at(conn: sqlite3.Connection) -> datetime | None:
+    columns = _table_columns(conn, "trade_lifecycle_events")
+    if not {"event_type", "created_at"}.issubset(columns):
+        return None
+    row = conn.execute(
+        """
+        SELECT created_at
+        FROM trade_lifecycle_events
+        WHERE event_type LIKE 'EXECUTOR%'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return _parse_db_timestamp(row["created_at"] if row else None)
+
+
+def _latest_executor_outcome_at(conn: sqlite3.Connection) -> datetime | None:
+    columns = _table_columns(conn, "executor_outcomes")
+    if "updated_at" not in columns:
+        return None
+    row = conn.execute("SELECT updated_at FROM executor_outcomes ORDER BY updated_at DESC LIMIT 1").fetchone()
+    return _parse_db_timestamp(row["updated_at"] if row else None)
+
+
+def _executor_open_trades(conn: sqlite3.Connection) -> int:
+    columns = _table_columns(conn, "executor_outcomes")
+    if not {"state", "action"}.issubset(columns):
+        return 0
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM executor_outcomes
+        WHERE UPPER(COALESCE(state, '')) != 'EXITED'
+          AND (
+              UPPER(COALESCE(state, '')) IN ('ENTERED', 'PROTECT_BREAKEVEN')
+              OR UPPER(COALESCE(action, '')) = 'HOLD'
+          )
+        """
+    ).fetchone()
+    return int(row["total"] if row else 0)
+
+
+def _executor_closed_trades_today(conn: sqlite3.Connection) -> int:
+    columns = _table_columns(conn, "executor_trades")
+    if "exit_time" not in columns:
+        return 0
+    today = datetime.now(timezone.utc).date().isoformat()
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM executor_trades
+        WHERE exit_time IS NOT NULL
+          AND date(exit_time) = ?
+        """,
+        (today,),
+    ).fetchone()
+    return int(row["total"] if row else 0)
+
+
+def _executor_status_from_activity(heartbeat: Heartbeat | None, latest_activity_at: datetime | None) -> str:
+    timestamps: list[datetime] = []
+    if heartbeat is not None:
+        timestamps.append(heartbeat.timestamp.astimezone(timezone.utc))
+    if latest_activity_at is not None:
+        timestamps.append(latest_activity_at)
+    if not timestamps:
+        return "no-heartbeat"
+    latest = max(timestamps)
+    age_seconds = (datetime.now(timezone.utc) - latest).total_seconds()
+    return "online" if age_seconds <= HEARTBEAT_MAX_AGE_SECONDS else "stale"
+
+
+def _executor_status_fields(heartbeats: dict[str, Heartbeat]) -> dict[str, int | str]:
+    fields: dict[str, int | str] = {
+        "executor": _executor_status_from_activity(heartbeats.get("executor"), None),
+        "open_trades": 0,
+        "closed_trades_today": 0,
+    }
+    if not SIGNALS_DB_PATH.exists():
+        return fields
+
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        latest_activity_at = max(
+            (timestamp for timestamp in (_latest_executor_event_at(conn), _latest_executor_outcome_at(conn)) if timestamp is not None),
+            default=None,
+        )
+        fields["executor"] = _executor_status_from_activity(heartbeats.get("executor"), latest_activity_at)
+        fields["open_trades"] = _executor_open_trades(conn)
+        fields["closed_trades_today"] = _executor_closed_trades_today(conn)
+        return fields
+    finally:
+        conn.close()
 
 
 def _signal_kind_group_empty() -> dict[str, float | int]:
@@ -354,7 +481,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/status")
     async def status():
-        return (await store.snapshot()).status
+        snapshot = await store.snapshot()
+        current_status = deepcopy(snapshot.status)
+        executor_fields = _executor_status_fields(snapshot.heartbeats)
+        current_status.executor = str(executor_fields["executor"])
+        current_status.open_trades = int(executor_fields["open_trades"])
+        current_status.closed_trades_today = int(executor_fields["closed_trades_today"])
+        return current_status
 
     @app.get("/api/market-state")
     async def market_state():
