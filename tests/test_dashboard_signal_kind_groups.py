@@ -230,10 +230,11 @@ def test_signal_kind_groups_endpoint_empty_when_db_missing(tmp_path: Path, monke
         response = client.get("/api/signal-kind-groups")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "groups": [],
-        "focus_groups": {"HIGH_POTENTIAL": [], "EXECUTION_STABLE": [], "EXPERIMENTAL": [], "OTHER": []},
-    }
+    payload = response.json()
+    assert payload["groups"] == []
+    assert payload["focus_groups"] == {"HIGH_POTENTIAL": [], "EXECUTION_STABLE": [], "EXPERIMENTAL": [], "OTHER": []}
+    assert payload["profit_potential"]["available"] is False
+    assert payload["high_potential_focus"]["profit_potential"]["available"] is False
 
 
 def test_high_potential_focus_endpoint_returns_required_kinds_and_recommendations(tmp_path: Path, monkeypatch) -> None:
