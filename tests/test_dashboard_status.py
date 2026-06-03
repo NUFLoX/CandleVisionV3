@@ -155,3 +155,22 @@ def test_status_closed_trades_today_counts_executor_trades_exit_time(tmp_path: P
 
     assert response.status_code == 200
     assert response.json()["closed_trades_today"] == 1
+
+
+def test_status_executor_online_when_recent_heartbeat_exists_without_executor_event(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "signals.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    client = _client_for_db(db_path, monkeypatch)
+
+    heartbeat = {
+        "component": "executor",
+        "status": "online",
+        "timestamp": _iso(datetime.now(timezone.utc)),
+        "meta": {"runner": "orderflow_accum", "loop": "executor_maintenance"},
+    }
+    ingest_response = client.post("/api/ingest/heartbeat", json=heartbeat)
+    response = client.get("/api/status")
+
+    assert ingest_response.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["executor"] == "online"

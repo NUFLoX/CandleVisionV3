@@ -168,6 +168,7 @@ def _executor_closed_trades_today(conn: sqlite3.Connection) -> int:
     return int(row["total"] if row else 0)
 
 
+# executor online status is based on the freshest heartbeat or executor activity timestamp.
 def _executor_status_from_activity(heartbeat: Heartbeat | None, latest_activity_at: datetime | None) -> str:
     timestamps: list[datetime] = []
     if heartbeat is not None:

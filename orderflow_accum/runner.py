@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from dashboard.ingest_client import DashboardIngestClient
 
@@ -157,6 +158,10 @@ class AccumulationRunner:
                 asyncio.create_task(self._run_macro_scan(rest, macro_symbols), name="accum_macro"),
                 asyncio.create_task(self._run_status(stream, len(realtime_symbols), len(macro_symbols)), name="accum_status"),
             ]
+            if self.trade_executor_enabled:
+                tasks.append(
+                    asyncio.create_task(self._run_executor_maintenance(rest, stream), name="accum_executor_maintenance")
+                )
 
             await asyncio.gather(*tasks)
 
@@ -181,8 +186,39 @@ class AccumulationRunner:
                 orderflow=self._counts["orderflow"],
             )
             self.ui.print_session(realtime_count, macro_count)
+            await self._post_executor_heartbeat(loop="status")
 
             await asyncio.sleep(30)
+
+    async def _post_executor_heartbeat(self, *, loop: str, refreshed: int | None = None) -> None:
+        if not self.trade_executor_enabled:
+            return
+        dashboard = getattr(self, "dashboard", None)
+        post_heartbeat = getattr(dashboard, "post_heartbeat", None)
+        if post_heartbeat is None:
+            return
+        meta = {
+            "runner": "orderflow_accum",
+            "loop": loop,
+            "mode": self.trade_executor_mode,
+        }
+        if refreshed is not None:
+            meta["refreshed_open_positions"] = refreshed
+        try:
+            await post_heartbeat("executor", status="online", meta=meta)
+        except Exception:
+            self.logger.debug("Executor heartbeat post failed", exc_info=True)
+
+    async def _run_executor_maintenance(self, rest: BybitRestClient, stream: MarketStream) -> None:
+        refresh_seconds = max(5, int(os.getenv("EXECUTOR_OPEN_POSITION_REFRESH_SECONDS", "30") or "30"))
+        while True:
+            refreshed = 0
+            try:
+                refreshed = await self.refresh_open_executor_positions(rest=rest, stream=stream)
+            except Exception:
+                self.logger.exception("Open executor position refresh failed")
+            await self._post_executor_heartbeat(loop="executor_maintenance", refreshed=refreshed)
+            await asyncio.sleep(refresh_seconds)
 
     async def _run_realtime_scan(
         self,
@@ -1183,6 +1219,121 @@ class AccumulationRunner:
             )
         except Exception:
             self.logger.exception("Failed to write executor_trades row for %s", signal_key)
+
+    def _executor_signal_from_outcome_row(self, row):
+        signal_key = str(row["signal_key"])
+        parts = signal_key.split("|")
+        market = parts[1] if len(parts) > 1 and parts[1] else "linear"
+        timeframe = parts[2] if len(parts) > 2 and parts[2] else "1"
+        kind = parts[3] if len(parts) > 3 and parts[3] else "CONFIRMED_LONG"
+        side = str(row["side"] or (parts[4] if len(parts) > 4 else "Buy"))
+        diagnostics = self._parse_executor_diagnostics(row["diagnostics_json"] if "diagnostics_json" in row.keys() else None)
+        entry_price = self._optional_float(diagnostics.get("executor_entry_price")) or self._optional_float(row["entry_price"]) or 0.0
+        initial_sl = self._optional_float(diagnostics.get("executor_initial_sl")) or self._optional_float(row["current_sl"]) or 0.0
+        return SimpleNamespace(
+            symbol=str(row["symbol"] or (parts[0] if parts else "")),
+            side=side,
+            kind=kind,
+            source="executor_refresh",
+            score=0.0,
+            entry=entry_price,
+            stop_loss=initial_sl,
+            take_profit_1=None,
+            take_profit_2=None,
+            reasons=["open_position_refresh"],
+            meta={
+                "tf": timeframe,
+                "market": market,
+                "btc_regime": diagnostics.get("btc_regime") or "BTC_NEUTRAL",
+            },
+        )
+
+    def _executor_snapshot_override_from_row(self, row) -> dict[str, object]:
+        diagnostics = self._parse_executor_diagnostics(row["diagnostics_json"] if "diagnostics_json" in row.keys() else None)
+        keys = set(row.keys())
+        snapshot: dict[str, object] = {}
+        for field in (
+            "price",
+            "spread_bps",
+            "buy_flow",
+            "sell_flow",
+            "volume_impulse",
+            "bid_wall_strength",
+            "ask_wall_strength",
+            "support",
+            "resistance",
+            "ema20",
+            "vwap",
+        ):
+            value = self._optional_float(row[field]) if field in keys else None
+            if value is None:
+                value = self._optional_float(diagnostics.get(field))
+            if value is not None:
+                snapshot[field] = value
+        snapshot.setdefault("price", self._optional_float(row["entry_price"]) or 0.0)
+        snapshot.setdefault("spread_bps", 0.0)
+        snapshot.setdefault("buy_flow", 1.0)
+        snapshot.setdefault("sell_flow", 1.0)
+        snapshot.setdefault("volume_impulse", 1.0)
+        snapshot.setdefault("bid_wall_strength", 0.0)
+        snapshot.setdefault("ask_wall_strength", 0.0)
+        snapshot["bars_since_entry"] = int(row["bars_in_trade"] or 0) + 1
+        return snapshot
+
+    async def _executor_candle_snapshot_override(self, rest: BybitRestClient, signal) -> dict[str, object]:
+        market = str(signal.meta.get("market") or "linear")
+        timeframe = str(signal.meta.get("tf") or "1")
+        try:
+            df = await rest.fetch_klines(signal.symbol, interval=timeframe, limit=30, category=market)
+        except Exception:
+            return {}
+        if getattr(df, "empty", True):
+            return {}
+        try:
+            last = df.iloc[-1]
+            close = self._optional_float(last.get("close"))
+            if close is None or close <= 0:
+                return {}
+            snapshot: dict[str, object] = {"price": close, "candle_close": close}
+            if "low" in df:
+                snapshot["support"] = self._optional_float(df["low"].tail(20).min())
+            if "high" in df:
+                snapshot["resistance"] = self._optional_float(df["high"].tail(20).max())
+            if "close" in df:
+                snapshot["ema20"] = self._optional_float(df["close"].tail(20).ewm(span=20, adjust=False).mean().iloc[-1])
+            return snapshot
+        except Exception:
+            return {}
+
+    async def refresh_open_executor_positions(self, *, rest: BybitRestClient | None = None, stream: MarketStream | None = None) -> int:
+        if not self.trade_executor_enabled or self.trade_executor is None:
+            return 0
+
+        open_positions = self.signal_store.list_open_executor_positions()
+        refreshed = 0
+        for row in open_positions:
+            try:
+                signal = self._executor_signal_from_outcome_row(row)
+                signal.meta["executor_snapshot"] = self._executor_snapshot_override_from_row(row)
+
+                if rest is not None:
+                    signal.meta["executor_snapshot"].update(await self._executor_candle_snapshot_override(rest, signal))
+
+                state = stream.get_state(signal.symbol) if stream is not None and hasattr(stream, "get_state") else None
+                snapshot, weak = self._paper_executor_snapshot(signal, state)
+                if weak:
+                    snapshot, weak = self._paper_executor_snapshot(signal, None)
+                if weak:
+                    self.logger.debug("Skipping weak open executor position refresh for %s", row["signal_key"])
+                    continue
+
+                position = self._position_from_executor_row(signal, row)
+                decision = self.trade_executor.update_position(position, snapshot)
+                self._store_paper_executor_decision(str(row["signal_key"]), signal, decision, decision.position, snapshot)
+                refreshed += 1
+            except Exception:
+                self.logger.exception("Failed to refresh open executor position %s", row["signal_key"])
+        return refreshed
 
     def _process_paper_executor(self, signal, market: str, confirmed_status: str | None, state=None) -> None:
         if not self.trade_executor_enabled or self.trade_executor is None:

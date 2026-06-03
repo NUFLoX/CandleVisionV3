@@ -391,6 +391,25 @@ class SignalStore:
         cur.execute("SELECT * FROM executor_outcomes WHERE signal_key = ?", (signal_key,))
         return cur.fetchone()
 
+    def list_open_executor_positions(self, limit: int = 100) -> list[sqlite3.Row]:
+        self.ensure_executor_schema()
+        safe_limit = max(1, int(limit or 100))
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM executor_outcomes
+            WHERE UPPER(COALESCE(state, '')) != 'EXITED'
+              AND (
+                  UPPER(COALESCE(state, '')) IN ('ENTERED', 'PROTECT_BREAKEVEN', 'TRAILING_PROFIT')
+                  OR UPPER(COALESCE(action, '')) = 'HOLD'
+              )
+            ORDER BY updated_at ASC, id ASC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+        return list(rows)
+
 
     def ensure_executor_trade_schema(self) -> None:
         cur = self.conn.cursor()
