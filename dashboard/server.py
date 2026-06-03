@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import csv
 import json
 import os
 import sqlite3
 from collections import Counter, defaultdict
+from statistics import median
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,23 @@ from orderflow_accum.signal_taxonomy import HIGH_POTENTIAL_KINDS, normalize_sign
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SIGNALS_DB_PATH = Path("data/signals.db")
+PROFIT_BACKTEST_DIR = Path("reports_profit_backtest")
+PROFIT_BY_KIND_REPORT = "signal_profit_by_kind.csv"
+PROFIT_SUMMARY_REPORT = "signal_profit_summary.json"
+PROFIT_POTENTIAL_KINDS = ("ACCUMULATION_WATCH", "ABSORPTION_ZONE", "PRE_IMPULSE_ZONE", "BREAKOUT_PRESSURE")
+PROFIT_POTENTIAL_METRICS = (
+    "avg_max_gain_pct",
+    "median_max_gain_pct",
+    "max_gain_pct",
+    "total_potential_profit_usd",
+    "avg_potential_profit_usd",
+    "hit_10_pct_share",
+    "hit_20_pct_share",
+    "hit_50_pct_share",
+    "first_touch_total_profit_usd",
+    "first_touch_avg_profit_usd",
+    "first_touch_win_rate",
+)
 
 
 class WebSocketHub:
@@ -78,6 +97,144 @@ async def _live_refresh_loop(store: DashboardStore, hub: WebSocketHub) -> None:
             await store.add_log(BotLog(message=f"Live refresh failed: {exc}", source="dashboard", severity="error"))
             await hub.broadcast("snapshot", await store.snapshot())
         await asyncio.sleep(60)
+
+
+def _safe_float(value: object) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip().replace("$", "").replace(",", "")
+    if not text:
+        return None
+    if text.endswith("%"):
+        text = text[:-1]
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _first_float(row: dict[str, object], names: tuple[str, ...]) -> float | None:
+    lower = {str(key).strip().lower(): value for key, value in row.items()}
+    for name in names:
+        value = _safe_float(lower.get(name.lower()))
+        if value is not None:
+            return value
+    return None
+
+
+def _empty_profit_potential_payload() -> dict[str, object]:
+    return {
+        "available": False,
+        "source_dir": str(PROFIT_BACKTEST_DIR),
+        "by_kind": {},
+        "key_kinds": [
+            {"kind": kind, "profit_potential": None}
+            for kind in PROFIT_POTENTIAL_KINDS
+        ],
+        "summary": None,
+    }
+
+
+def _normalize_profit_potential_row(row: dict[str, object]) -> tuple[str, dict[str, float | None]] | None:
+    kind = str(row.get("kind") or row.get("signal_kind") or row.get("Signal Kind") or "").strip().upper()
+    if not kind:
+        return None
+    aliases: dict[str, tuple[str, ...]] = {
+        "avg_max_gain_pct": ("avg_max_gain_pct", "average_max_gain_pct", "mean_max_gain_pct", "avg_gain_pct"),
+        "median_max_gain_pct": ("median_max_gain_pct", "med_max_gain_pct", "median_gain_pct"),
+        "max_gain_pct": ("max_gain_pct", "best_max_gain_pct", "peak_max_gain_pct"),
+        "total_potential_profit_usd": ("total_potential_profit_usd", "potential_profit_total_usd", "total_profit_usd"),
+        "avg_potential_profit_usd": ("avg_potential_profit_usd", "potential_profit_avg_usd", "avg_profit_usd"),
+        "hit_10_pct_share": ("hit_10_pct_share", "hit_10_share", "hit_10_pct", "hit_10_rate"),
+        "hit_20_pct_share": ("hit_20_pct_share", "hit_20_share", "hit_20_pct", "hit_20_rate"),
+        "hit_50_pct_share": ("hit_50_pct_share", "hit_50_share", "hit_50_pct", "hit_50_rate"),
+        "first_touch_total_profit_usd": ("first_touch_total_profit_usd", "first_touch_profit_total_usd", "ft_total_profit_usd"),
+        "first_touch_avg_profit_usd": ("first_touch_avg_profit_usd", "first_touch_profit_avg_usd", "ft_avg_profit_usd"),
+        "first_touch_win_rate": ("first_touch_win_rate", "first_touch_win_pct", "ft_win_rate"),
+    }
+    metrics = {metric: _first_float(row, names) for metric, names in aliases.items()}
+    return kind, metrics
+
+
+def _aggregate_profit_backtest_rows(rows: list[dict[str, object]]) -> dict[str, dict[str, float | None]]:
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        kind = str(row.get("kind") or row.get("signal_kind") or "").strip().upper()
+        if kind:
+            grouped[kind].append(row)
+
+    result: dict[str, dict[str, float | None]] = {}
+    for kind, items in grouped.items():
+        gains = [value for value in (_first_float(item, ("max_gain_pct", "max_gain", "gain_pct")) for item in items) if value is not None]
+        profits = [value for value in (_first_float(item, ("potential_profit_usd", "profit_usd", "max_profit_usd")) for item in items) if value is not None]
+        first_touch_profits = [value for value in (_first_float(item, ("first_touch_profit_usd", "first_touch_pnl_usd", "ft_profit_usd")) for item in items) if value is not None]
+        first_touch_wins = [value for value in (_first_float(item, ("first_touch_win", "first_touch_won", "ft_win")) for item in items) if value is not None]
+        metrics = {metric: None for metric in PROFIT_POTENTIAL_METRICS}
+        if gains:
+            metrics.update(
+                {
+                    "avg_max_gain_pct": round(sum(gains) / len(gains), 4),
+                    "median_max_gain_pct": round(float(median(gains)), 4),
+                    "max_gain_pct": round(max(gains), 4),
+                    "hit_10_pct_share": round(sum(1 for value in gains if value >= 10.0) / len(gains), 4),
+                    "hit_20_pct_share": round(sum(1 for value in gains if value >= 20.0) / len(gains), 4),
+                    "hit_50_pct_share": round(sum(1 for value in gains if value >= 50.0) / len(gains), 4),
+                }
+            )
+        if profits:
+            metrics["total_potential_profit_usd"] = round(sum(profits), 4)
+            metrics["avg_potential_profit_usd"] = round(sum(profits) / len(profits), 4)
+        if first_touch_profits:
+            metrics["first_touch_total_profit_usd"] = round(sum(first_touch_profits), 4)
+            metrics["first_touch_avg_profit_usd"] = round(sum(first_touch_profits) / len(first_touch_profits), 4)
+        if first_touch_wins:
+            metrics["first_touch_win_rate"] = round(sum(1 for value in first_touch_wins if value > 0) / len(first_touch_wins), 4)
+        result[kind] = metrics
+    return result
+
+
+def _read_profit_potential_payload() -> dict[str, object]:
+    payload = _empty_profit_potential_payload()
+    report_dir = PROFIT_BACKTEST_DIR
+    by_kind_path = report_dir / PROFIT_BY_KIND_REPORT
+    summary_path = report_dir / PROFIT_SUMMARY_REPORT
+    by_kind: dict[str, dict[str, float | None]] = {}
+
+    if by_kind_path.exists():
+        try:
+            with by_kind_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            for row in rows:
+                normalized = _normalize_profit_potential_row(row)
+                if normalized is None:
+                    continue
+                kind, metrics = normalized
+                by_kind[kind] = metrics
+        except (OSError, csv.Error):
+            by_kind = {}
+
+    if not by_kind:
+        backtest_path = report_dir / "signal_profit_backtest.csv"
+        if backtest_path.exists():
+            try:
+                with backtest_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                    by_kind = _aggregate_profit_backtest_rows(list(csv.DictReader(handle)))
+            except (OSError, csv.Error):
+                by_kind = {}
+
+    if summary_path.exists():
+        try:
+            payload["summary"] = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload["summary"] = None
+
+    payload["available"] = bool(by_kind or payload["summary"])
+    payload["by_kind"] = by_kind
+    payload["key_kinds"] = [
+        {"kind": kind, "profit_potential": by_kind.get(kind)}
+        for kind in PROFIT_POTENTIAL_KINDS
+    ]
+    return payload
 
 
 def _parse_db_timestamp(value: object) -> datetime | None:
@@ -386,7 +543,21 @@ def _aggregate_focus_rows(rows: list[sqlite3.Row], group_fields: tuple[str, ...]
     return sorted(result_rows, key=lambda row: tuple(str(row.get(field, "")) for field in group_fields))
 
 
-def _high_potential_focus_payload(rows: list[sqlite3.Row]) -> dict[str, object]:
+def _profit_potential_by_kind(payload: dict[str, object]) -> dict[str, dict[str, float | None]]:
+    raw = payload.get("by_kind")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(kind): metrics for kind, metrics in raw.items() if isinstance(metrics, dict)}
+
+
+def _attach_profit_potential(rows: list[dict[str, object]], profit_payload: dict[str, object]) -> None:
+    by_kind = _profit_potential_by_kind(profit_payload)
+    for row in rows:
+        row["profit_potential"] = by_kind.get(str(row.get("kind", "")).upper())
+
+
+def _high_potential_focus_payload(rows: list[sqlite3.Row], profit_payload: dict[str, object] | None = None) -> dict[str, object]:
+    profit_payload = profit_payload or _read_profit_potential_payload()
     by_kind = _aggregate_focus_rows(rows, ("kind",), high_potential_only=True)
     present = {str(row.get("kind")) for row in by_kind}
     for kind in sorted(HIGH_POTENTIAL_KINDS - present):
@@ -410,18 +581,24 @@ def _high_potential_focus_payload(rows: list[sqlite3.Row]) -> dict[str, object]:
         )
     priority = ["ACCUMULATION_WATCH", "ABSORPTION_ZONE", "PRE_IMPULSE_ZONE"]
     by_kind = sorted(by_kind, key=lambda row: priority.index(str(row["kind"])) if str(row["kind"]) in priority else 99)
+    _attach_profit_potential(by_kind, profit_payload)
     recommendations = Counter(str(row["recommended_management"]) for row in by_kind if int(row.get("total", 0)) > 0)
+    by_timeframe = _aggregate_focus_rows(rows, ("timeframe",), high_potential_only=True)
+    by_symbol = _aggregate_focus_rows(rows, ("symbol",), high_potential_only=True)
+    by_kind_timeframe = _aggregate_focus_rows(rows, ("kind", "timeframe"), high_potential_only=True)
+    _attach_profit_potential(by_kind_timeframe, profit_payload)
     return {
         "high_potential_summary": _aggregate_focus_rows(rows, ("signal_focus_group",), high_potential_only=True),
         "by_kind": by_kind,
-        "by_timeframe": _aggregate_focus_rows(rows, ("timeframe",), high_potential_only=True),
-        "by_symbol": _aggregate_focus_rows(rows, ("symbol",), high_potential_only=True),
-        "by_kind_timeframe": _aggregate_focus_rows(rows, ("kind", "timeframe"), high_potential_only=True),
+        "by_timeframe": by_timeframe,
+        "by_symbol": by_symbol,
+        "by_kind_timeframe": by_kind_timeframe,
         "management_recommendations": [
             {"recommendation": recommendation, "total_groups": total}
             for recommendation, total in sorted(recommendations.items())
         ],
         "focus_group_comparison": _aggregate_focus_rows(rows, ("signal_focus_group",), high_potential_only=False),
+        "profit_potential": profit_payload,
     }
 
 
@@ -553,12 +730,17 @@ def create_app() -> FastAPI:
             conn.close()
 
 
+    @app.get("/api/signal-profit-potential")
+    async def signal_profit_potential():
+        return _read_profit_potential_payload()
+
     @app.get("/api/signal-kind-groups")
     async def signal_kind_groups():
         if not SIGNALS_DB_PATH.exists():
             return {"groups": [], "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")}}
 
         rows = _read_signal_metric_rows()
+        profit_payload = _read_profit_potential_payload()
         grouped: dict[tuple[str, str, str, str, str], dict[str, float | int]] = defaultdict(_signal_kind_group_empty)
         for row in rows:
             kind = normalize_signal_kind(row["kind"]) or "UNKNOWN"
@@ -585,16 +767,27 @@ def create_app() -> FastAPI:
                 metrics["confirmed"] = int(metrics["confirmed"]) + 1
 
         groups = _finalize_signal_kind_groups(grouped)
+        profit_by_kind = _profit_potential_by_kind(profit_payload)
+        for row in groups:
+            row.profit_potential = profit_by_kind.get(row.kind)
         focus_groups = {focus_group: [] for focus_group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")}
         for row in groups:
             focus_groups.setdefault(row.signal_focus_group, []).append(row)
-        return {"groups": groups, "focus_groups": focus_groups, "high_potential_focus": _high_potential_focus_payload(rows)}
+        return {
+            "groups": groups,
+            "focus_groups": focus_groups,
+            "high_potential_focus": _high_potential_focus_payload(rows, profit_payload),
+            "profit_potential": profit_payload,
+        }
 
     @app.get("/api/high-potential-focus")
     async def high_potential_focus():
+        profit_payload = _read_profit_potential_payload()
         if not SIGNALS_DB_PATH.exists():
-            return _empty_high_potential_focus()
-        return _high_potential_focus_payload(_read_signal_metric_rows())
+            payload = _empty_high_potential_focus()
+            payload["profit_potential"] = profit_payload
+            return payload
+        return _high_potential_focus_payload(_read_signal_metric_rows(), profit_payload)
 
     @app.get("/api/setup-performance")
     async def setup_performance():
