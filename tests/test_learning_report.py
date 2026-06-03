@@ -12,6 +12,7 @@ from tools.learning_report import (
     DIAGNOSIS_SUMMARY_HEADERS,
     EXECUTOR_BLOCKERS_HEADERS,
     EXECUTOR_TRADES_HEADERS,
+    HIGH_POTENTIAL_FOCUS_HEADERS,
     RECOMMENDATIONS_HEADERS,
     SYMBOL_EDGE_HEADERS,
     TIMEFRAME_EDGE_HEADERS,
@@ -26,6 +27,7 @@ OUTPUT_FILES = [
     "learning_executor_trades.csv",
     "learning_diagnosis_summary.csv",
     "learning_recommendations.csv",
+    "learning_high_potential_focus.csv",
 ]
 
 
@@ -585,6 +587,13 @@ def test_json_summary_includes_required_keys(tmp_path: Path) -> None:
         "top_sl_symbols",
         "top_executor_blockers",
         "high_level_notes",
+        "high_potential_total",
+        "high_potential_tp2",
+        "high_potential_sl",
+        "high_potential_expired",
+        "high_potential_tp2_rate_closed_pct",
+        "top_high_potential_kinds",
+        "high_potential_recommendations_count",
     }
     assert summary["since_hours"] == 12
 
@@ -602,6 +611,7 @@ def test_csv_files_have_stable_headers(tmp_path: Path) -> None:
         "learning_executor_trades.csv": EXECUTOR_TRADES_HEADERS,
         "learning_diagnosis_summary.csv": DIAGNOSIS_SUMMARY_HEADERS,
         "learning_recommendations.csv": RECOMMENDATIONS_HEADERS,
+        "learning_high_potential_focus.csv": HIGH_POTENTIAL_FOCUS_HEADERS,
     }
     for filename, headers in expected.items():
         with (tmp_path / "reports" / filename).open(newline="", encoding="utf-8") as handle:
@@ -631,3 +641,52 @@ def test_cli_main_can_run_against_temp_db(tmp_path: Path) -> None:
     )
 
     assert (out_dir / "learning_summary.json").exists()
+
+
+def test_high_potential_focus_report_and_summary_are_generated(tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_key TEXT,
+            symbol TEXT,
+            timeframe TEXT,
+            kind TEXT,
+            status TEXT,
+            outcome TEXT,
+            score_max REAL,
+            max_gain_pct REAL,
+            max_drawdown_pct REAL,
+            first_seen TEXT,
+            last_seen TEXT
+        )
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO signals (signal_key, symbol, timeframe, kind, status, outcome, score_max, max_gain_pct, max_drawdown_pct, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("btc-1", "BTCUSDT", "15", "ACCUMULATION_WATCH", "WATCHING", "TP2", 11.0, 6.0, -1.0, now_iso(), now_iso()),
+            ("eth-1", "ETHUSDT", "15", "ABSORPTION_ZONE", "WATCHING", "SL", 8.0, 4.0, -2.0, now_iso(), now_iso()),
+            ("sol-1", "SOLUSDT", "5", "PRE_IMPULSE_ZONE", "EXPIRED", None, 7.0, 3.0, -1.5, now_iso(), now_iso()),
+            ("xrp-1", "XRPUSDT", "5", "BREAKOUT_PRESSURE", "WATCHING", "TP2", 12.0, 5.0, -0.5, now_iso(), now_iso()),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    summary = generate_learning_report(db_path, tmp_path / "reports", min_sample=1)
+
+    rows = read_csv(tmp_path / "reports" / "learning_high_potential_focus.csv")
+    assert {row["kind"] for row in rows} == {"ACCUMULATION_WATCH", "ABSORPTION_ZONE", "PRE_IMPULSE_ZONE"}
+    assert summary["high_potential_total"] == 3
+    assert summary["high_potential_tp2"] == 1
+    assert summary["high_potential_sl"] == 1
+    assert summary["high_potential_expired"] == 1
+    assert summary["high_potential_tp2_rate_closed_pct"] == 33.33
+    assert "ACCUMULATION_WATCH" in summary["top_high_potential_kinds"]
+    assert summary["high_potential_recommendations_count"]

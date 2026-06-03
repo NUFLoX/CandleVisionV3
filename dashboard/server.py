@@ -5,7 +5,7 @@ import contextlib
 import json
 import os
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Annotated, AsyncIterator
 
@@ -19,7 +19,7 @@ from .schemas import BotLog, Heartbeat, MarketState, Signal, SignalKindGroupStat
 from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
 from .taxonomy import build_signal_taxonomy
-from orderflow_accum.signal_taxonomy import normalize_signal_kind, signal_family, signal_focus_group
+from orderflow_accum.signal_taxonomy import HIGH_POTENTIAL_KINDS, normalize_signal_kind, signal_family, signal_focus_group
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SIGNALS_DB_PATH = Path("data/signals.db")
@@ -104,6 +104,33 @@ def _is_confirmed_signal(row: sqlite3.Row) -> bool:
     return status in {"CONFIRMED", "CONFIRMED_LONG", "CONFIRMED_SHORT"}
 
 
+def _management_recommendation(
+    *,
+    focus_group: str,
+    total: int,
+    tp2: int,
+    sl: int,
+    expired: int,
+    tp2_rate_closed_pct: float,
+    avg_max_gain_pct: float,
+) -> str:
+    if focus_group == "EXECUTION_STABLE":
+        return "normal_tp_sl"
+    if focus_group == "EXPERIMENTAL":
+        return "paper_only_low_priority"
+    if focus_group != "HIGH_POTENTIAL":
+        return "monitor"
+
+    expired_share = (expired / total) if total else 0.0
+    if expired_share >= 0.4:
+        return "extend_watch_window_or_wait_for_confirmation"
+    if avg_max_gain_pct >= 3.0 and tp2_rate_closed_pct < 50.0:
+        return "breakeven_first_trailing_candidate"
+    if tp2_rate_closed_pct >= 50.0 and tp2 >= max(sl, 1):
+        return "priority_high_potential"
+    return "monitor_high_potential"
+
+
 def _finalize_signal_kind_groups(groups: dict[tuple[str, str, str, str, str], dict[str, float | int]]) -> list[SignalKindGroupStats]:
     rows: list[SignalKindGroupStats] = []
     for (kind, family, focus_group, timeframe, source), metrics in groups.items():
@@ -128,7 +155,164 @@ def _finalize_signal_kind_groups(groups: dict[tuple[str, str, str, str, str], di
                 avg_max_drawdown_pct=round(float(metrics["max_drawdown_sum"]) / total, 4) if total else 0.0,
             )
         )
+        rows[-1].recommended_management = _management_recommendation(
+            focus_group=focus_group,
+            total=total,
+            tp2=int(metrics["tp2"]),
+            sl=int(metrics["sl"]),
+            expired=int(metrics["expired"]),
+            tp2_rate_closed_pct=rows[-1].tp2_rate_closed_pct,
+            avg_max_gain_pct=rows[-1].avg_max_gain_pct,
+        )
     return sorted(rows, key=lambda row: (row.signal_focus_group, row.kind, row.timeframe, row.source))
+
+
+def _empty_high_potential_focus() -> dict[str, object]:
+    return {
+        "high_potential_summary": [],
+        "by_kind": [],
+        "by_timeframe": [],
+        "by_symbol": [],
+        "by_kind_timeframe": [],
+        "management_recommendations": [],
+        "focus_group_comparison": [],
+    }
+
+
+def _aggregate_focus_rows(rows: list[sqlite3.Row], group_fields: tuple[str, ...], *, high_potential_only: bool) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, ...], dict[str, object]] = {}
+    for row in rows:
+        kind = normalize_signal_kind(row["kind"]) or "UNKNOWN"
+        family = signal_family(kind)
+        focus_group = signal_focus_group(kind)
+        if high_potential_only and focus_group != "HIGH_POTENTIAL":
+            continue
+        values = {
+            "signal_focus_group": focus_group,
+            "signal_family": family,
+            "kind": kind,
+            "timeframe": str(row["timeframe"] or "UNKNOWN"),
+            "symbol": str(row["symbol"] or "UNKNOWN"),
+        }
+        key = tuple(str(values[field]) for field in group_fields)
+        metrics = grouped.setdefault(
+            key,
+            {
+                **{field: values[field] for field in group_fields},
+                "signal_focus_group": focus_group,
+                "signal_family": family if "kind" in group_fields else "MIXED",
+                **_signal_kind_group_empty(),
+            },
+        )
+        metrics["total"] = int(metrics["total"]) + 1
+        metrics["score_last_sum"] = float(metrics["score_last_sum"]) + float(row["score_last"] or 0.0)
+        metrics["score_max_sum"] = float(metrics["score_max_sum"]) + float(row["score_max"] or 0.0)
+        metrics["max_gain_sum"] = float(metrics["max_gain_sum"]) + float(row["max_gain_pct"] or 0.0)
+        metrics["max_drawdown_sum"] = float(metrics["max_drawdown_sum"]) + float(row["max_drawdown_pct"] or 0.0)
+
+        result = _status_or_outcome(row)
+        if result == "TP2":
+            metrics["tp2"] = int(metrics["tp2"]) + 1
+        elif result == "SL":
+            metrics["sl"] = int(metrics["sl"]) + 1
+        elif result == "EXPIRED":
+            metrics["expired"] = int(metrics["expired"]) + 1
+        if _is_confirmed_signal(row):
+            metrics["confirmed"] = int(metrics["confirmed"]) + 1
+
+    result_rows: list[dict[str, object]] = []
+    for metrics in grouped.values():
+        total = int(metrics["total"])
+        closed_total = int(metrics["tp2"]) + int(metrics["sl"]) + int(metrics["expired"])
+        tp2_rate = round((int(metrics["tp2"]) / closed_total) * 100.0, 2) if closed_total else 0.0
+        avg_gain = round(float(metrics["max_gain_sum"]) / total, 4) if total else 0.0
+        output = {
+            field: metrics[field]
+            for field in group_fields
+        }
+        output.update(
+            {
+                "signal_focus_group": metrics["signal_focus_group"],
+                "signal_family": metrics["signal_family"],
+                "total": total,
+                "tp2": int(metrics["tp2"]),
+                "sl": int(metrics["sl"]),
+                "expired": int(metrics["expired"]),
+                "confirmed": int(metrics["confirmed"]),
+                "tp2_rate_closed_pct": tp2_rate,
+                "avg_score_last": round(float(metrics["score_last_sum"]) / total, 4) if total else 0.0,
+                "avg_score_max": round(float(metrics["score_max_sum"]) / total, 4) if total else 0.0,
+                "avg_max_gain_pct": avg_gain,
+                "avg_max_drawdown_pct": round(float(metrics["max_drawdown_sum"]) / total, 4) if total else 0.0,
+                "recommended_management": _management_recommendation(
+                    focus_group=str(metrics["signal_focus_group"]),
+                    total=total,
+                    tp2=int(metrics["tp2"]),
+                    sl=int(metrics["sl"]),
+                    expired=int(metrics["expired"]),
+                    tp2_rate_closed_pct=tp2_rate,
+                    avg_max_gain_pct=avg_gain,
+                ),
+            }
+        )
+        result_rows.append(output)
+    return sorted(result_rows, key=lambda row: tuple(str(row.get(field, "")) for field in group_fields))
+
+
+def _high_potential_focus_payload(rows: list[sqlite3.Row]) -> dict[str, object]:
+    by_kind = _aggregate_focus_rows(rows, ("kind",), high_potential_only=True)
+    present = {str(row.get("kind")) for row in by_kind}
+    for kind in sorted(HIGH_POTENTIAL_KINDS - present):
+        by_kind.append(
+            {
+                "kind": kind,
+                "signal_family": signal_family(kind),
+                "signal_focus_group": "HIGH_POTENTIAL",
+                "total": 0,
+                "tp2": 0,
+                "sl": 0,
+                "expired": 0,
+                "confirmed": 0,
+                "tp2_rate_closed_pct": 0.0,
+                "avg_score_last": 0.0,
+                "avg_score_max": 0.0,
+                "avg_max_gain_pct": 0.0,
+                "avg_max_drawdown_pct": 0.0,
+                "recommended_management": "monitor_high_potential",
+            }
+        )
+    priority = ["ACCUMULATION_WATCH", "ABSORPTION_ZONE", "PRE_IMPULSE_ZONE"]
+    by_kind = sorted(by_kind, key=lambda row: priority.index(str(row["kind"])) if str(row["kind"]) in priority else 99)
+    recommendations = Counter(str(row["recommended_management"]) for row in by_kind if int(row.get("total", 0)) > 0)
+    return {
+        "high_potential_summary": _aggregate_focus_rows(rows, ("signal_focus_group",), high_potential_only=True),
+        "by_kind": by_kind,
+        "by_timeframe": _aggregate_focus_rows(rows, ("timeframe",), high_potential_only=True),
+        "by_symbol": _aggregate_focus_rows(rows, ("symbol",), high_potential_only=True),
+        "by_kind_timeframe": _aggregate_focus_rows(rows, ("kind", "timeframe"), high_potential_only=True),
+        "management_recommendations": [
+            {"recommendation": recommendation, "total_groups": total}
+            for recommendation, total in sorted(recommendations.items())
+        ],
+        "focus_group_comparison": _aggregate_focus_rows(rows, ("signal_focus_group",), high_potential_only=False),
+    }
+
+
+def _read_signal_metric_rows() -> list[sqlite3.Row]:
+    if not SIGNALS_DB_PATH.exists():
+        return []
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
+        required = {"kind", "timeframe", "source", "symbol", "status", "score_last", "score_max", "max_gain_pct", "max_drawdown_pct"}
+        if not required.issubset(columns):
+            return []
+        optional_columns = [name for name in ("outcome",) if name in columns]
+        select_columns = ["kind", "timeframe", "source", "symbol", "status", "score_last", "score_max", "max_gain_pct", "max_drawdown_pct", *optional_columns]
+        return conn.execute(f"SELECT {', '.join(select_columns)} FROM signals").fetchall()
+    finally:
+        conn.close()
 
 
 def create_app() -> FastAPI:
@@ -241,26 +425,7 @@ def create_app() -> FastAPI:
         if not SIGNALS_DB_PATH.exists():
             return {"groups": [], "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")}}
 
-        conn = sqlite3.connect(str(SIGNALS_DB_PATH))
-        conn.row_factory = sqlite3.Row
-        try:
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
-            optional_columns = [name for name in ("outcome",) if name in columns]
-            select_columns = [
-                "kind",
-                "timeframe",
-                "source",
-                "status",
-                "score_last",
-                "score_max",
-                "max_gain_pct",
-                "max_drawdown_pct",
-                *optional_columns,
-            ]
-            rows = conn.execute(f"SELECT {', '.join(select_columns)} FROM signals").fetchall()
-        finally:
-            conn.close()
-
+        rows = _read_signal_metric_rows()
         grouped: dict[tuple[str, str, str, str, str], dict[str, float | int]] = defaultdict(_signal_kind_group_empty)
         for row in rows:
             kind = normalize_signal_kind(row["kind"]) or "UNKNOWN"
@@ -290,7 +455,13 @@ def create_app() -> FastAPI:
         focus_groups = {focus_group: [] for focus_group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")}
         for row in groups:
             focus_groups.setdefault(row.signal_focus_group, []).append(row)
-        return {"groups": groups, "focus_groups": focus_groups}
+        return {"groups": groups, "focus_groups": focus_groups, "high_potential_focus": _high_potential_focus_payload(rows)}
+
+    @app.get("/api/high-potential-focus")
+    async def high_potential_focus():
+        if not SIGNALS_DB_PATH.exists():
+            return _empty_high_potential_focus()
+        return _high_potential_focus_payload(_read_signal_metric_rows())
 
     @app.get("/api/setup-performance")
     async def setup_performance():

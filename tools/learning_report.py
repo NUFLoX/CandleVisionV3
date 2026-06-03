@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
+from orderflow_accum.signal_taxonomy import HIGH_POTENTIAL_KINDS, normalize_signal_kind, signal_family, signal_focus_group
+
 SUMMARY_FILE = "learning_summary.json"
 SYMBOL_EDGE_FILE = "learning_symbol_edge.csv"
 TIMEFRAME_EDGE_FILE = "learning_timeframe_edge.csv"
@@ -16,6 +18,7 @@ EXECUTOR_BLOCKERS_FILE = "learning_executor_blockers.csv"
 EXECUTOR_TRADES_FILE = "learning_executor_trades.csv"
 DIAGNOSIS_SUMMARY_FILE = "learning_diagnosis_summary.csv"
 RECOMMENDATIONS_FILE = "learning_recommendations.csv"
+HIGH_POTENTIAL_FOCUS_FILE = "learning_high_potential_focus.csv"
 
 SYMBOL_EDGE_HEADERS = [
     "symbol",
@@ -93,6 +96,22 @@ DIAGNOSIS_SUMMARY_HEADERS = [
     "avg_max_gain_pct",
     "avg_max_drawdown_pct",
     "common_recommendation",
+]
+HIGH_POTENTIAL_FOCUS_HEADERS = [
+    "signal_focus_group",
+    "signal_family",
+    "kind",
+    "timeframe",
+    "total",
+    "tp2",
+    "sl",
+    "expired",
+    "confirmed",
+    "tp2_rate_closed_pct",
+    "avg_score_max",
+    "avg_max_gain_pct",
+    "avg_max_drawdown_pct",
+    "recommendation",
 ]
 RECOMMENDATIONS_HEADERS = [
     "scope",
@@ -264,6 +283,115 @@ def rate(count: int, total: int) -> float:
     if total <= 0:
         return 0.0
     return count / total
+
+
+def signal_result(row: dict[str, Any]) -> str:
+    outcome = str(row.get("outcome") or "").strip().upper()
+    status = str(row.get("status") or "").strip().upper()
+    return outcome or status
+
+
+def signal_is_confirmed(row: dict[str, Any]) -> bool:
+    return str(row.get("status") or "").strip().upper() in {"CONFIRMED", "CONFIRMED_LONG", "CONFIRMED_SHORT"}
+
+
+def high_potential_recommendation(
+    focus_group: str,
+    *,
+    total: int,
+    tp2: int,
+    sl: int,
+    expired: int,
+    tp2_rate_closed_pct: float,
+    avg_max_gain_pct: float,
+) -> str:
+    if focus_group == "EXECUTION_STABLE":
+        return "normal_tp_sl"
+    if focus_group == "EXPERIMENTAL":
+        return "paper_only_low_priority"
+    if focus_group != "HIGH_POTENTIAL":
+        return "monitor"
+
+    expired_share = (expired / total) if total else 0.0
+    if expired_share >= 0.4:
+        return "extend_watch_window_or_wait_for_confirmation"
+    if avg_max_gain_pct >= 3.0 and tp2_rate_closed_pct < 50.0:
+        return "breakeven_first_trailing_candidate"
+    if tp2_rate_closed_pct >= 50.0 and tp2 >= max(sl, 1):
+        return "priority_high_potential"
+    return "monitor_high_potential"
+
+
+def build_high_potential_focus_rows(signals: list[dict[str, Any]]) -> list[dict[str, str]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in signals:
+        kind = normalize_signal_kind(row.get("kind")) or "UNKNOWN"
+        if signal_focus_group(kind) != "HIGH_POTENTIAL":
+            continue
+        timeframe = str(row.get("timeframe") or "UNKNOWN")
+        grouped[(kind, timeframe)].append(row)
+
+    result: list[dict[str, str]] = []
+    for (kind, timeframe), items in sorted(grouped.items()):
+        total = len(items)
+        tp2 = sum(1 for item in items if signal_result(item) == "TP2")
+        sl = sum(1 for item in items if signal_result(item) == "SL")
+        expired = sum(1 for item in items if signal_result(item) == "EXPIRED")
+        confirmed = sum(1 for item in items if signal_is_confirmed(item))
+        closed_total = tp2 + sl + expired
+        tp2_rate = (tp2 / closed_total) * 100.0 if closed_total else 0.0
+        avg_score_max = safe_avg(item.get("score_max") for item in items)
+        avg_max_gain = safe_avg(item.get("max_gain_pct") for item in items)
+        avg_max_drawdown = safe_avg(item.get("max_drawdown_pct") for item in items)
+        family = signal_family(kind)
+        focus_group = signal_focus_group(kind)
+        result.append(
+            {
+                "signal_focus_group": focus_group,
+                "signal_family": family,
+                "kind": kind,
+                "timeframe": timeframe,
+                "total": str(total),
+                "tp2": str(tp2),
+                "sl": str(sl),
+                "expired": str(expired),
+                "confirmed": str(confirmed),
+                "tp2_rate_closed_pct": fmt_float(tp2_rate),
+                "avg_score_max": fmt_float(avg_score_max),
+                "avg_max_gain_pct": fmt_float(avg_max_gain),
+                "avg_max_drawdown_pct": fmt_float(avg_max_drawdown),
+                "recommendation": high_potential_recommendation(
+                    focus_group,
+                    total=total,
+                    tp2=tp2,
+                    sl=sl,
+                    expired=expired,
+                    tp2_rate_closed_pct=tp2_rate,
+                    avg_max_gain_pct=avg_max_gain,
+                ),
+            }
+        )
+    return result
+
+
+def high_potential_summary_metrics(signals: list[dict[str, Any]], focus_rows: list[dict[str, str]]) -> dict[str, Any]:
+    high_potential = [row for row in signals if signal_focus_group(normalize_signal_kind(row.get("kind"))) == "HIGH_POTENTIAL"]
+    total = len(high_potential)
+    tp2 = sum(1 for row in high_potential if signal_result(row) == "TP2")
+    sl = sum(1 for row in high_potential if signal_result(row) == "SL")
+    expired = sum(1 for row in high_potential if signal_result(row) == "EXPIRED")
+    closed_total = tp2 + sl + expired
+    recommendation_counts = Counter(row["recommendation"] for row in focus_rows)
+    kind_totals = Counter(normalize_signal_kind(row.get("kind")) for row in high_potential)
+    return {
+        "high_potential_total": total,
+        "high_potential_tp2": tp2,
+        "high_potential_sl": sl,
+        "high_potential_expired": expired,
+        "high_potential_tp2_rate_closed_pct": round((tp2 / closed_total) * 100.0, 2) if closed_total else 0.0,
+        "top_high_potential_kinds": [kind for kind, count in sorted(kind_totals.items(), key=lambda item: (-item[1], item[0])) if kind in HIGH_POTENTIAL_KINDS][:10],
+        "high_potential_recommendations_count": dict(sorted(recommendation_counts.items())),
+    }
 
 
 def edge_recommendation(tp_rate: float, sl_rate: float, sample_size: int, min_sample: int, label: str) -> str:
@@ -618,6 +746,7 @@ def build_summary(
     lifecycle_events: list[dict[str, Any]],
     executor_rows: list[dict[str, Any]],
     executor_trades: list[dict[str, Any]],
+    high_potential_focus_rows: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     outcome_counts = Counter(str(row.get("outcome") or "UNKNOWN").upper() for row in diagnoses)
     executor_action_counts = Counter(str(row.get("action") or "UNKNOWN") for row in executor_outcomes)
@@ -639,6 +768,8 @@ def build_summary(
     if not executor_outcomes:
         high_level_notes.append("No executor decisions found for this period.")
 
+    high_potential_metrics = high_potential_summary_metrics(signals, high_potential_focus_rows or [])
+
     return {
         "generated_at": utc_iso_now(),
         "since_hours": since_hours,
@@ -656,6 +787,7 @@ def build_summary(
         "top_sl_symbols": top_sl_symbols,
         "top_executor_blockers": top_executor_blockers,
         "high_level_notes": high_level_notes,
+        **high_potential_metrics,
     }
 
 
@@ -689,6 +821,7 @@ def generate_learning_report(db_path: str | Path, out_dir: str | Path, since_hou
     diagnosis_rows = build_diagnosis_summary_rows(diagnoses)
     executor_trade_rows = build_executor_trade_rows(executor_trades, min_sample)
     recommendation_rows = build_recommendation_rows(symbol_rows, timeframe_rows, executor_rows, min_sample)
+    high_potential_focus_rows = build_high_potential_focus_rows(signals)
     summary = build_summary(
         since_hours=since_hours,
         signals=signals,
@@ -697,6 +830,7 @@ def generate_learning_report(db_path: str | Path, out_dir: str | Path, since_hou
         lifecycle_events=lifecycle_events,
         executor_rows=executor_rows,
         executor_trades=executor_trades,
+        high_potential_focus_rows=high_potential_focus_rows,
     )
 
     (out_path / SUMMARY_FILE).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -706,6 +840,7 @@ def generate_learning_report(db_path: str | Path, out_dir: str | Path, since_hou
     write_csv(out_path / EXECUTOR_TRADES_FILE, EXECUTOR_TRADES_HEADERS, executor_trade_rows)
     write_csv(out_path / DIAGNOSIS_SUMMARY_FILE, DIAGNOSIS_SUMMARY_HEADERS, diagnosis_rows)
     write_csv(out_path / RECOMMENDATIONS_FILE, RECOMMENDATIONS_HEADERS, recommendation_rows)
+    write_csv(out_path / HIGH_POTENTIAL_FOCUS_FILE, HIGH_POTENTIAL_FOCUS_HEADERS, high_potential_focus_rows)
     return summary
 
 
