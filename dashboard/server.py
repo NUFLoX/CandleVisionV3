@@ -21,7 +21,6 @@ from .health import HEARTBEAT_MAX_AGE_SECONDS
 from .schemas import BotLog, Heartbeat, MarketState, Signal, SignalKindGroupStats, Trade, WatchlistItem
 from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
-from .taxonomy import build_signal_taxonomy
 from orderflow_accum.signal_taxonomy import HIGH_POTENTIAL_KINDS, normalize_signal_kind, signal_family, signal_focus_group
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -644,7 +643,8 @@ def create_app() -> FastAPI:
             tf = str(row["timeframe"] or "1")
             kind = str(row["kind"] or "UNKNOWN") if "kind" in row.keys() else "UNKNOWN"
             source = str(row["source"] or "UNKNOWN") if "source" in row.keys() else "UNKNOWN"
-            taxonomy = build_signal_taxonomy(kind=kind, source=source, timeframe=tf)
+            family = signal_family(kind)
+            focus_group = signal_focus_group(kind)
             score_b = bucket(score)
             mfe = float(row["max_gain_pct"] or 0.0)
             mae = float(row["max_drawdown_pct"] or 0.0)
@@ -670,8 +670,8 @@ def create_app() -> FastAPI:
                 tf_stats[tf],
                 kind_stats[kind],
                 source_stats[source],
-                family_stats[taxonomy.signal_family],
-                focus_stats[taxonomy.signal_focus_group],
+                family_stats[family],
+                focus_stats[focus_group],
             )
             for group in grouped_buckets:
                 group["total"] += 1
@@ -684,9 +684,16 @@ def create_app() -> FastAPI:
                 else:
                     group["pending"] += 1
 
-        def finalize(items: dict, label: str) -> list[dict]:
+        def finalize(items: dict, label: str, allowed_labels: tuple[str, ...] | None = None) -> list[dict]:
             out = []
-            for key, value in items.items():
+            source_items = dict(items)
+            if allowed_labels is not None:
+                empty_metrics = {"total": 0, "tp": 0, "sl": 0, "pending": 0, "mfe": 0.0, "mae": 0.0}
+                source_items = {
+                    label_value: source_items.get(label_value, empty_metrics.copy())
+                    for label_value in allowed_labels
+                }
+            for key, value in source_items.items():
                 total = max(int(value["total"]), 1)
                 tp = int(value["tp"])
                 sl = int(value["sl"])
@@ -703,7 +710,22 @@ def create_app() -> FastAPI:
                         "avg_mae": round(value["mae"] / total, 4),
                     }
                 )
+            if allowed_labels is not None:
+                priority = {label_value: index for index, label_value in enumerate(allowed_labels)}
+                return sorted(out, key=lambda row: priority.get(str(row[label]), len(priority)))
             return sorted(out, key=lambda row: row["total"], reverse=True)
+
+        focus_taxonomy_labels = ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")
+        family_taxonomy_labels = (
+            "HIGH_POTENTIAL_ACCUMULATION",
+            "HIGH_POTENTIAL_ABSORPTION",
+            "HIGH_POTENTIAL_PRE_IMPULSE",
+            "EXECUTION_STABLE_BREAKOUT",
+            "EXPERIMENTAL_EARLY",
+            "EXPERIMENTAL_READY",
+            "EXPERIMENTAL_BASE_BUILDUP",
+            "OTHER",
+        )
 
         return {
             "by_reason": finalize(reason_stats, "reason"),
@@ -711,8 +733,8 @@ def create_app() -> FastAPI:
             "by_timeframe": finalize(tf_stats, "timeframe"),
             "by_kind": finalize(kind_stats, "kind"),
             "by_source": finalize(source_stats, "source"),
-            "by_family": finalize(family_stats, "family"),
-            "by_focus_group": finalize(focus_stats, "focus_group"),
+            "by_family": finalize(family_stats, "family", family_taxonomy_labels),
+            "by_focus_group": finalize(focus_stats, "focus_group", focus_taxonomy_labels),
         }
 
     @app.get("/api/watchlist")
