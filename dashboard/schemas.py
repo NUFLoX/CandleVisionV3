@@ -106,6 +106,7 @@ class SignalKindGroupStats(BaseModel):
     avg_score_max: float = 0.0
     avg_max_gain_pct: float = 0.0
     avg_max_drawdown_pct: float = 0.0
+    recommended_management: str = ""
 
 
 class WatchlistItem(BaseModel):

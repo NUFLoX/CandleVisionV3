@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import sys
 from pathlib import Path
@@ -8,9 +9,19 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import pytest
 from fastapi.testclient import TestClient
 
 import dashboard.server as server_module
+
+
+@pytest.fixture(autouse=True)
+def _disable_dashboard_live_refresh(monkeypatch):
+    async def idle_refresh_loop(*_args, **_kwargs):
+        while True:
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(server_module, "_live_refresh_loop", idle_refresh_loop)
 
 
 def _init_db(path: Path) -> None:
@@ -223,3 +234,101 @@ def test_signal_kind_groups_endpoint_empty_when_db_missing(tmp_path: Path, monke
         "groups": [],
         "focus_groups": {"HIGH_POTENTIAL": [], "EXECUTION_STABLE": [], "EXPERIMENTAL": [], "OTHER": []},
     }
+
+
+def test_high_potential_focus_endpoint_returns_required_kinds_and_recommendations(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "signals.db"
+    _init_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.executemany(
+        """
+        INSERT INTO signals (
+            signal_key,symbol,market,timeframe,source,kind,side,
+            score_first,score_last,score_max,entry,stop_loss,take_profit_1,take_profit_2,
+            reasons_first,reasons_last,meta,first_seen,last_seen,repeat_count,status,outcome,max_gain_pct,max_drawdown_pct
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        [
+            (
+                "ADAUSDT|linear|15|ABSORPTION_ZONE|Buy",
+                "ADAUSDT",
+                "linear",
+                "15",
+                "orderflow",
+                "ABSORPTION_ZONE",
+                "Buy",
+                6.0,
+                7.0,
+                9.0,
+                100.0,
+                95.0,
+                110.0,
+                120.0,
+                "[]",
+                "[]",
+                "{}",
+                "2026-05-01T00:00:00+00:00",
+                "2026-05-02T00:00:00+00:00",
+                1,
+                "WATCHING",
+                "EXPIRED",
+                4.0,
+                -1.0,
+            ),
+            (
+                "DOGEUSDT|linear|5|PRE_IMPULSE_ZONE|Buy",
+                "DOGEUSDT",
+                "linear",
+                "5",
+                "orderflow",
+                "PRE_IMPULSE_ZONE",
+                "Buy",
+                6.0,
+                6.5,
+                8.5,
+                100.0,
+                95.0,
+                110.0,
+                120.0,
+                "[]",
+                "[]",
+                "{}",
+                "2026-05-01T00:00:00+00:00",
+                "2026-05-02T00:00:00+00:00",
+                1,
+                "WATCHING",
+                "SL",
+                5.0,
+                -2.0,
+            ),
+        ],
+    )
+    before_rows = conn.execute("SELECT signal_key, kind, status, outcome FROM signals ORDER BY signal_key").fetchall()
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(server_module, "SIGNALS_DB_PATH", db_path)
+
+    app = server_module.create_app()
+    with TestClient(app) as client:
+        response = client.get("/api/high-potential-focus")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload) >= {
+        "high_potential_summary",
+        "by_kind",
+        "by_timeframe",
+        "by_symbol",
+        "by_kind_timeframe",
+        "management_recommendations",
+    }
+    assert [row["kind"] for row in payload["by_kind"]] == ["ACCUMULATION_WATCH", "ABSORPTION_ZONE", "PRE_IMPULSE_ZONE"]
+    recommendations = {row["kind"]: row["recommended_management"] for row in payload["by_kind"]}
+    assert recommendations["ACCUMULATION_WATCH"] in {"priority_high_potential", "breakeven_first_trailing_candidate"}
+    assert recommendations["ABSORPTION_ZONE"] == "extend_watch_window_or_wait_for_confirmation"
+    assert recommendations["PRE_IMPULSE_ZONE"] == "breakeven_first_trailing_candidate"
+
+    conn = sqlite3.connect(str(db_path))
+    after_rows = conn.execute("SELECT signal_key, kind, status, outcome FROM signals ORDER BY signal_key").fetchall()
+    conn.close()
+    assert after_rows == before_rows
