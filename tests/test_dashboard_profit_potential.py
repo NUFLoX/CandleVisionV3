@@ -145,6 +145,31 @@ def test_signal_profit_potential_endpoint_does_not_crash_when_reports_missing(tm
     assert all(row["profit_potential"] is None for row in payload["key_kinds"])
 
 
+def test_signal_intelligence_returns_profit_potential_without_signals_db(tmp_path: Path, monkeypatch) -> None:
+    reports_dir = tmp_path / "reports_profit_backtest"
+    reports_dir.mkdir()
+    (reports_dir / "signal_profit_by_kind.csv").write_text(
+        "kind,avg_max_gain_pct,avg_potential_profit_usd,hit_10_pct_share\n"
+        "ACCUMULATION_WATCH,12.5,2.5,0.8\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server_module, "SIGNALS_DB_PATH", tmp_path / "missing_signals.db")
+    monkeypatch.setattr(server_module, "PROFIT_BACKTEST_DIR", reports_dir)
+
+    app = server_module.create_app()
+    with TestClient(app) as client:
+        response = client.get("/api/signal-kind-groups")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["groups"] == []
+    assert payload["profit_potential"]["available"] is True
+    assert payload["profit_potential"]["by_kind"]["ACCUMULATION_WATCH"]["avg_potential_profit_usd"] == 2.5
+    focus = payload["high_potential_focus"]
+    assert focus["profit_potential"]["available"] is True
+    assert focus["by_kind"][0]["kind"] == "ACCUMULATION_WATCH"
+    assert focus["by_kind"][0]["profit_potential"]["avg_max_gain_pct"] == 12.5
+
 def test_signal_intelligence_still_works_with_only_signals_db(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "signals.db"
     _init_signals_db(db_path)
