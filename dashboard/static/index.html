@@ -61,7 +61,9 @@
         const [outcomes, setOutcomes] = useState([]);
         const [statsError, setStatsError] = useState('');
         const [activeSetups, setActiveSetups] = useState([]);
+        const emptySignalKindGroups = { groups: [], focus_groups: { HIGH_POTENTIAL: [], EXECUTION_STABLE: [], EXPERIMENTAL: [], OTHER: [] } };
         const [setupPerf, setSetupPerf] = useState({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] });
+        const [signalKindGroups, setSignalKindGroups] = useState(emptySignalKindGroups);
 
         const load = async () => setSnapshot(await api('/api/snapshot'));
         const loadStats = async () => {
@@ -73,6 +75,7 @@
         const refreshLive = async () => setSnapshot(await api('/api/refresh', { method: 'POST' }));
         const loadActiveSetups = async () => setActiveSetups(await api('/api/active-setups?limit=500'));
         const loadSetupPerformance = async () => setSetupPerf(await api('/api/setup-performance'));
+        const loadSignalKindGroups = async () => setSignalKindGroups(await api('/api/signal-kind-groups'));
         const refreshStats = async () => {
           try {
             const result = await api('/api/signal-outcomes/refresh', { method: 'POST' });
@@ -88,6 +91,7 @@
           loadStats().catch((e) => setStatsError(e.message));
           loadActiveSetups().catch(() => setActiveSetups([]));
           loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] }));
+          loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups));
           const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
           const ws = new WebSocket(`${wsProtocol}://${location.host}/ws`);
           ws.onmessage = () => load();
@@ -95,7 +99,8 @@
           const statsTimer = setInterval(() => loadStats().catch((e) => setStatsError(e.message)), 30000);
           const setupsTimer = setInterval(() => loadActiveSetups().catch(() => setActiveSetups([])), 30000);
           const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] })), 30000);
-          return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(perfTimer); ws.close(); };
+          const kindGroupsTimer = setInterval(() => loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups)), 30000);
+          return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(perfTimer); clearInterval(kindGroupsTimer); ws.close(); };
         }, []);
 
         useEffect(() => {
@@ -201,6 +206,7 @@
           <SignalPerformancePanel stats={stats} outcomes={outcomes} error={statsError} onRefresh={refreshStats} />
           <ActiveSetupsPanel setups={activeSetups} onRefresh={loadActiveSetups} />
           <SetupPerformancePanel perf={setupPerf} onRefresh={loadSetupPerformance} />
+          <SignalIntelligencePanel data={signalKindGroups} onRefresh={loadSignalKindGroups} />
 
           <section className="grid gap-6 xl:grid-cols-[.9fr_1.1fr]">
             <Card title="Поиск монеты" action={<input className="w-32 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-cyan-400" value={coinQuery} onChange={(e) => setCoinQuery(e.target.value)} placeholder="BTC" />}>
@@ -331,6 +337,71 @@
             {setups.length === 0 && <p className="p-4 text-sm text-slate-500">Нет активных setup'ов в signals.db</p>}
           </div>
         </Card>;
+      }
+
+
+      function SignalIntelligencePanel({ data, onRefresh }) {
+        const focusGroups = data?.focus_groups || {};
+        const configs = [
+          ['HIGH_POTENTIAL', 'HIGH POTENTIAL', 'green'],
+          ['EXECUTION_STABLE', 'EXECUTION STABLE', 'blue'],
+          ['EXPERIMENTAL', 'EXPERIMENTAL', 'amber'],
+          ['OTHER', 'OTHER', 'slate'],
+        ];
+        return <Card title="Signal Intelligence" action={<button onClick={onRefresh} className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-400/20">Refresh taxonomy</button>}>
+          <div className="grid gap-4 xl:grid-cols-2">
+            {configs.map(([key, title, tone]) => <SignalFocusGroupCard key={key} title={title} tone={tone} rows={focusGroups[key] || []} />)}
+          </div>
+        </Card>;
+      }
+
+      function SignalFocusGroupCard({ title, tone, rows }) {
+        const sortedRows = [...rows].sort((a, b) => {
+          const priority = ['ACCUMULATION_WATCH', 'ABSORPTION_ZONE', 'PRE_IMPULSE_ZONE'];
+          const pa = priority.indexOf(a.kind);
+          const pb = priority.indexOf(b.kind);
+          if (pa !== -1 || pb !== -1) return (pa === -1 ? 99 : pa) - (pb === -1 ? 99 : pb);
+          return (b.total || 0) - (a.total || 0);
+        });
+        return <div className="overflow-auto rounded-xl border border-slate-800">
+          <div className="flex items-center justify-between bg-slate-900 px-3 py-2">
+            <span className="text-sm font-bold">{title}</span>
+            <Badge tone={tone}>{rows.reduce((sum, row) => sum + Number(row.total || 0), 0)} signals</Badge>
+          </div>
+          <table className="min-w-full text-left text-xs">
+            <thead className="bg-slate-900/50 text-slate-500">
+              <tr>
+                <th className="px-2 py-2">Kind</th>
+                <th className="px-2 py-2">Family</th>
+                <th className="px-2 py-2">TF</th>
+                <th className="px-2 py-2">Src</th>
+                <th className="px-2 py-2">Total</th>
+                <th className="px-2 py-2">TP2</th>
+                <th className="px-2 py-2">SL</th>
+                <th className="px-2 py-2">EXP</th>
+                <th className="px-2 py-2">TP2%</th>
+                <th className="px-2 py-2">Score</th>
+                <th className="px-2 py-2">MFE/MAE</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedRows.map((row, idx) => <tr key={`${row.kind}-${row.timeframe}-${row.source}-${idx}`} className="border-t border-slate-800">
+                <td className="px-2 py-2 font-semibold text-slate-200">{row.kind}</td>
+                <td className="px-2 py-2 text-slate-400">{row.signal_family}</td>
+                <td className="px-2 py-2">{row.timeframe}</td>
+                <td className="px-2 py-2">{row.source}</td>
+                <td className="px-2 py-2">{row.total}</td>
+                <td className="px-2 py-2 text-emerald-300">{row.tp2}</td>
+                <td className="px-2 py-2 text-red-300">{row.sl}</td>
+                <td className="px-2 py-2 text-slate-400">{row.expired}</td>
+                <td className="px-2 py-2">{Number(row.tp2_rate_closed_pct || 0).toFixed(1)}%</td>
+                <td className="px-2 py-2">{Number(row.avg_score_last || 0).toFixed(2)} / {Number(row.avg_score_max || 0).toFixed(2)}</td>
+                <td className="px-2 py-2">{Number(row.avg_max_gain_pct || 0).toFixed(2)}% / {Number(row.avg_max_drawdown_pct || 0).toFixed(2)}%</td>
+              </tr>)}
+            </tbody>
+          </table>
+          {rows.length === 0 && <p className="p-3 text-xs text-slate-500">No signal kind rows yet.</p>}
+        </div>;
       }
 
       function SetupPerformancePanel({ perf, onRefresh }) {
