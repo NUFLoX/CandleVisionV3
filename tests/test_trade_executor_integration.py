@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -49,6 +50,7 @@ from orderflow_accum.models import Signal
 from orderflow_accum.runner import AccumulationRunner
 from orderflow_accum.signal_store import SignalStore
 from orderflow_accum.trade_executor import SmartTradeExecutor
+from orderflow_accum.trade_learning import TradeLearningEngine
 
 
 class DummySettings:
@@ -418,6 +420,64 @@ def test_invalid_long_executor_initial_sl_does_not_inflate_r_result(tmp_path: Pa
     assert trade_diagnostics["invalid_initial_sl"] is True
     runner.signal_store.close()
 
+
+def test_refresh_open_position_writes_hold_without_new_signal_and_no_duplicate_enter(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    runner.trade_learning = TradeLearningEngine(runner.signal_store, logger=runner.logger)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+    runner.signal_store.conn.execute(
+        "UPDATE executor_outcomes SET updated_at = ? WHERE signal_key = ?",
+        ("2026-01-01T00:00:00+00:00", key),
+    )
+    runner.signal_store.conn.commit()
+
+    refreshed = asyncio.run(runner.refresh_open_executor_positions())
+
+    assert refreshed == 1
+    row = runner.signal_store.get_executor_outcome(key)
+    assert row is not None
+    assert row["action"] == "HOLD"
+    assert row["state"] == "ENTERED"
+    assert row["updated_at"] > "2026-01-01T00:00:00+00:00"
+    assert row_count(runner.signal_store) == 1
+    enter_events = [
+        event
+        for event in runner.signal_store.get_trade_lifecycle_events(key)
+        if event["event_type"] == "EXECUTOR_ENTER" or event["action"] == "ENTER_LONG"
+    ]
+    assert len(enter_events) == 1
+    runner.signal_store.close()
+
+
+def test_refresh_open_position_can_exit_and_write_trade_without_new_signal(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+    runner.signal_store.conn.execute(
+        """
+        UPDATE executor_outcomes
+        SET price = ?, buy_flow = ?, sell_flow = ?, volume_impulse = ?, updated_at = ?
+        WHERE signal_key = ?
+        """,
+        (100.1, 80.0, 130.0, 1.0, "2026-01-01T00:00:00+00:00", key),
+    )
+    runner.signal_store.conn.commit()
+
+    refreshed = asyncio.run(runner.refresh_open_executor_positions())
+
+    assert refreshed == 1
+    row = runner.signal_store.get_executor_outcome(key)
+    assert row is not None
+    assert row["action"] == "EXIT"
+    assert row["state"] == "EXITED"
+    assert row["exit_reason"] == "exit_sell_flow_dominance"
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["signal_key"] == key
+    runner.signal_store.close()
 
 def test_invalid_short_initial_sl_does_not_calculate_r_result() -> None:
     assert (
