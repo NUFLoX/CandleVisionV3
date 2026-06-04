@@ -1242,13 +1242,24 @@ def create_app() -> FastAPI:
 
     @app.get("/api/signal-kind-groups")
     async def signal_kind_groups():
-        if not SIGNALS_DB_PATH.exists():
-            return _empty_signal_kind_groups_payload()
-        if not _signals_metric_table_available():
-            return _empty_signal_kind_groups_payload()
-
         profit_payload = _read_profit_potential_payload()
+
+        if not SIGNALS_DB_PATH.exists():
+            return {
+                "groups": [],
+                "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")},
+                "high_potential_focus": _high_potential_focus_payload([], profit_payload),
+                "profit_potential": profit_payload,
+            }
+
         rows = _read_signal_metric_rows()
+        if not rows:
+            return {
+                "groups": [],
+                "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")},
+                "high_potential_focus": _high_potential_focus_payload([], profit_payload),
+                "profit_potential": profit_payload,
+            }
         grouped: dict[tuple[str, str, str, str, str], dict[str, float | int]] = defaultdict(_signal_kind_group_empty)
         for row in rows:
             kind = normalize_signal_kind(row["kind"]) or "UNKNOWN"
@@ -1290,17 +1301,19 @@ def create_app() -> FastAPI:
 
     @app.get("/api/high-potential-focus")
     async def high_potential_focus():
+        profit_payload = _read_profit_potential_payload()
         if not SIGNALS_DB_PATH.exists():
             payload = _empty_high_potential_focus()
-            payload["profit_potential"] = _empty_signal_kind_profit_potential_payload()
-            return payload
-        if not _signals_metric_table_available():
-            payload = _empty_high_potential_focus()
-            payload["profit_potential"] = _empty_signal_kind_profit_potential_payload()
+            payload["profit_potential"] = profit_payload
             return payload
 
-        profit_payload = _read_profit_potential_payload()
-        return _high_potential_focus_payload(_read_signal_metric_rows(), profit_payload)
+        rows = _read_signal_metric_rows()
+        if not rows:
+            payload = _empty_high_potential_focus()
+            payload["profit_potential"] = profit_payload
+            return payload
+
+        return _high_potential_focus_payload(rows, profit_payload)
 
     @app.get("/api/setup-performance")
     async def setup_performance():
