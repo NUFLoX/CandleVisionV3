@@ -1069,6 +1069,19 @@ def _high_potential_focus_payload(rows: list[sqlite3.Row], profit_payload: dict[
     }
 
 
+def _signals_metric_table_available() -> bool:
+    if not SIGNALS_DB_PATH.exists():
+        return False
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = _table_columns(conn, "signals")
+        required = {"kind", "timeframe", "source", "symbol", "status", "score_last", "score_max", "max_gain_pct", "max_drawdown_pct"}
+        return required.issubset(columns)
+    finally:
+        conn.close()
+
+
 def _read_signal_metric_rows() -> list[sqlite3.Row]:
     if not SIGNALS_DB_PATH.exists():
         return []
@@ -1213,15 +1226,16 @@ def create_app() -> FastAPI:
 
     @app.get("/api/signal-kind-groups")
     async def signal_kind_groups():
-        profit_payload = _read_profit_potential_payload()
-        if not SIGNALS_DB_PATH.exists():
+        if not _signals_metric_table_available():
+            profit_payload = _empty_profit_potential_payload()
             return {
                 "groups": [],
                 "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")},
-                "high_potential_focus": _high_potential_focus_payload([], profit_payload),
+                "high_potential_focus": {**_empty_high_potential_focus(), "profit_potential": profit_payload},
                 "profit_potential": profit_payload,
             }
 
+        profit_payload = _read_profit_potential_payload()
         rows = _read_signal_metric_rows()
         grouped: dict[tuple[str, str, str, str, str], dict[str, float | int]] = defaultdict(_signal_kind_group_empty)
         for row in rows:
@@ -1264,11 +1278,11 @@ def create_app() -> FastAPI:
 
     @app.get("/api/high-potential-focus")
     async def high_potential_focus():
-        profit_payload = _read_profit_potential_payload()
-        if not SIGNALS_DB_PATH.exists():
+        if not _signals_metric_table_available():
             payload = _empty_high_potential_focus()
-            payload["profit_potential"] = profit_payload
+            payload["profit_potential"] = _empty_profit_potential_payload()
             return payload
+        profit_payload = _read_profit_potential_payload()
         return _high_potential_focus_payload(_read_signal_metric_rows(), profit_payload)
 
     @app.get("/api/setup-performance")
