@@ -406,11 +406,328 @@ def _diagnostic_value(diagnostics: dict[str, object], *names: str) -> object | N
     return None
 
 
-def _executor_select_expr(columns: set[str], name: str, alias: str | None = None) -> str:
+def _executor_select_expr(columns: set[str], name: str, alias: str | None = None, table_alias: str = "eo") -> str:
     output_name = alias or name
     if name in columns:
-        return f"eo.{name} AS {output_name}"
+        return f"{table_alias}.{name} AS {output_name}"
     return f"NULL AS {output_name}"
+
+
+def _round4(value: float | None) -> float | None:
+    return round(value, 4) if value is not None else None
+
+
+def _parse_signal_key_parts(signal_key: object) -> dict[str, str | None]:
+    parts = str(signal_key or "").split("|")
+    return {
+        "timeframe": parts[2] if len(parts) > 2 and parts[2] else None,
+        "kind": parts[3] if len(parts) > 3 and parts[3] else None,
+    }
+
+
+def _taxonomy_payload(kind: object | None) -> dict[str, str | None]:
+    normalized = normalize_signal_kind(str(kind or "")) if kind else None
+    if not normalized:
+        return {"signal_kind": None, "signal_family": None, "signal_focus_group": None}
+    return {
+        "signal_kind": normalized,
+        "signal_family": signal_family(normalized),
+        "signal_focus_group": signal_focus_group(normalized),
+    }
+
+
+def _resolve_signal_taxonomy(
+    *,
+    diagnostics: dict[str, object],
+    signal_key: object,
+    joined_kind: object | None = None,
+) -> dict[str, str | None]:
+    diagnostic_kind = _diagnostic_value(diagnostics, "signal_kind", "kind")
+    parsed_kind = _parse_signal_key_parts(signal_key).get("kind")
+    kind = diagnostic_kind or parsed_kind or joined_kind
+    payload = _taxonomy_payload(kind)
+    if diagnostic_kind and not payload["signal_kind"]:
+        payload["signal_kind"] = str(diagnostic_kind)
+    payload["signal_family"] = (
+        str(value)
+        if (value := _diagnostic_value(diagnostics, "signal_family", "family")) is not None
+        else payload["signal_family"]
+    )
+    payload["signal_focus_group"] = (
+        str(value)
+        if (value := _diagnostic_value(diagnostics, "signal_focus_group", "focus_group")) is not None
+        else payload["signal_focus_group"]
+    )
+    return payload
+
+
+def _empty_executor_ledger_payload() -> dict[str, object]:
+    return {
+        "summary": {
+            "total_closed_trades": 0,
+            "total_open_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "breakeven_or_flat": 0,
+            "win_rate": 0.0,
+            "net_r": 0.0,
+            "avg_r": 0.0,
+            "gross_win_r": 0.0,
+            "gross_loss_r": 0.0,
+            "profit_factor": None,
+            "breakeven_moves": 0,
+            "avg_max_gain_r": 0.0,
+            "avg_max_drawdown_r": 0.0,
+            "closed_trades_today": 0,
+        },
+        "open_trades": [],
+        "closed_trades": [],
+        "exit_reasons": [],
+    }
+
+
+def _closed_trade_where(columns: set[str]) -> str:
+    clauses: list[str] = []
+    if "exit_time" in columns:
+        clauses.append("et.exit_time IS NOT NULL")
+    if "state" in columns:
+        clauses.append("UPPER(COALESCE(et.state, '')) = 'EXITED'")
+    return f"WHERE ({' OR '.join(clauses)})" if clauses else ""
+
+
+def _read_executor_ledger(limit: int = 50) -> dict[str, object]:
+    payload = _empty_executor_ledger_payload()
+    if not SIGNALS_DB_PATH.exists():
+        return payload
+
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        payload["open_trades"] = _read_executor_ledger_open_trades(conn, limit=limit)
+        payload["closed_trades"] = _read_executor_ledger_closed_trades(conn, limit=limit)
+        payload["exit_reasons"] = _read_executor_ledger_exit_reasons(conn)
+        payload["summary"] = _read_executor_ledger_summary(conn, payload["open_trades"])
+        return payload
+    finally:
+        conn.close()
+
+
+def _read_executor_ledger_summary(conn: sqlite3.Connection, open_trades: object) -> dict[str, object]:
+    summary = dict(_empty_executor_ledger_payload()["summary"])
+    summary["total_open_trades"] = len(open_trades) if isinstance(open_trades, list) else 0
+
+    columns = _table_columns(conn, "executor_trades")
+    if "r_result" not in columns:
+        return summary
+
+    where_sql = _closed_trade_where(columns)
+    rows = conn.execute(
+        f"""
+        SELECT
+            r_result,
+            {_executor_select_expr(columns, 'moved_to_breakeven', table_alias='et')},
+            {_executor_select_expr(columns, 'max_gain_r', table_alias='et')},
+            {_executor_select_expr(columns, 'max_drawdown_r', table_alias='et')}
+        FROM executor_trades et
+        {where_sql}
+        """
+    ).fetchall()
+    r_values = [_safe_float(row["r_result"]) for row in rows]
+    r_values = [value for value in r_values if value is not None]
+    total_closed = len(r_values)
+    wins = sum(1 for value in r_values if value > 0.0000001)
+    losses = sum(1 for value in r_values if value < -0.0000001)
+    flats = total_closed - wins - losses
+    non_flat = wins + losses
+    gross_win = sum(value for value in r_values if value > 0)
+    gross_loss = abs(sum(value for value in r_values if value < 0))
+    max_gain_values = [value for row in rows if (value := _safe_float(row["max_gain_r"])) is not None]
+    max_drawdown_values = [value for row in rows if (value := _safe_float(row["max_drawdown_r"])) is not None]
+
+    summary.update(
+        {
+            "total_closed_trades": total_closed,
+            "wins": wins,
+            "losses": losses,
+            "breakeven_or_flat": flats,
+            "win_rate": _round4(wins / (non_flat or total_closed)) if total_closed else 0.0,
+            "net_r": _round4(sum(r_values)) or 0.0,
+            "avg_r": _round4(sum(r_values) / total_closed) if total_closed else 0.0,
+            "gross_win_r": _round4(gross_win) or 0.0,
+            "gross_loss_r": _round4(gross_loss) or 0.0,
+            "profit_factor": _round4(gross_win / gross_loss) if gross_loss > 0 else None,
+            "breakeven_moves": sum(1 for row in rows if _safe_int(row["moved_to_breakeven"]) == 1),
+            "avg_max_gain_r": _round4(sum(max_gain_values) / len(max_gain_values)) if max_gain_values else 0.0,
+            "avg_max_drawdown_r": _round4(sum(max_drawdown_values) / len(max_drawdown_values)) if max_drawdown_values else 0.0,
+            "closed_trades_today": _executor_closed_trades_today(conn),
+        }
+    )
+    return summary
+
+
+def _read_executor_ledger_closed_trades(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, object]]:
+    columns = _table_columns(conn, "executor_trades")
+    if not columns:
+        return []
+    signal_columns = _table_columns(conn, "signals")
+    can_join_signals = {"signal_key", "kind"}.issubset(signal_columns)
+    join_sql = "LEFT JOIN signals s ON s.signal_key = et.signal_key" if can_join_signals else ""
+    kind_expr = "s.kind AS joined_signal_kind" if can_join_signals else "NULL AS joined_signal_kind"
+    select_columns = [
+        _executor_select_expr(columns, name, table_alias="et")
+        for name in (
+            "trade_key", "signal_key", "symbol", "timeframe", "side", "state", "entry_price", "exit_price",
+            "initial_sl", "final_sl", "current_sl", "exit_reason", "r_result", "max_gain_r",
+            "max_drawdown_r", "bars_in_trade", "duration_minutes", "moved_to_breakeven", "breakeven_time",
+            "entry_time", "exit_time", "updated_at", "diagnostics_json",
+        )
+    ]
+    select_columns.append(kind_expr)
+    order_expr = "et.exit_time" if "exit_time" in columns else ("et.updated_at" if "updated_at" in columns else "et.rowid")
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM executor_trades et
+        {join_sql}
+        {_closed_trade_where(columns)}
+        ORDER BY {order_expr} DESC, et.rowid DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    trades: list[dict[str, object]] = []
+    for row in rows:
+        diagnostics = _safe_json_object(row["diagnostics_json"])
+        taxonomy = _resolve_signal_taxonomy(diagnostics=diagnostics, signal_key=row["signal_key"], joined_kind=row["joined_signal_kind"])
+        parsed = _parse_signal_key_parts(row["signal_key"])
+        trades.append({
+            "trade_key": str(row["trade_key"] or ""),
+            "signal_key": str(row["signal_key"] or ""),
+            "symbol": str(row["symbol"] or "UNKNOWN"),
+            "timeframe": str(row["timeframe"] or parsed.get("timeframe") or "") or None,
+            "side": str(row["side"]) if row["side"] is not None else None,
+            "state": str(row["state"]) if row["state"] is not None else None,
+            "entry_price": _safe_float(row["entry_price"]),
+            "exit_price": _safe_float(row["exit_price"]),
+            "initial_sl": _safe_float(row["initial_sl"]),
+            "final_sl": _safe_float(row["final_sl"]),
+            "current_sl": _safe_float(row["current_sl"]),
+            "exit_reason": str(row["exit_reason"]) if row["exit_reason"] is not None else None,
+            "r_result": _round4(_safe_float(row["r_result"])),
+            "max_gain_r": _round4(_safe_float(row["max_gain_r"])),
+            "max_drawdown_r": _round4(_safe_float(row["max_drawdown_r"])),
+            "bars_in_trade": _safe_int(row["bars_in_trade"]),
+            "duration_minutes": _round4(_safe_float(row["duration_minutes"])),
+            "moved_to_breakeven": bool(_safe_int(row["moved_to_breakeven"])),
+            "breakeven_time": str(row["breakeven_time"]) if row["breakeven_time"] is not None else None,
+            "entry_time": str(row["entry_time"]) if row["entry_time"] is not None else None,
+            "exit_time": str(row["exit_time"]) if row["exit_time"] is not None else None,
+            "updated_at": str(row["updated_at"]) if row["updated_at"] is not None else None,
+            **taxonomy,
+        })
+    return trades
+
+
+def _read_executor_ledger_open_trades(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, object]]:
+    outcome_columns = _table_columns(conn, "executor_outcomes")
+    if not {"state", "action"}.issubset(outcome_columns):
+        return []
+    signal_columns = _table_columns(conn, "signals")
+    can_join_timeframe = {"signal_key", "timeframe"}.issubset(signal_columns)
+    can_join_kind = {"signal_key", "kind"}.issubset(signal_columns)
+    join_sql = "LEFT JOIN signals s ON s.signal_key = eo.signal_key" if (can_join_timeframe or can_join_kind) else ""
+    timeframe_expr = "s.timeframe AS timeframe" if can_join_timeframe else "NULL AS timeframe"
+    kind_expr = "s.kind AS joined_signal_kind" if can_join_kind else "NULL AS joined_signal_kind"
+    select_columns = [
+        _executor_select_expr(outcome_columns, name)
+        for name in (
+            "signal_key", "symbol", "side", "state", "action", "reason", "entry_price", "current_sl",
+            "exit_price", "max_gain_r", "max_drawdown_r", "bars_in_trade", "updated_at", "created_at", "diagnostics_json",
+        )
+    ]
+    select_columns.extend([timeframe_expr, kind_expr])
+    order_expr = "eo.updated_at" if "updated_at" in outcome_columns else "eo.rowid"
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM executor_outcomes eo
+        {join_sql}
+        WHERE UPPER(COALESCE(eo.state, '')) NOT IN ('EXITED', 'TRADE_WATCH')
+          AND UPPER(COALESCE(eo.action, '')) NOT IN ('EXIT', 'WATCH')
+          AND (
+              UPPER(COALESCE(eo.state, '')) IN ('ENTERED', 'PROTECT_BREAKEVEN', 'TRAILING_PROFIT')
+              OR UPPER(COALESCE(eo.action, '')) = 'HOLD'
+          )
+        ORDER BY {order_expr} DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    trades: list[dict[str, object]] = []
+    for row in rows:
+        diagnostics = _safe_json_object(row["diagnostics_json"])
+        taxonomy = _resolve_signal_taxonomy(diagnostics=diagnostics, signal_key=row["signal_key"], joined_kind=row["joined_signal_kind"])
+        parsed = _parse_signal_key_parts(row["signal_key"])
+        trades.append({
+            "signal_key": str(row["signal_key"] or ""),
+            "symbol": str(row["symbol"] or "UNKNOWN"),
+            "timeframe": str(row["timeframe"] or parsed.get("timeframe") or "") or None,
+            "side": str(row["side"]) if row["side"] is not None else None,
+            "state": str(row["state"]) if row["state"] is not None else None,
+            "action": str(row["action"]) if row["action"] is not None else None,
+            "reason": str(row["reason"]) if row["reason"] is not None else None,
+            "entry_price": _safe_float(row["entry_price"]),
+            "current_sl": _safe_float(row["current_sl"]),
+            "exit_price": _safe_float(row["exit_price"]),
+            "max_gain_r": _round4(_safe_float(row["max_gain_r"])),
+            "max_drawdown_r": _round4(_safe_float(row["max_drawdown_r"])),
+            "bars_in_trade": _safe_int(row["bars_in_trade"]),
+            "updated_at": str(row["updated_at"]) if row["updated_at"] is not None else None,
+            "created_at": str(row["created_at"]) if row["created_at"] is not None else None,
+            "executor_entry_time": str(value) if (value := _diagnostic_value(diagnostics, "executor_entry_time", "entry_time")) is not None else None,
+            "executor_initial_sl": _safe_float(_diagnostic_value(diagnostics, "executor_initial_sl", "initial_sl")),
+            "breakeven_time": str(value) if (value := _diagnostic_value(diagnostics, "breakeven_time")) is not None else None,
+            **taxonomy,
+        })
+    return trades
+
+
+def _read_executor_ledger_exit_reasons(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    columns = _table_columns(conn, "executor_trades")
+    if not {"exit_reason", "r_result"}.issubset(columns):
+        return []
+    rows = conn.execute(
+        f"""
+        SELECT
+            COALESCE(exit_reason, 'UNKNOWN') AS exit_reason,
+            COUNT(*) AS total,
+            SUM(CASE WHEN r_result > 0.0000001 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN r_result < -0.0000001 THEN 1 ELSE 0 END) AS losses,
+            SUM(COALESCE(r_result, 0)) AS net_r,
+            AVG(r_result) AS avg_r,
+            AVG({_executor_select_expr(columns, 'max_gain_r', table_alias='et').split(' AS ')[0]}) AS avg_max_gain_r,
+            AVG({_executor_select_expr(columns, 'max_drawdown_r', table_alias='et').split(' AS ')[0]}) AS avg_max_drawdown_r
+        FROM executor_trades et
+        {_closed_trade_where(columns)}
+        GROUP BY COALESCE(exit_reason, 'UNKNOWN')
+        ORDER BY total DESC, exit_reason ASC
+        """
+    ).fetchall()
+    return [
+        {
+            "exit_reason": str(row["exit_reason"] or "UNKNOWN"),
+            "total": int(row["total"] or 0),
+            "wins": int(row["wins"] or 0),
+            "losses": int(row["losses"] or 0),
+            "net_r": _round4(_safe_float(row["net_r"])) or 0.0,
+            "avg_r": _round4(_safe_float(row["avg_r"])) or 0.0,
+            "avg_max_gain_r": _round4(_safe_float(row["avg_max_gain_r"])) or 0.0,
+            "avg_max_drawdown_r": _round4(_safe_float(row["avg_max_drawdown_r"])) or 0.0,
+        }
+        for row in rows
+    ]
 
 
 def _read_executor_active_trades(limit: int = 500) -> ActiveExecutorTradesResponse:
@@ -752,6 +1069,19 @@ def _high_potential_focus_payload(rows: list[sqlite3.Row], profit_payload: dict[
     }
 
 
+def _signals_metric_table_available() -> bool:
+    if not SIGNALS_DB_PATH.exists():
+        return False
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = _table_columns(conn, "signals")
+        required = {"kind", "timeframe", "source", "symbol", "status", "score_last", "score_max", "max_gain_pct", "max_drawdown_pct"}
+        return required.issubset(columns)
+    finally:
+        conn.close()
+
+
 def _read_signal_metric_rows() -> list[sqlite3.Row]:
     if not SIGNALS_DB_PATH.exists():
         return []
@@ -885,21 +1215,27 @@ def create_app() -> FastAPI:
         return _read_executor_active_trades(limit=limit)
 
 
+    @app.get("/api/executor-ledger")
+    async def executor_ledger(limit: Annotated[int, Query(ge=1, le=2000)] = 50):
+        return _read_executor_ledger(limit=limit)
+
+
     @app.get("/api/signal-profit-potential")
     async def signal_profit_potential():
         return _read_profit_potential_payload()
 
     @app.get("/api/signal-kind-groups")
     async def signal_kind_groups():
-        profit_payload = _read_profit_potential_payload()
-        if not SIGNALS_DB_PATH.exists():
+        if not _signals_metric_table_available():
+            profit_payload = _empty_profit_potential_payload()
             return {
                 "groups": [],
                 "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")},
-                "high_potential_focus": _high_potential_focus_payload([], profit_payload),
+                "high_potential_focus": {**_empty_high_potential_focus(), "profit_potential": profit_payload},
                 "profit_potential": profit_payload,
             }
 
+        profit_payload = _read_profit_potential_payload()
         rows = _read_signal_metric_rows()
         grouped: dict[tuple[str, str, str, str, str], dict[str, float | int]] = defaultdict(_signal_kind_group_empty)
         for row in rows:
@@ -942,11 +1278,11 @@ def create_app() -> FastAPI:
 
     @app.get("/api/high-potential-focus")
     async def high_potential_focus():
-        profit_payload = _read_profit_potential_payload()
-        if not SIGNALS_DB_PATH.exists():
+        if not _signals_metric_table_available():
             payload = _empty_high_potential_focus()
-            payload["profit_potential"] = profit_payload
+            payload["profit_potential"] = _empty_profit_potential_payload()
             return payload
+        profit_payload = _read_profit_potential_payload()
         return _high_potential_focus_payload(_read_signal_metric_rows(), profit_payload)
 
     @app.get("/api/setup-performance")

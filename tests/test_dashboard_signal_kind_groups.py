@@ -237,6 +237,24 @@ def test_signal_kind_groups_endpoint_empty_when_db_missing(tmp_path: Path, monke
     assert payload["high_potential_focus"]["profit_potential"]["available"] is False
 
 
+def test_signal_kind_groups_endpoint_empty_when_signals_table_missing(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "signals.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(db_path).close()
+    monkeypatch.setattr(server_module, "SIGNALS_DB_PATH", db_path)
+
+    app = server_module.create_app()
+    with TestClient(app) as client:
+        response = client.get("/api/signal-kind-groups")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["groups"] == []
+    assert payload["focus_groups"] == {"HIGH_POTENTIAL": [], "EXECUTION_STABLE": [], "EXPERIMENTAL": [], "OTHER": []}
+    assert payload["profit_potential"]["available"] is False
+    assert payload["high_potential_focus"]["profit_potential"]["available"] is False
+
+
 def test_high_potential_focus_endpoint_returns_required_kinds_and_recommendations(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "signals.db"
     _init_db(db_path)
