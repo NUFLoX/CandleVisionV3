@@ -72,6 +72,8 @@
         const [executorLedger, setExecutorLedger] = useState({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] });
         const emptyLearningEffectiveness = { summary: {}, windows: [], problem_patterns: [], by_kind: [], by_timeframe: [], by_exit_reason: [], recent_trades: [] };
         const [learningEffectiveness, setLearningEffectiveness] = useState(emptyLearningEffectiveness);
+        const emptyExitSimulator = { summary: {}, rules: [], by_kind: [], by_timeframe: [], trade_simulations: [] };
+        const [exitSimulator, setExitSimulator] = useState(emptyExitSimulator);
         const emptySignalKindGroups = { groups: [], focus_groups: { HIGH_POTENTIAL: [], EXECUTION_STABLE: [], EXPERIMENTAL: [], OTHER: [] }, profit_potential: { available: false, by_kind: {}, key_kinds: [] } };
         const [setupPerf, setSetupPerf] = useState({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] });
         const [signalKindGroups, setSignalKindGroups] = useState(emptySignalKindGroups);
@@ -88,8 +90,15 @@
         const loadActiveExecutorTrades = async () => setActiveExecutorTrades(await api('/api/executor-active-trades?limit=500'));
         const loadExecutorLedger = async () => setExecutorLedger(await api('/api/executor-ledger?limit=50'));
         const loadLearningEffectiveness = async () => setLearningEffectiveness(await api('/api/learning-effectiveness'));
+        const loadExitSimulator = async () => setExitSimulator(await api('/api/executor-exit-simulator'));
         const loadSetupPerformance = async () => setSetupPerf(await api('/api/setup-performance'));
         const loadSignalKindGroups = async () => setSignalKindGroups(await api('/api/signal-kind-groups'));
+        const refreshExitAnalytics = async () => {
+          await Promise.all([
+            loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness)),
+            loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator)),
+          ]);
+        };
         const refreshStats = async () => {
           try {
             const result = await api('/api/signal-outcomes/refresh', { method: 'POST' });
@@ -107,6 +116,7 @@
           loadActiveExecutorTrades().catch(() => setActiveExecutorTrades({ rows: [], summary: {} }));
           loadExecutorLedger().catch(() => setExecutorLedger({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] }));
           loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness));
+          loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator));
           loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] }));
           loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups));
           const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -119,6 +129,7 @@
             loadActiveExecutorTrades().catch(() => setActiveExecutorTrades({ rows: [], summary: {} }));
             loadExecutorLedger().catch(() => setExecutorLedger({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] }));
             loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness));
+            loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator));
           }, 30000);
           const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] })), 30000);
           const kindGroupsTimer = setInterval(() => loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups)), 30000);
@@ -229,7 +240,8 @@
           <ActiveSetupsPanel setups={activeSetups} onRefresh={loadActiveSetups} />
           <ActiveExecutorTradesPanel payload={activeExecutorTrades} onRefresh={loadActiveExecutorTrades} />
           <ExecutorLedgerPanel payload={executorLedger} onRefresh={loadExecutorLedger} />
-          <LearningEffectivenessPanel payload={learningEffectiveness} onRefresh={loadLearningEffectiveness} />
+          <LearningEffectivenessPanel payload={learningEffectiveness} onRefresh={refreshExitAnalytics} />
+          <ExecutorExitSimulatorPanel payload={exitSimulator} onRefresh={refreshExitAnalytics} />
           <SetupPerformancePanel perf={setupPerf} onRefresh={loadSetupPerformance} />
           <SignalIntelligencePanel data={signalKindGroups} onRefresh={loadSignalKindGroups} />
 
@@ -528,6 +540,55 @@
               <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Kind</th><th className="px-3 py-2">Result R</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Giveback R</th><th className="px-3 py-2">BE</th><th className="px-3 py-2">Exit Reason</th><th className="px-3 py-2">Exit Time</th></tr></thead>
               <tbody>{recentTrades.map((trade) => <tr key={trade.trade_key || `${trade.symbol}-${trade.exit_time}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{trade.symbol}</td><td className="px-3 py-2">{trade.timeframe || '-'}</td><td className="px-3 py-2">{trade.signal_kind || '-'}</td><td className={`px-3 py-2 font-semibold ${Number(trade.r_result || 0) > 0 ? 'text-emerald-300' : Number(trade.r_result || 0) < 0 ? 'text-red-300' : 'text-slate-300'}`}>{fmtNum(trade.r_result, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(trade.max_gain_r, 4)}</td><td className="px-3 py-2 text-amber-300">{fmtNum(trade.giveback_r, 4)}</td><td className="px-3 py-2">{trade.moved_to_breakeven ? 'Yes' : 'No'}</td><td className="px-3 py-2">{trade.exit_reason || '-'}</td><td className="px-3 py-2">{fmtDate(trade.exit_time)}</td></tr>)}</tbody>
               {recentTrades.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No recent executor learning trades.</caption>}
+            </LedgerTable>
+          </div>
+        </Card>;
+      }
+
+
+      function ExecutorExitSimulatorPanel({ payload, onRefresh }) {
+        const summary = payload?.summary || {};
+        const rules = payload?.rules || [];
+        const byKind = payload?.by_kind || [];
+        const trades = payload?.trade_simulations || [];
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const fmtPct = (value) => value === null || value === undefined ? '-' : `${(Number(value || 0) * 100).toFixed(1)}%`;
+        const recommendationTone = (value) => value === 'strong_candidate' ? 'text-emerald-300' : value === 'candidate' ? 'text-cyan-300' : value === 'needs_more_data' ? 'text-amber-300' : 'text-slate-300';
+        const cards = [
+          ['Current Net R', fmtNum(summary.current_net_r, 4), Number(summary.current_net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Best Sim Net R', fmtNum(summary.best_simulated_net_r, 4), Number(summary.best_simulated_net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Best Delta R', fmtNum(summary.best_delta_net_r, 4), Number(summary.best_delta_net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Best Rule', summary.best_rule_by_net_r || '-', 'text-cyan-200'],
+          ['Sample Size', summary.total_trades ?? 0, 'text-slate-100'],
+          ['Warning', summary.sample_warning?.warning ? 'Small sample' : 'OK', summary.sample_warning?.warning ? 'text-amber-200' : 'text-emerald-200'],
+        ];
+        return <Card title="Executor Exit What-If Simulator" action={<button onClick={onRefresh} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh simulator</button>}>
+          <div className="space-y-5">
+            <p className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-3 py-2 text-xs font-semibold text-cyan-100">Diagnostic simulation only — does not change live or paper trading.</p>
+            {summary.sample_warning?.warning && <p className="rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs font-semibold text-amber-100">{summary.sample_warning?.message || 'Sample is small; use this as diagnostics only.'}</p>}
+            <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+              {cards.map(([label, value, tone]) => <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
+                <p className={`mt-2 break-words text-xl font-black ${tone}`}>{value}</p>
+              </div>)}
+            </div>
+
+            <LedgerTable title="Simulated Exit Rules">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Rule</th><th className="px-3 py-2">Sim Net R</th><th className="px-3 py-2">Delta R</th><th className="px-3 py-2">Avg R</th><th className="px-3 py-2">Win Rate</th><th className="px-3 py-2">PF</th><th className="px-3 py-2">Prevented SL</th><th className="px-3 py-2">Improved</th><th className="px-3 py-2">Recommendation</th></tr></thead>
+              <tbody>{rules.map((row) => <tr key={row.rule_id} className="border-t border-slate-800"><td className="px-3 py-2"><div className="font-semibold">{row.label || row.rule_id}</div><div className="text-xs text-slate-500">{row.rule_id}</div></td><td className="px-3 py-2">{fmtNum(row.simulated_net_r, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(row.delta_net_r_vs_actual || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.delta_net_r_vs_actual, 4)}</td><td className="px-3 py-2">{fmtNum(row.simulated_avg_r, 4)}</td><td className="px-3 py-2">{fmtPct(row.simulated_win_rate)}</td><td className="px-3 py-2">{fmtNum(row.simulated_profit_factor, 4)}</td><td className="px-3 py-2">{row.prevented_full_losses ?? 0}</td><td className="px-3 py-2">{row.improved_trades ?? 0}</td><td className={`px-3 py-2 font-semibold ${recommendationTone(row.recommendation)}`}>{row.recommendation || '-'}</td></tr>)}</tbody>
+              {rules.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No simulator rules available.</caption>}
+            </LedgerTable>
+
+            <LedgerTable title="Best by Signal Kind">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Kind</th><th className="px-3 py-2">Trades</th><th className="px-3 py-2">Current Net R</th><th className="px-3 py-2">Best Rule</th><th className="px-3 py-2">Best Sim Net R</th><th className="px-3 py-2">Delta R</th><th className="px-3 py-2">Avg Giveback</th></tr></thead>
+              <tbody>{byKind.map((row) => <tr key={row.kind} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.kind}</td><td className="px-3 py-2">{row.total_trades}</td><td className="px-3 py-2">{fmtNum(row.current_net_r, 4)}</td><td className="px-3 py-2">{row.best_rule_id || '-'}</td><td className="px-3 py-2">{fmtNum(row.best_simulated_net_r, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(row.best_delta_net_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.best_delta_net_r, 4)}</td><td className="px-3 py-2 text-amber-300">{fmtNum(row.avg_giveback_r, 4)}</td></tr>)}</tbody>
+              {byKind.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No signal-kind what-if grouping yet.</caption>}
+            </LedgerTable>
+
+            <LedgerTable title="Recent Trade What-If">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Kind</th><th className="px-3 py-2">Actual R</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Giveback</th><th className="px-3 py-2">Best Rule</th><th className="px-3 py-2">Best Sim R</th><th className="px-3 py-2">Delta</th><th className="px-3 py-2">Exit Reason</th></tr></thead>
+              <tbody>{trades.map((trade) => <tr key={`${trade.symbol}-${trade.exit_time}-${trade.best_rule_id_for_trade}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{trade.symbol}</td><td className="px-3 py-2">{trade.timeframe || '-'}</td><td className="px-3 py-2">{trade.signal_kind || '-'}</td><td className={`px-3 py-2 font-semibold ${Number(trade.actual_r || 0) > 0 ? 'text-emerald-300' : Number(trade.actual_r || 0) < 0 ? 'text-red-300' : 'text-slate-300'}`}>{fmtNum(trade.actual_r, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(trade.max_gain_r, 4)}</td><td className="px-3 py-2 text-amber-300">{fmtNum(trade.actual_giveback_r, 4)}</td><td className="px-3 py-2">{trade.best_rule_id_for_trade || '-'}</td><td className="px-3 py-2">{fmtNum(trade.best_simulated_r_for_trade, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(trade.best_delta_r_for_trade || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(trade.best_delta_r_for_trade, 4)}</td><td className="px-3 py-2">{trade.exit_reason || '-'}</td></tr>)}</tbody>
+              {trades.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No recent executor trade simulations.</caption>}
             </LedgerTable>
           </div>
         </Card>;
