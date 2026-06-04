@@ -247,6 +247,7 @@ def test_signal_kind_groups_endpoint_empty_when_signals_table_missing(tmp_path: 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sqlite3.connect(db_path).close()
     monkeypatch.setattr(server_module, "SIGNALS_DB_PATH", db_path)
+    monkeypatch.setattr(server_module, "PROFIT_BACKTEST_DIR", tmp_path / "missing_reports")
 
     app = server_module.create_app()
     with TestClient(app) as client:
@@ -269,6 +270,7 @@ def test_signal_kind_groups_endpoint_empty_when_signals_table_missing(tmp_path: 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sqlite3.connect(db_path).close()
     monkeypatch.setattr(server_module, "SIGNALS_DB_PATH", db_path)
+    monkeypatch.setattr(server_module, "PROFIT_BACKTEST_DIR", tmp_path / "missing_reports")
 
     app = server_module.create_app()
     with TestClient(app) as client:
