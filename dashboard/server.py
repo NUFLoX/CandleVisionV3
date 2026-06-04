@@ -438,6 +438,7 @@ def _parse_signal_key_parts(signal_key: object) -> dict[str, str | None]:
     return {
         "timeframe": parts[2] if len(parts) > 2 and parts[2] else None,
         "kind": parts[3] if len(parts) > 3 and parts[3] else None,
+        "side": parts[4] if len(parts) > 4 and parts[4] else None,
     }
 
 
@@ -500,6 +501,378 @@ def _empty_executor_ledger_payload() -> dict[str, object]:
         "closed_trades": [],
         "exit_reasons": [],
     }
+
+
+def _empty_learning_effectiveness_payload() -> dict[str, object]:
+    return {
+        "summary": {
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "breakeven_or_flat": 0,
+            "win_rate": 0.0,
+            "net_r": 0.0,
+            "avg_r": 0.0,
+            "gross_win_r": 0.0,
+            "gross_loss_r": 0.0,
+            "profit_factor": None,
+            "avg_max_gain_r": 0.0,
+            "avg_max_drawdown_r": 0.0,
+            "total_giveback_r": 0.0,
+            "avg_giveback_r": 0.0,
+            "reached_1r_count": 0,
+            "reached_1r_closed_nonpositive_count": 0,
+            "reached_1r_closed_nonpositive_share": 0.0,
+            "reached_1r_full_sl_count": 0,
+            "breakeven_moves": 0,
+            "breakeven_save_count": 0,
+            "breakeven_save_r": 0.0,
+            "stop_loss_after_profit_count": 0,
+            "learning_status": "insufficient_data",
+        },
+        "windows": [],
+        "giveback": {
+            "total_giveback_r": 0.0,
+            "avg_giveback_r": 0.0,
+            "reached_1r_count": 0,
+            "reached_1r_closed_nonpositive_count": 0,
+            "reached_1r_closed_nonpositive_share": 0.0,
+            "reached_1r_full_sl_count": 0,
+        },
+        "problem_patterns": [],
+        "by_kind": [],
+        "by_timeframe": [],
+        "by_exit_reason": [],
+        "recent_trades": [],
+    }
+
+
+def _learning_order_key(row: dict[str, object]) -> str:
+    return str(row.get("exit_time") or row.get("updated_at") or row.get("entry_time") or "")
+
+
+def _read_learning_closed_trades(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    columns = _table_columns(conn, "executor_trades")
+    if not columns or "r_result" not in columns:
+        return []
+
+    signal_columns = _table_columns(conn, "signals")
+    can_join_signals = "signal_key" in columns and "signal_key" in signal_columns
+    join_sql = "LEFT JOIN signals s ON s.signal_key = et.signal_key" if can_join_signals else ""
+    joined_kind_expr = "s.kind AS joined_signal_kind" if can_join_signals and "kind" in signal_columns else "NULL AS joined_signal_kind"
+    joined_timeframe_expr = "s.timeframe AS joined_signal_timeframe" if can_join_signals and "timeframe" in signal_columns else "NULL AS joined_signal_timeframe"
+    select_columns = [
+        _executor_select_expr(columns, name, table_alias="et")
+        for name in (
+            "trade_key", "signal_key", "symbol", "timeframe", "side", "entry_price", "exit_price",
+            "exit_reason", "r_result", "max_gain_r", "max_drawdown_r", "duration_minutes",
+            "moved_to_breakeven", "entry_time", "exit_time", "updated_at", "diagnostics_json",
+        )
+    ]
+    select_columns.extend([joined_kind_expr, joined_timeframe_expr])
+    order_expr = "et.exit_time" if "exit_time" in columns else ("et.updated_at" if "updated_at" in columns else "et.rowid")
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM executor_trades et
+        {join_sql}
+        {_closed_trade_where(columns)}
+        ORDER BY {order_expr} ASC, et.rowid ASC
+        """
+    ).fetchall()
+
+    trades: list[dict[str, object]] = []
+    for index, row in enumerate(rows):
+        r_result = _safe_float(row["r_result"])
+        if r_result is None:
+            continue
+        diagnostics = _safe_json_object(row["diagnostics_json"])
+        parsed = _parse_signal_key_parts(row["signal_key"])
+        diagnostic_kind = _diagnostic_value(diagnostics, "signal_kind", "kind")
+        kind = diagnostic_kind or parsed.get("kind") or row["joined_signal_kind"] or "UNKNOWN"
+        timeframe = row["timeframe"] or parsed.get("timeframe") or row["joined_signal_timeframe"] or "UNKNOWN"
+        max_gain_r = _safe_float(row["max_gain_r"]) or 0.0
+        max_drawdown_r = _safe_float(row["max_drawdown_r"]) or 0.0
+        giveback_r = max(max_gain_r - r_result, 0.0)
+        trades.append(
+            {
+                "_index": index,
+                "trade_key": str(row["trade_key"] or ""),
+                "signal_key": str(row["signal_key"] or ""),
+                "symbol": str(row["symbol"] or "UNKNOWN"),
+                "timeframe": str(timeframe) if timeframe not in (None, "") else "UNKNOWN",
+                "side": str(row["side"]) if row["side"] is not None else parsed.get("side"),
+                "signal_kind": str(kind or "UNKNOWN"),
+                "entry_price": _safe_float(row["entry_price"]),
+                "exit_price": _safe_float(row["exit_price"]),
+                "r_result": r_result,
+                "max_gain_r": max_gain_r,
+                "max_drawdown_r": max_drawdown_r,
+                "giveback_r": giveback_r,
+                "moved_to_breakeven": _safe_int(row["moved_to_breakeven"]) == 1,
+                "exit_reason": str(row["exit_reason"] or "UNKNOWN"),
+                "duration_minutes": _safe_float(row["duration_minutes"]),
+                "entry_time": str(row["entry_time"]) if row["entry_time"] is not None else None,
+                "exit_time": str(row["exit_time"]) if row["exit_time"] is not None else None,
+                "updated_at": str(row["updated_at"]) if row["updated_at"] is not None else None,
+            }
+        )
+    return trades
+
+
+def _learning_metrics(rows: list[dict[str, object]]) -> dict[str, object]:
+    total = len(rows)
+    r_values = [float(row["r_result"] or 0.0) for row in rows]
+    wins = sum(1 for value in r_values if value > 0.000001)
+    losses = sum(1 for value in r_values if value < -0.000001)
+    flats = total - wins - losses
+    gross_win = sum(value for value in r_values if value > 0)
+    gross_loss = abs(sum(value for value in r_values if value < 0))
+    max_gain_values = [float(row.get("max_gain_r") or 0.0) for row in rows]
+    max_drawdown_values = [float(row.get("max_drawdown_r") or 0.0) for row in rows]
+    givebacks = [float(row.get("giveback_r") or 0.0) for row in rows]
+    reached_1r_rows = [row for row in rows if float(row.get("max_gain_r") or 0.0) >= 1.0]
+    reached_nonpositive = [row for row in reached_1r_rows if float(row.get("r_result") or 0.0) <= 0]
+    breakeven_save_rows = [row for row in rows if row.get("moved_to_breakeven") and float(row.get("r_result") or 0.0) >= 0]
+    return {
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "breakeven_or_flat": flats,
+        "win_rate": _round4(wins / total) if total else 0.0,
+        "net_r": _round4(sum(r_values)) or 0.0,
+        "avg_r": _round4(sum(r_values) / total) if total else 0.0,
+        "gross_win_r": _round4(gross_win) or 0.0,
+        "gross_loss_r": _round4(gross_loss) or 0.0,
+        "profit_factor": _round4(gross_win / gross_loss) if gross_loss > 0 else None,
+        "avg_max_gain_r": _round4(sum(max_gain_values) / total) if total else 0.0,
+        "avg_max_drawdown_r": _round4(sum(max_drawdown_values) / total) if total else 0.0,
+        "total_giveback_r": _round4(sum(givebacks)) or 0.0,
+        "avg_giveback_r": _round4(sum(givebacks) / total) if total else 0.0,
+        "reached_1r_count": len(reached_1r_rows),
+        "reached_1r_closed_nonpositive_count": len(reached_nonpositive),
+        "reached_1r_closed_nonpositive_share": _round4(len(reached_nonpositive) / len(reached_1r_rows)) if reached_1r_rows else 0.0,
+        "reached_1r_full_sl_count": sum(1 for row in reached_1r_rows if float(row.get("r_result") or 0.0) <= -0.9),
+        "breakeven_moves": sum(1 for row in rows if row.get("moved_to_breakeven")),
+        "breakeven_save_count": len(breakeven_save_rows),
+        "breakeven_save_r": _round4(sum(max(float(row.get("r_result") or 0.0), 0.0) for row in breakeven_save_rows)) or 0.0,
+        "stop_loss_after_profit_count": sum(
+            1 for row in rows
+            if "stop_loss" in str(row.get("exit_reason") or "").lower() and float(row.get("max_gain_r") or 0.0) > 0.5
+        ),
+    }
+
+
+def _learning_status(rows: list[dict[str, object]], summary: dict[str, object]) -> str:
+    total = int(summary.get("total_trades") or 0)
+    avg_r = float(summary.get("avg_r") or 0.0)
+    profit_factor = summary.get("profit_factor")
+    pf = float(profit_factor) if profit_factor is not None else None
+    if total < 20:
+        return "insufficient_data"
+    if total >= 50 and avg_r >= 0.1 and pf is not None and pf >= 1.2:
+        return "strong_positive_edge"
+    if total >= 30 and avg_r > 0 and pf is not None and pf > 1:
+        return "positive_edge"
+    if avg_r < 0 and pf is not None and pf < 1:
+        return "negative_edge"
+    if total >= 20:
+        recent = rows[-10:]
+        previous = rows[-20:-10]
+        if previous:
+            recent_avg = sum(float(row.get("r_result") or 0.0) for row in recent) / len(recent)
+            previous_avg = sum(float(row.get("r_result") or 0.0) for row in previous) / len(previous)
+            if recent_avg > previous_avg and float(summary.get("net_r") or 0.0) <= 0:
+                return "improving_watch"
+    return "insufficient_data"
+
+
+def _learning_window(name: str, rows: list[dict[str, object]]) -> dict[str, object]:
+    metrics = _learning_metrics(rows)
+    return {
+        "name": name,
+        "total_trades": metrics["total_trades"],
+        "net_r": metrics["net_r"],
+        "avg_r": metrics["avg_r"],
+        "win_rate": metrics["win_rate"],
+        "profit_factor": metrics["profit_factor"],
+        "avg_giveback_r": metrics["avg_giveback_r"],
+        "reached_1r_closed_nonpositive_count": metrics["reached_1r_closed_nonpositive_count"],
+        "breakeven_moves": metrics["breakeven_moves"],
+        "full_sl_count": sum(1 for row in rows if float(row.get("r_result") or 0.0) <= -0.9),
+    }
+
+
+def _learning_windows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    if not rows:
+        return []
+    half = len(rows) // 2
+    windows = [_learning_window("all_time", rows)]
+    if half > 0:
+        windows.append(_learning_window("first_half", rows[:half]))
+        windows.append(_learning_window("second_half", rows[half:]))
+    for size in (10, 20, 50):
+        if len(rows) >= size:
+            windows.append(_learning_window(f"last_{size}", rows[-size:]))
+    return windows
+
+
+def _learning_group_rows(rows: list[dict[str, object]], key_name: str, output_name: str) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(key_name) or "UNKNOWN")].append(row)
+    output: list[dict[str, object]] = []
+    for key, group in grouped.items():
+        metrics = _learning_metrics(group)
+        output.append(
+            {
+                output_name: key,
+                "total_trades": metrics["total_trades"],
+                "wins": metrics["wins"],
+                "losses": metrics["losses"],
+                "win_rate": metrics["win_rate"],
+                "net_r": metrics["net_r"],
+                "avg_r": metrics["avg_r"],
+                "profit_factor": metrics["profit_factor"],
+                "avg_max_gain_r": metrics["avg_max_gain_r"],
+                "avg_giveback_r": metrics["avg_giveback_r"],
+                "reached_1r_closed_nonpositive_count": metrics["reached_1r_closed_nonpositive_count"],
+            }
+        )
+    return sorted(output, key=lambda row: (-int(row["total_trades"]), str(row[output_name])))
+
+
+def _learning_exit_reason_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get("exit_reason") or "UNKNOWN")].append(row)
+    output: list[dict[str, object]] = []
+    for reason, group in grouped.items():
+        metrics = _learning_metrics(group)
+        output.append(
+            {
+                "exit_reason": reason,
+                "total": metrics["total_trades"],
+                "wins": metrics["wins"],
+                "losses": metrics["losses"],
+                "net_r": metrics["net_r"],
+                "avg_r": metrics["avg_r"],
+                "avg_max_gain_r": metrics["avg_max_gain_r"],
+                "avg_giveback_r": metrics["avg_giveback_r"],
+            }
+        )
+    return sorted(output, key=lambda row: (-int(row["total"]), str(row["exit_reason"])))
+
+
+def _learning_problem_patterns(rows: list[dict[str, object]], summary: dict[str, object], by_exit_reason: list[dict[str, object]]) -> list[dict[str, object]]:
+    patterns: list[dict[str, object]] = []
+    reached_failures = [row for row in rows if float(row.get("max_gain_r") or 0.0) >= 1.0 and float(row.get("r_result") or 0.0) <= 0]
+    if reached_failures:
+        examples = ", ".join(str(row.get("symbol") or "UNKNOWN") for row in reached_failures[:3])
+        patterns.append({
+            "pattern": "large_giveback_after_1r",
+            "severity": "critical" if len(reached_failures) >= 3 else "warning",
+            "count": len(reached_failures),
+            "examples": [
+                {
+                    "symbol": row.get("symbol"),
+                    "timeframe": row.get("timeframe"),
+                    "signal_kind": row.get("signal_kind"),
+                    "r_result": _round4(float(row.get("r_result") or 0.0)),
+                    "max_gain_r": _round4(float(row.get("max_gain_r") or 0.0)),
+                    "giveback_r": _round4(float(row.get("giveback_r") or 0.0)),
+                }
+                for row in reached_failures[:3]
+            ],
+            "description": f"{len(reached_failures)} trades reached at least +1R and closed non-positive. Examples: {examples}.",
+            "suggested_next_step": "Review management diagnostics for these trades before changing any stop or target rules.",
+        })
+    positive = [float(row.get("r_result") or 0.0) for row in rows if float(row.get("r_result") or 0.0) > 0]
+    if positive and (sum(positive) / len(positive)) < 0.25:
+        patterns.append({
+            "pattern": "wins_too_small",
+            "severity": "warning",
+            "count": len(positive),
+            "description": "Average winning trade is below +0.25R.",
+            "suggested_next_step": "Inspect exit reasons and max-gain distribution to see whether winners are being capped too early.",
+        })
+    negative_abs = [abs(float(row.get("r_result") or 0.0)) for row in rows if float(row.get("r_result") or 0.0) < 0]
+    if negative_abs and (sum(negative_abs) / len(negative_abs)) > 0.75:
+        patterns.append({
+            "pattern": "losses_too_large",
+            "severity": "warning",
+            "count": len(negative_abs),
+            "description": "Average losing trade is larger than -0.75R.",
+            "suggested_next_step": "Review whether losses are concentrated in specific kinds, timeframes, or exit reasons.",
+        })
+    if by_exit_reason:
+        top_reason = by_exit_reason[0]
+        if str(top_reason.get("exit_reason") or "").lower() == "exit_stop_loss_hit" and float(summary.get("net_r") or 0.0) < 0:
+            patterns.append({
+                "pattern": "stop_loss_dominates_exits",
+                "severity": "critical",
+                "count": int(top_reason.get("total") or 0),
+                "description": "EXIT_STOP_LOSS_HIT is the most frequent exit reason while net R is negative.",
+                "suggested_next_step": "Investigate signal kinds and timeframes that most often end in stop-loss exits.",
+            })
+    if int(summary.get("total_trades") or 0) < 30:
+        patterns.append({
+            "pattern": "insufficient_executor_sample",
+            "severity": "info",
+            "count": int(summary.get("total_trades") or 0),
+            "description": "Fewer than 30 closed executor trades are available, so edge claims are not statistically stable.",
+            "suggested_next_step": "Keep collecting paper executor outcomes before interpreting profitability as learned edge.",
+        })
+    return patterns
+
+
+def _read_learning_effectiveness() -> dict[str, object]:
+    payload = _empty_learning_effectiveness_payload()
+    if not SIGNALS_DB_PATH.exists():
+        return payload
+
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = _read_learning_closed_trades(conn)
+    except sqlite3.Error:
+        return payload
+    finally:
+        conn.close()
+
+    if not rows:
+        return payload
+
+    summary = _learning_metrics(rows)
+    summary["learning_status"] = _learning_status(rows, summary)
+    by_exit_reason = _learning_exit_reason_rows(rows)
+    payload.update(
+        {
+            "summary": summary,
+            "windows": _learning_windows(rows),
+            "giveback": {
+                "total_giveback_r": summary["total_giveback_r"],
+                "avg_giveback_r": summary["avg_giveback_r"],
+                "reached_1r_count": summary["reached_1r_count"],
+                "reached_1r_closed_nonpositive_count": summary["reached_1r_closed_nonpositive_count"],
+                "reached_1r_closed_nonpositive_share": summary["reached_1r_closed_nonpositive_share"],
+                "reached_1r_full_sl_count": summary["reached_1r_full_sl_count"],
+            },
+            "problem_patterns": _learning_problem_patterns(rows, summary, by_exit_reason),
+            "by_kind": _learning_group_rows(rows, "signal_kind", "kind"),
+            "by_timeframe": _learning_group_rows(rows, "timeframe", "timeframe"),
+            "by_exit_reason": by_exit_reason,
+            "recent_trades": [
+                {
+                    key: (_round4(value) if isinstance(value, float) else value)
+                    for key, value in row.items()
+                    if not key.startswith("_") and key != "updated_at"
+                }
+                for row in sorted(rows, key=_learning_order_key, reverse=True)[:20]
+            ],
+        }
+    )
+    return payload
 
 
 def _closed_trade_where(columns: set[str]) -> str:
@@ -1293,6 +1666,11 @@ def create_app() -> FastAPI:
     @app.get("/api/executor-ledger")
     async def executor_ledger(limit: Annotated[int, Query(ge=1, le=2000)] = 50):
         return _read_executor_ledger(limit=limit)
+
+
+    @app.get("/api/learning-effectiveness")
+    async def learning_effectiveness():
+        return _read_learning_effectiveness()
 
 
     @app.get("/api/signal-profit-potential")
