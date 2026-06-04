@@ -645,6 +645,37 @@ def _read_executor_ledger_closed_trades(conn: sqlite3.Connection, limit: int = 5
     return trades
 
 
+def _executor_breakeven_active(side: object, state: object, entry_price: object, current_sl: object) -> bool:
+    state_text = str(state or "").strip().upper()
+    if state_text in {"PROTECT_BREAKEVEN", "TRAILING_PROFIT"}:
+        return True
+
+    entry = _safe_float(entry_price)
+    stop = _safe_float(current_sl)
+    if entry is None or stop is None:
+        return False
+
+    side_text = str(side or "").strip().upper()
+    if side_text in {"BUY", "LONG"}:
+        return stop >= entry
+    if side_text in {"SELL", "SHORT"}:
+        return stop <= entry
+    return False
+
+
+def _executor_breakeven_display_fields(
+    *, side: object, state: object, entry_price: object, current_sl: object, diagnostics: dict[str, object]
+) -> dict[str, object]:
+    breakeven_time = _diagnostic_value(diagnostics, "breakeven_time")
+    breakeven_active = _executor_breakeven_active(side, state, entry_price, current_sl)
+    has_breakeven_time = breakeven_time not in (None, "")
+    return {
+        "breakeven_active": breakeven_active,
+        "breakeven_display_time": str(breakeven_time) if breakeven_active and has_breakeven_time else None,
+        "stale_breakeven_time": bool(has_breakeven_time and not breakeven_active),
+    }
+
+
 def _read_executor_ledger_open_trades(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, object]]:
     outcome_columns = _table_columns(conn, "executor_outcomes")
     if not {"state", "action"}.issubset(outcome_columns):
@@ -686,16 +717,27 @@ def _read_executor_ledger_open_trades(conn: sqlite3.Connection, limit: int = 50)
         diagnostics = _safe_json_object(row["diagnostics_json"])
         taxonomy = _resolve_signal_taxonomy(diagnostics=diagnostics, signal_key=row["signal_key"], joined_kind=row["joined_signal_kind"])
         parsed = _parse_signal_key_parts(row["signal_key"])
+        side = str(row["side"]) if row["side"] is not None else None
+        state = str(row["state"]) if row["state"] is not None else None
+        entry_price = _safe_float(row["entry_price"])
+        current_sl = _safe_float(row["current_sl"])
+        breakeven_fields = _executor_breakeven_display_fields(
+            side=side,
+            state=state,
+            entry_price=entry_price,
+            current_sl=current_sl,
+            diagnostics=diagnostics,
+        )
         trades.append({
             "signal_key": str(row["signal_key"] or ""),
             "symbol": str(row["symbol"] or "UNKNOWN"),
             "timeframe": str(row["timeframe"] or parsed.get("timeframe") or "") or None,
-            "side": str(row["side"]) if row["side"] is not None else None,
-            "state": str(row["state"]) if row["state"] is not None else None,
+            "side": side,
+            "state": state,
             "action": str(row["action"]) if row["action"] is not None else None,
             "reason": str(row["reason"]) if row["reason"] is not None else None,
-            "entry_price": _safe_float(row["entry_price"]),
-            "current_sl": _safe_float(row["current_sl"]),
+            "entry_price": entry_price,
+            "current_sl": current_sl,
             "exit_price": _safe_float(row["exit_price"]),
             "max_gain_r": _round4(_safe_float(row["max_gain_r"])),
             "max_drawdown_r": _round4(_safe_float(row["max_drawdown_r"])),
@@ -705,6 +747,7 @@ def _read_executor_ledger_open_trades(conn: sqlite3.Connection, limit: int = 50)
             "executor_entry_time": str(value) if (value := _diagnostic_value(diagnostics, "executor_entry_time", "entry_time")) is not None else None,
             "executor_initial_sl": _safe_float(_diagnostic_value(diagnostics, "executor_initial_sl", "initial_sl")),
             "breakeven_time": str(value) if (value := _diagnostic_value(diagnostics, "breakeven_time")) is not None else None,
+            **breakeven_fields,
             **taxonomy,
         })
     return trades
