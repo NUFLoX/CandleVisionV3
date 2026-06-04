@@ -1177,6 +1177,209 @@ def _closed_trade_where(columns: set[str]) -> str:
     return f"WHERE ({' OR '.join(clauses)})" if clauses else ""
 
 
+
+def _empty_executor_exit_shadow_payload() -> dict[str, object]:
+    return {
+        "summary": {
+            "shadow_enabled": os.getenv("EXECUTOR_EXIT_SHADOW_ENABLED", "false").strip().lower() == "true",
+            "shadow_policy": os.getenv("EXECUTOR_EXIT_SHADOW_POLICY", "trailing_40pct_giveback_after_1r").strip() or "trailing_40pct_giveback_after_1r",
+            "open_shadow_count": 0,
+            "triggered_open_count": 0,
+            "closed_with_shadow_count": 0,
+            "shadow_net_r": 0.0,
+            "actual_net_r_for_shadow_trades": 0.0,
+            "shadow_delta_r": 0.0,
+            "avg_shadow_delta_r": None,
+        },
+        "open_shadow_trades": [],
+        "closed_shadow_results": [],
+        "shadow_events": [],
+    }
+
+
+def _read_executor_exit_shadow() -> dict[str, object]:
+    payload = _empty_executor_exit_shadow_payload()
+    if not SIGNALS_DB_PATH.exists():
+        return payload
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        outcome_columns = _table_columns(conn, "executor_outcomes")
+        if outcome_columns:
+            payload["open_shadow_trades"] = _read_executor_exit_shadow_open(conn, outcome_columns)
+        trade_columns = _table_columns(conn, "executor_trades")
+        if trade_columns:
+            payload["closed_shadow_results"] = _read_executor_exit_shadow_closed(conn, trade_columns)
+        event_columns = _table_columns(conn, "trade_lifecycle_events")
+        if event_columns:
+            payload["shadow_events"] = _read_executor_exit_shadow_events(conn, event_columns)
+        open_rows = payload["open_shadow_trades"] if isinstance(payload["open_shadow_trades"], list) else []
+        closed_rows = payload["closed_shadow_results"] if isinstance(payload["closed_shadow_results"], list) else []
+        shadow_values = [value for row in closed_rows if (value := _safe_float(row.get("shadow_exit_r"))) is not None]
+        actual_values = [value for row in closed_rows if (value := _safe_float(row.get("actual_r"))) is not None]
+        delta_values = [value for row in closed_rows if (value := _safe_float(row.get("shadow_delta_r"))) is not None]
+        payload["summary"].update(
+            {
+                "open_shadow_count": len(open_rows),
+                "triggered_open_count": sum(1 for row in open_rows if row.get("exit_shadow_triggered")),
+                "closed_with_shadow_count": len(delta_values),
+                "shadow_net_r": _round4(sum(shadow_values)) or 0.0,
+                "actual_net_r_for_shadow_trades": _round4(sum(actual_values)) or 0.0,
+                "shadow_delta_r": _round4(sum(delta_values)) or 0.0,
+                "avg_shadow_delta_r": _round4(sum(delta_values) / len(delta_values)) if delta_values else None,
+            }
+        )
+        return payload
+    finally:
+        conn.close()
+
+
+def _read_executor_exit_shadow_open(conn: sqlite3.Connection, columns: set[str], limit: int = 100) -> list[dict[str, object]]:
+    if not {"state", "action", "diagnostics_json"}.issubset(columns):
+        return []
+    signal_columns = _table_columns(conn, "signals")
+    can_join_timeframe = {"signal_key", "timeframe"}.issubset(signal_columns)
+    join_sql = "LEFT JOIN signals s ON s.signal_key = eo.signal_key" if can_join_timeframe else ""
+    timeframe_expr = "s.timeframe AS timeframe" if can_join_timeframe else "NULL AS timeframe"
+    select_columns = [
+        _executor_select_expr(columns, name)
+        for name in (
+            "signal_key",
+            "symbol",
+            "side",
+            "state",
+            "entry_price",
+            "current_sl",
+            "max_gain_r",
+            "updated_at",
+            "diagnostics_json",
+        )
+    ]
+    select_columns.append(timeframe_expr)
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM executor_outcomes eo
+        {join_sql}
+        WHERE UPPER(COALESCE(eo.state, '')) != 'EXITED'
+          AND UPPER(COALESCE(eo.action, '')) != 'EXIT'
+        ORDER BY {('eo.updated_at' if 'updated_at' in columns else 'eo.rowid')} DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        diagnostics = _safe_json_object(row["diagnostics_json"])
+        if "exit_shadow_enabled" not in diagnostics and "exit_shadow_policy" not in diagnostics:
+            continue
+        parsed = _parse_signal_key_parts(row["signal_key"])
+        out.append(
+            {
+                "symbol": str(row["symbol"] or "UNKNOWN"),
+                "timeframe": str(row["timeframe"] or parsed.get("timeframe") or "") or None,
+                "side": str(row["side"]) if row["side"] is not None else None,
+                "state": str(row["state"]) if row["state"] is not None else None,
+                "entry_price": _safe_float(row["entry_price"]),
+                "current_sl": _safe_float(row["current_sl"]),
+                "max_gain_r": _round4(_safe_float(row["max_gain_r"])),
+                "exit_shadow_policy": diagnostics.get("exit_shadow_policy"),
+                "exit_shadow_peak_r": _round4(_safe_float(diagnostics.get("exit_shadow_peak_r"))),
+                "exit_shadow_floor_r": _round4(_safe_float(diagnostics.get("exit_shadow_floor_r"))),
+                "exit_shadow_current_r": _round4(_safe_float(diagnostics.get("exit_shadow_current_r"))),
+                "exit_shadow_triggered": bool(diagnostics.get("exit_shadow_triggered")),
+                "exit_shadow_triggered_at": diagnostics.get("exit_shadow_triggered_at"),
+                "updated_at": str(row["updated_at"]) if row["updated_at"] is not None else None,
+            }
+        )
+    return out
+
+
+def _read_executor_exit_shadow_closed(conn: sqlite3.Connection, columns: set[str], limit: int = 100) -> list[dict[str, object]]:
+    if "diagnostics_json" not in columns:
+        return []
+    select_columns = [
+        _executor_select_expr(columns, name, table_alias="et")
+        for name in ("symbol", "timeframe", "side", "r_result", "max_gain_r", "exit_reason", "exit_time", "updated_at", "diagnostics_json")
+    ]
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM executor_trades et
+        {_closed_trade_where(columns)}
+        ORDER BY {('et.exit_time' if 'exit_time' in columns else 'et.rowid')} DESC, et.rowid DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        diagnostics = _safe_json_object(row["diagnostics_json"])
+        if "exit_shadow_exit_r" not in diagnostics and "exit_shadow_delta_r" not in diagnostics:
+            continue
+        out.append(
+            {
+                "symbol": str(row["symbol"] or "UNKNOWN"),
+                "timeframe": str(row["timeframe"] or "") or None,
+                "side": str(row["side"]) if row["side"] is not None else None,
+                "actual_r": _round4(_safe_float(diagnostics.get("exit_shadow_actual_r", row["r_result"]))),
+                "shadow_exit_r": _round4(_safe_float(diagnostics.get("exit_shadow_exit_r"))),
+                "shadow_delta_r": _round4(_safe_float(diagnostics.get("exit_shadow_delta_r"))),
+                "max_gain_r": _round4(_safe_float(row["max_gain_r"])),
+                "exit_reason": str(row["exit_reason"]) if row["exit_reason"] is not None else None,
+                "exit_time": str(row["exit_time"] or row["updated_at"] or "") or None,
+            }
+        )
+    return out
+
+
+def _read_executor_exit_shadow_events(conn: sqlite3.Connection, columns: set[str], limit: int = 100) -> list[dict[str, object]]:
+    if "event_type" not in columns:
+        return []
+    select_columns = [
+        _executor_select_expr(columns, name, table_alias="tle")
+        for name in (
+            "signal_key",
+            "symbol",
+            "timeframe",
+            "side",
+            "event_type",
+            "status",
+            "action",
+            "reason",
+            "price",
+            "created_at",
+            "features_json",
+        )
+    ]
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM trade_lifecycle_events tle
+        WHERE event_type = 'EXECUTOR_SHADOW_EXIT'
+        ORDER BY {('tle.created_at' if 'created_at' in columns else 'tle.rowid')} DESC, tle.rowid DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "signal_key": str(row["signal_key"] or ""),
+            "symbol": str(row["symbol"] or "UNKNOWN"),
+            "timeframe": str(row["timeframe"] or "") or None,
+            "side": str(row["side"]) if row["side"] is not None else None,
+            "event_type": str(row["event_type"] or ""),
+            "status": str(row["status"] or "") or None,
+            "action": str(row["action"] or "") or None,
+            "reason": str(row["reason"] or "") or None,
+            "price": _safe_float(row["price"]),
+            "created_at": str(row["created_at"] or "") or None,
+            "features": _safe_json_object(row["features_json"]),
+        }
+        for row in rows
+    ]
+
+
 def _read_executor_ledger(limit: int = 50) -> dict[str, object]:
     payload = _empty_executor_ledger_payload()
     if not SIGNALS_DB_PATH.exists():
@@ -1969,6 +2172,11 @@ def create_app() -> FastAPI:
     @app.get("/api/executor-exit-simulator")
     async def executor_exit_simulator():
         return _read_executor_exit_simulator()
+
+
+    @app.get("/api/executor-exit-shadow")
+    async def executor_exit_shadow():
+        return _read_executor_exit_shadow()
 
 
     @app.get("/api/signal-profit-potential")
