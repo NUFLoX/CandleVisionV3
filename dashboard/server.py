@@ -146,6 +146,22 @@ def _empty_profit_potential_payload() -> dict[str, object]:
     }
 
 
+def _empty_signal_kind_profit_potential_payload() -> dict[str, object]:
+    payload = _empty_profit_potential_payload()
+    payload["key_kinds"] = []
+    return payload
+
+
+def _empty_signal_kind_groups_payload() -> dict[str, object]:
+    profit_payload = _empty_signal_kind_profit_potential_payload()
+    return {
+        "groups": [],
+        "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")},
+        "high_potential_focus": {**_empty_high_potential_focus(), "profit_potential": profit_payload},
+        "profit_potential": profit_payload,
+    }
+
+
 def _normalize_profit_potential_row(row: dict[str, object]) -> tuple[str, dict[str, float | None]] | None:
     kind = str(row.get("kind") or row.get("signal_kind") or row.get("Signal Kind") or "").strip().upper()
     if not kind:
@@ -1226,14 +1242,10 @@ def create_app() -> FastAPI:
 
     @app.get("/api/signal-kind-groups")
     async def signal_kind_groups():
+        if not SIGNALS_DB_PATH.exists():
+            return _empty_signal_kind_groups_payload()
         if not _signals_metric_table_available():
-            profit_payload = _empty_profit_potential_payload()
-            return {
-                "groups": [],
-                "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")},
-                "high_potential_focus": {**_empty_high_potential_focus(), "profit_potential": profit_payload},
-                "profit_potential": profit_payload,
-            }
+            return _empty_signal_kind_groups_payload()
 
         profit_payload = _read_profit_potential_payload()
         rows = _read_signal_metric_rows()
@@ -1278,10 +1290,15 @@ def create_app() -> FastAPI:
 
     @app.get("/api/high-potential-focus")
     async def high_potential_focus():
+        if not SIGNALS_DB_PATH.exists():
+            payload = _empty_high_potential_focus()
+            payload["profit_potential"] = _empty_signal_kind_profit_potential_payload()
+            return payload
         if not _signals_metric_table_available():
             payload = _empty_high_potential_focus()
-            payload["profit_potential"] = _empty_profit_potential_payload()
+            payload["profit_potential"] = _empty_signal_kind_profit_potential_payload()
             return payload
+
         profit_payload = _read_profit_potential_payload()
         return _high_potential_focus_payload(_read_signal_metric_rows(), profit_payload)
 
