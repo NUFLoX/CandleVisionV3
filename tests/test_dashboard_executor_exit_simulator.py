@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import sys
@@ -14,7 +15,16 @@ if str(ROOT) not in sys.path:
 import dashboard.server as server_module
 
 
+def _disable_dashboard_live_refresh(monkeypatch) -> None:
+    async def idle_refresh_loop(*_args, **_kwargs):
+        while True:
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(server_module, "_live_refresh_loop", idle_refresh_loop)
+
+
 def _client_for_db(db_path: Path, monkeypatch) -> TestClient:
+    _disable_dashboard_live_refresh(monkeypatch)
     monkeypatch.setattr(server_module, "SIGNALS_DB_PATH", db_path)
     return TestClient(server_module.create_app(), raise_server_exceptions=False)
 

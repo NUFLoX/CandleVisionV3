@@ -74,6 +74,8 @@
         const [learningEffectiveness, setLearningEffectiveness] = useState(emptyLearningEffectiveness);
         const emptyExitSimulator = { summary: {}, rules: [], by_kind: [], by_timeframe: [], trade_simulations: [] };
         const [exitSimulator, setExitSimulator] = useState(emptyExitSimulator);
+        const emptyExitShadow = { summary: {}, open_shadow_trades: [], closed_shadow_results: [], shadow_events: [] };
+        const [exitShadow, setExitShadow] = useState(emptyExitShadow);
         const emptySignalKindGroups = { groups: [], focus_groups: { HIGH_POTENTIAL: [], EXECUTION_STABLE: [], EXPERIMENTAL: [], OTHER: [] }, profit_potential: { available: false, by_kind: {}, key_kinds: [] } };
         const [setupPerf, setSetupPerf] = useState({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] });
         const [signalKindGroups, setSignalKindGroups] = useState(emptySignalKindGroups);
@@ -91,12 +93,14 @@
         const loadExecutorLedger = async () => setExecutorLedger(await api('/api/executor-ledger?limit=50'));
         const loadLearningEffectiveness = async () => setLearningEffectiveness(await api('/api/learning-effectiveness'));
         const loadExitSimulator = async () => setExitSimulator(await api('/api/executor-exit-simulator'));
+        const loadExitShadow = async () => setExitShadow(await api('/api/executor-exit-shadow'));
         const loadSetupPerformance = async () => setSetupPerf(await api('/api/setup-performance'));
         const loadSignalKindGroups = async () => setSignalKindGroups(await api('/api/signal-kind-groups'));
         const refreshExitAnalytics = async () => {
           await Promise.all([
             loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness)),
             loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator)),
+            loadExitShadow().catch(() => setExitShadow(emptyExitShadow)),
           ]);
         };
         const refreshStats = async () => {
@@ -117,6 +121,7 @@
           loadExecutorLedger().catch(() => setExecutorLedger({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] }));
           loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness));
           loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator));
+          loadExitShadow().catch(() => setExitShadow(emptyExitShadow));
           loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] }));
           loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups));
           const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -130,6 +135,7 @@
             loadExecutorLedger().catch(() => setExecutorLedger({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] }));
             loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness));
             loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator));
+            loadExitShadow().catch(() => setExitShadow(emptyExitShadow));
           }, 30000);
           const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] })), 30000);
           const kindGroupsTimer = setInterval(() => loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups)), 30000);
@@ -242,6 +248,7 @@
           <ExecutorLedgerPanel payload={executorLedger} onRefresh={loadExecutorLedger} />
           <LearningEffectivenessPanel payload={learningEffectiveness} onRefresh={refreshExitAnalytics} />
           <ExecutorExitSimulatorPanel payload={exitSimulator} onRefresh={refreshExitAnalytics} />
+          <ExecutorExitShadowPanel payload={exitShadow} onRefresh={refreshExitAnalytics} />
           <SetupPerformancePanel perf={setupPerf} onRefresh={loadSetupPerformance} />
           <SignalIntelligencePanel data={signalKindGroups} onRefresh={loadSignalKindGroups} />
 
@@ -589,6 +596,44 @@
               <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Kind</th><th className="px-3 py-2">Actual R</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Giveback</th><th className="px-3 py-2">Best Rule</th><th className="px-3 py-2">Best Sim R</th><th className="px-3 py-2">Delta</th><th className="px-3 py-2">Exit Reason</th></tr></thead>
               <tbody>{trades.map((trade) => <tr key={`${trade.symbol}-${trade.exit_time}-${trade.best_rule_id_for_trade}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{trade.symbol}</td><td className="px-3 py-2">{trade.timeframe || '-'}</td><td className="px-3 py-2">{trade.signal_kind || '-'}</td><td className={`px-3 py-2 font-semibold ${Number(trade.actual_r || 0) > 0 ? 'text-emerald-300' : Number(trade.actual_r || 0) < 0 ? 'text-red-300' : 'text-slate-300'}`}>{fmtNum(trade.actual_r, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(trade.max_gain_r, 4)}</td><td className="px-3 py-2 text-amber-300">{fmtNum(trade.actual_giveback_r, 4)}</td><td className="px-3 py-2">{trade.best_rule_id_for_trade || '-'}</td><td className="px-3 py-2">{fmtNum(trade.best_simulated_r_for_trade, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(trade.best_delta_r_for_trade || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(trade.best_delta_r_for_trade, 4)}</td><td className="px-3 py-2">{trade.exit_reason || '-'}</td></tr>)}</tbody>
               {trades.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No recent executor trade simulations.</caption>}
+            </LedgerTable>
+          </div>
+        </Card>;
+      }
+
+
+      function ExecutorExitShadowPanel({ payload, onRefresh }) {
+        const summary = payload?.summary || {};
+        const openRows = payload?.open_shadow_trades || [];
+        const closedRows = payload?.closed_shadow_results || [];
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const cards = [
+          ['Shadow Enabled', summary.shadow_enabled ? 'ON' : 'OFF', summary.shadow_enabled ? 'text-emerald-200' : 'text-slate-300'],
+          ['Policy', summary.shadow_policy || '-', 'text-cyan-200'],
+          ['Open Shadow', summary.open_shadow_count ?? 0, 'text-slate-100'],
+          ['Triggered', summary.triggered_open_count ?? 0, Number(summary.triggered_open_count || 0) > 0 ? 'text-amber-200' : 'text-slate-100'],
+          ['Shadow Net R', fmtNum(summary.shadow_net_r, 4), Number(summary.shadow_net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Delta R', fmtNum(summary.shadow_delta_r, 4), Number(summary.shadow_delta_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+        ];
+        return <Card title="Executor Exit Shadow Mode" action={<button onClick={onRefresh} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh shadow</button>}>
+          <div className="space-y-5">
+            <p className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-3 py-2 text-xs font-semibold text-cyan-100">Shadow mode only — tracks what the candidate exit policy would do without changing trades.</p>
+            {!summary.shadow_enabled && <p className="rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs font-semibold text-amber-100">Shadow mode is disabled. Set EXECUTOR_EXIT_SHADOW_ENABLED=true to collect live shadow diagnostics.</p>}
+            <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+              {cards.map(([label, value, tone]) => <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
+                <p className={`mt-2 break-words text-xl font-black ${tone}`}>{value}</p>
+              </div>)}
+            </div>
+            <LedgerTable title="Open Shadow Trades">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">State</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Current R</th><th className="px-3 py-2">Shadow Floor</th><th className="px-3 py-2">Triggered</th><th className="px-3 py-2">Updated</th></tr></thead>
+              <tbody>{openRows.map((row, idx) => <tr key={`${row.symbol}-${row.updated_at}-${idx}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.symbol}</td><td className="px-3 py-2">{row.timeframe || '-'}</td><td className="px-3 py-2">{row.state || '-'}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(row.max_gain_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.exit_shadow_current_r, 4)}</td><td className="px-3 py-2 text-amber-300">{fmtNum(row.exit_shadow_floor_r, 4)}</td><td className={`px-3 py-2 font-semibold ${row.exit_shadow_triggered ? 'text-amber-300' : 'text-slate-400'}`}>{row.exit_shadow_triggered ? 'Yes' : 'No'}</td><td className="px-3 py-2">{row.updated_at || '-'}</td></tr>)}</tbody>
+              {openRows.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No open shadow diagnostics yet.</caption>}
+            </LedgerTable>
+            <LedgerTable title="Closed Shadow Results">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Actual R</th><th className="px-3 py-2">Shadow R</th><th className="px-3 py-2">Delta R</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Exit Reason</th><th className="px-3 py-2">Exit Time</th></tr></thead>
+              <tbody>{closedRows.map((row, idx) => <tr key={`${row.symbol}-${row.exit_time}-${idx}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.symbol}</td><td className="px-3 py-2">{row.timeframe || '-'}</td><td className={`px-3 py-2 font-semibold ${Number(row.actual_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.actual_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.shadow_exit_r, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(row.shadow_delta_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.shadow_delta_r, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(row.max_gain_r, 4)}</td><td className="px-3 py-2">{row.exit_reason || '-'}</td><td className="px-3 py-2">{row.exit_time || '-'}</td></tr>)}</tbody>
+              {closedRows.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No closed shadow results yet.</caption>}
             </LedgerTable>
           </div>
         </Card>;

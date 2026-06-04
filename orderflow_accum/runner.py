@@ -21,6 +21,12 @@ from .chart_render import render_signal_chart
 from .signal_logger import RejectionCsvLogger, SignalCsvLogger
 from .signal_store import SignalStore
 from .confirmed_promoter import ConfirmedPromoter
+from .executor_exit_shadow import (
+    DEFAULT_EXIT_SHADOW_POLICY,
+    current_unrealized_r,
+    evaluate_exit_shadow_policy,
+    utc_now_iso,
+)
 from .telegram_notify import TelegramNotifier
 from .trade_learning import TradeLearningEngine
 from .trade_executor import (
@@ -68,6 +74,8 @@ class AccumulationRunner:
             and self.trade_executor_mode == "paper"
         )
         self.trade_executor = SmartTradeExecutor() if self.trade_executor_enabled else None
+        self.executor_exit_shadow_enabled = os.getenv("EXECUTOR_EXIT_SHADOW_ENABLED", "false").strip().lower() == "true"
+        self.executor_exit_shadow_policy = os.getenv("EXECUTOR_EXIT_SHADOW_POLICY", DEFAULT_EXIT_SHADOW_POLICY).strip() or DEFAULT_EXIT_SHADOW_POLICY
         self.trade_learning = TradeLearningEngine(self.signal_store, logger=self.logger)
         self.dashboard = DashboardIngestClient()
         self.promoter = ConfirmedPromoter()
@@ -889,6 +897,14 @@ class AccumulationRunner:
             and diagnostics_json.get("volume_impulse_source") == "missing_default"
         ):
             diagnostics_json["blocker_root_cause"] = "missing_volume_impulse_mapping"
+        self._apply_executor_exit_shadow(
+            signal_key=signal_key,
+            signal=signal,
+            position=position,
+            snapshot=snapshot,
+            diagnostics_json=diagnostics_json,
+            previous_row=previous_row,
+        )
         row = self.signal_store.upsert_executor_decision(
             signal_key=signal_key,
             symbol=str(signal.symbol),
@@ -1038,6 +1054,111 @@ class AccumulationRunner:
         for key, value in snapshot.items():
             if diagnostics.get(key) in (None, ""):
                 diagnostics[key] = value
+
+    @staticmethod
+    def _executor_shadow_snapshot_from_diagnostics(diagnostics: dict[str, object]) -> dict[str, object]:
+        keys = [
+            "exit_shadow_enabled",
+            "exit_shadow_policy",
+            "exit_shadow_peak_r",
+            "exit_shadow_floor_r",
+            "exit_shadow_current_r",
+            "exit_shadow_triggered",
+            "exit_shadow_triggered_at",
+            "exit_shadow_exit_r",
+            "exit_shadow_delta_vs_actual_open_r",
+        ]
+        return {key: diagnostics.get(key) for key in keys if key in diagnostics}
+
+    def _apply_executor_exit_shadow(
+        self,
+        *,
+        signal_key: str,
+        signal,
+        position,
+        snapshot,
+        diagnostics_json: dict[str, object],
+        previous_row,
+    ) -> None:
+        shadow_enabled = bool(getattr(self, "executor_exit_shadow_enabled", False))
+        shadow_policy = str(getattr(self, "executor_exit_shadow_policy", DEFAULT_EXIT_SHADOW_POLICY) or DEFAULT_EXIT_SHADOW_POLICY)
+        diagnostics_json["exit_shadow_enabled"] = shadow_enabled
+        diagnostics_json["exit_shadow_policy"] = shadow_policy
+        if not shadow_enabled or position is None or snapshot is None:
+            return
+
+        previous_diagnostics = {}
+        if previous_row is not None:
+            previous_diagnostics = self._parse_executor_diagnostics(previous_row["diagnostics_json"])
+        entry_price = self._optional_float(diagnostics_json.get("executor_entry_price"))
+        if entry_price is None:
+            entry_price = self._optional_float(getattr(position, "entry_price", None))
+        initial_sl = self._optional_float(diagnostics_json.get("executor_initial_sl"))
+        if initial_sl is None:
+            initial_sl = self._optional_float(getattr(position, "stop_loss", None))
+        current_price = self._optional_float(getattr(snapshot, "price", None))
+        side = str(diagnostics_json.get("executor_side") or getattr(position, "side", ""))
+        if entry_price is None or initial_sl is None or current_price is None:
+            return
+        current_r = current_unrealized_r(
+            side=side,
+            current_price=current_price,
+            entry_price=entry_price,
+            initial_sl=initial_sl,
+        )
+        if current_r is None:
+            return
+
+        evaluation = evaluate_exit_shadow_policy(
+            policy=shadow_policy,
+            previous_peak_r=self._optional_float(previous_diagnostics.get("exit_shadow_peak_r")),
+            observed_max_gain_r=self._optional_float(getattr(position, "max_gain_r", None)),
+            current_r=current_r,
+        )
+        previously_triggered_at = previous_diagnostics.get("exit_shadow_triggered_at")
+        triggered_at = previously_triggered_at
+        first_trigger = bool(evaluation.triggered and not triggered_at)
+        if first_trigger:
+            triggered_at = utc_now_iso()
+
+        diagnostics_json.update(
+            {
+                "exit_shadow_enabled": True,
+                "exit_shadow_policy": evaluation.policy,
+                "exit_shadow_peak_r": evaluation.peak_r,
+                "exit_shadow_floor_r": evaluation.floor_r,
+                "exit_shadow_current_r": evaluation.current_r,
+                "exit_shadow_triggered": bool(evaluation.triggered or previously_triggered_at),
+                "exit_shadow_triggered_at": triggered_at,
+                "exit_shadow_exit_r": self._optional_float(
+                    evaluation.exit_r if evaluation.exit_r is not None else previous_diagnostics.get("exit_shadow_exit_r")
+                ),
+                "exit_shadow_delta_vs_actual_open_r": (
+                    self._optional_float(evaluation.exit_r if evaluation.exit_r is not None else previous_diagnostics.get("exit_shadow_exit_r")) - current_r
+                    if self._optional_float(evaluation.exit_r if evaluation.exit_r is not None else previous_diagnostics.get("exit_shadow_exit_r")) is not None
+                    else None
+                ),
+            }
+        )
+        if first_trigger:
+            self.signal_store.add_trade_lifecycle_event(
+                {
+                    "signal_key": signal_key,
+                    "symbol": str(getattr(signal, "symbol", "UNKNOWN")),
+                    "timeframe": str(getattr(signal, "meta", {}).get("tf") or diagnostics_json.get("executor_timeframe") or ""),
+                    "side": side,
+                    "event_type": "EXECUTOR_SHADOW_EXIT",
+                    "status": "SHADOW_EXIT",
+                    "action": "SHADOW_TRAILING_EXIT",
+                    "reason": "shadow_trailing_40pct_after_1r_triggered",
+                    "price": current_price,
+                    "score": self._optional_float(getattr(signal, "score", None)),
+                    "btc_regime": str(getattr(signal, "meta", {}).get("btc_regime") or "") or None,
+                    "market_regime": str(getattr(signal, "meta", {}).get("market_regime") or "") or None,
+                    "features": self._executor_shadow_snapshot_from_diagnostics(diagnostics_json),
+                    "created_at": triggered_at,
+                }
+            )
 
     def _executor_entry_snapshot_from_lifecycle(self, signal_key: str, exit_time) -> dict[str, object]:
         events = self.signal_store.get_trade_lifecycle_events(signal_key)
@@ -1200,6 +1321,16 @@ class AccumulationRunner:
             entry_action = ENTER_SHORT if str(row["side"]) == "Sell" else ENTER_LONG
             if previous_row is not None and str(previous_row["action"]) in {ENTER_LONG, ENTER_SHORT}:
                 entry_action = str(previous_row["action"])
+
+            shadow_exit_r = self._optional_float(diagnostics_payload.get("exit_shadow_exit_r"))
+            diagnostics_payload["exit_shadow_policy"] = diagnostics_payload.get("exit_shadow_policy")
+            diagnostics_payload["exit_shadow_peak_r"] = self._optional_float(diagnostics_payload.get("exit_shadow_peak_r"))
+            diagnostics_payload["exit_shadow_floor_r"] = self._optional_float(diagnostics_payload.get("exit_shadow_floor_r"))
+            diagnostics_payload["exit_shadow_triggered"] = bool(diagnostics_payload.get("exit_shadow_triggered"))
+            diagnostics_payload["exit_shadow_triggered_at"] = diagnostics_payload.get("exit_shadow_triggered_at")
+            diagnostics_payload["exit_shadow_exit_r"] = shadow_exit_r
+            diagnostics_payload["exit_shadow_actual_r"] = r_result
+            diagnostics_payload["exit_shadow_delta_r"] = (shadow_exit_r - r_result) if shadow_exit_r is not None and r_result is not None else None
 
             self.signal_store.upsert_executor_trade(
                 {
