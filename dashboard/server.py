@@ -558,7 +558,8 @@ def _read_learning_closed_trades(conn: sqlite3.Connection) -> list[dict[str, obj
 
     signal_columns = _table_columns(conn, "signals")
     can_join_signals = "signal_key" in columns and "signal_key" in signal_columns
-    join_sql = "LEFT JOIN signals s ON s.signal_key = et.signal_key" if can_join_signals else ""
+    signals_table = "(SELECT signal_key, MIN(kind) AS kind, MIN(timeframe) AS timeframe FROM signals GROUP BY signal_key)"
+    join_sql = f"LEFT JOIN {signals_table} s ON s.signal_key = et.signal_key" if can_join_signals else ""
     joined_kind_expr = "s.kind AS joined_signal_kind" if can_join_signals and "kind" in signal_columns else "NULL AS joined_signal_kind"
     joined_timeframe_expr = "s.timeframe AS joined_signal_timeframe" if can_join_signals and "timeframe" in signal_columns else "NULL AS joined_signal_timeframe"
     select_columns = [
@@ -825,6 +826,298 @@ def _learning_problem_patterns(rows: list[dict[str, object]], summary: dict[str,
         })
     return patterns
 
+
+EXIT_SIMULATOR_RULES: tuple[dict[str, str], ...] = (
+    {
+        "rule_id": "current_actual",
+        "label": "Current Actual",
+        "description": "Baseline using the executor trade's recorded actual R result.",
+    },
+    {
+        "rule_id": "no_full_loss_after_1r",
+        "label": "No Full Loss After 1R",
+        "description": "If a trade reached +1R and actually closed negative, simulate a flat 0R exit instead.",
+    },
+    {
+        "rule_id": "lock_0_25r_after_1r",
+        "label": "Lock +0.25R After 1R",
+        "description": "If a trade reached +1R, simulate never closing below +0.25R.",
+    },
+    {
+        "rule_id": "lock_0_5r_after_1_5r",
+        "label": "Lock +0.5R After 1.5R",
+        "description": "If a trade reached +1.5R, simulate never closing below +0.5R; if it reached +1R, simulate never closing below flat.",
+    },
+    {
+        "rule_id": "trailing_40pct_giveback_after_1r",
+        "label": "Trail 40% Giveback After 1R",
+        "description": "If a trade reached +1R, simulate retaining 60% of the maximum favorable R excursion.",
+    },
+    {
+        "rule_id": "trailing_50pct_giveback_after_1r",
+        "label": "Trail 50% Giveback After 1R",
+        "description": "If a trade reached +1R, simulate retaining 50% of the maximum favorable R excursion.",
+    },
+    {
+        "rule_id": "take_half_at_1r_rest_actual",
+        "label": "Take Half At 1R",
+        "description": "If a trade reached +1R, simulate half closing at +1R while the other half follows the actual outcome.",
+    },
+    {
+        "rule_id": "conservative_protect_after_0_75r",
+        "label": "Protect After 0.75R",
+        "description": "If a trade reached +0.75R and actually closed negative, simulate a flat 0R exit instead.",
+    },
+)
+
+
+def _empty_exit_simulator_payload() -> dict[str, object]:
+    rules = [
+        {
+            "rule_id": rule["rule_id"],
+            "label": rule["label"],
+            "description": rule["description"],
+            "total_trades": 0,
+            "simulated_net_r": 0.0,
+            "simulated_avg_r": 0.0,
+            "simulated_wins": 0,
+            "simulated_losses": 0,
+            "simulated_win_rate": 0.0,
+            "simulated_profit_factor": None,
+            "delta_net_r_vs_actual": 0.0,
+            "delta_avg_r_vs_actual": 0.0,
+            "prevented_full_losses": 0,
+            "improved_trades": 0,
+            "worsened_trades": 0,
+            "avg_simulated_giveback_r": 0.0,
+            "recommendation": "baseline" if rule["rule_id"] == "current_actual" else "needs_more_data",
+        }
+        for rule in EXIT_SIMULATOR_RULES
+    ]
+    return {
+        "summary": {
+            "total_trades": 0,
+            "current_net_r": 0.0,
+            "current_avg_r": 0.0,
+            "current_profit_factor": None,
+            "current_wins": 0,
+            "current_losses": 0,
+            "current_win_rate": 0.0,
+            "avg_max_gain_r": 0.0,
+            "avg_giveback_r": 0.0,
+            "best_rule_by_net_r": None,
+            "best_rule_by_profit_factor": None,
+            "best_simulated_net_r": 0.0,
+            "best_delta_net_r": 0.0,
+            "sample_warning": {
+                "warning": True,
+                "message": "Sample is small; use this as diagnostics only.",
+            },
+        },
+        "rules": rules,
+        "by_kind": [],
+        "by_timeframe": [],
+        "trade_simulations": [],
+    }
+
+
+def _simulate_exit_rule(rule_id: str, r_result: float, max_gain_r: float) -> float:
+    if rule_id == "current_actual":
+        return r_result
+    if rule_id == "no_full_loss_after_1r":
+        return 0.0 if max_gain_r >= 1.0 and r_result < 0 else r_result
+    if rule_id == "lock_0_25r_after_1r":
+        return max(r_result, 0.25) if max_gain_r >= 1.0 else r_result
+    if rule_id == "lock_0_5r_after_1_5r":
+        if max_gain_r >= 1.5:
+            return max(r_result, 0.5)
+        if max_gain_r >= 1.0:
+            return max(r_result, 0.0)
+        return r_result
+    if rule_id == "trailing_40pct_giveback_after_1r":
+        return max(r_result, max_gain_r * 0.60) if max_gain_r >= 1.0 else r_result
+    if rule_id == "trailing_50pct_giveback_after_1r":
+        return max(r_result, max_gain_r * 0.50) if max_gain_r >= 1.0 else r_result
+    if rule_id == "take_half_at_1r_rest_actual":
+        return 0.5 + (0.5 * r_result) if max_gain_r >= 1.0 else r_result
+    if rule_id == "conservative_protect_after_0_75r":
+        return 0.0 if max_gain_r >= 0.75 and r_result < 0 else r_result
+    return r_result
+
+
+def _exit_simulator_current_metrics(rows: list[dict[str, object]]) -> dict[str, object]:
+    total = len(rows)
+    actual = [float(row.get("r_result") or 0.0) for row in rows]
+    gross_win = sum(value for value in actual if value > 0)
+    gross_loss = abs(sum(value for value in actual if value < 0))
+    wins = sum(1 for value in actual if value > 0.000001)
+    losses = sum(1 for value in actual if value < -0.000001)
+    max_gains = [float(row.get("max_gain_r") or 0.0) for row in rows]
+    givebacks = [max(float(row.get("max_gain_r") or 0.0) - float(row.get("r_result") or 0.0), 0.0) for row in rows]
+    return {
+        "total_trades": total,
+        "current_net_r": _round4(sum(actual)) or 0.0,
+        "current_avg_r": _round4(sum(actual) / total) if total else 0.0,
+        "current_profit_factor": _round4(gross_win / gross_loss) if gross_loss > 0 else None,
+        "current_wins": wins,
+        "current_losses": losses,
+        "current_win_rate": _round4(wins / total) if total else 0.0,
+        "avg_max_gain_r": _round4(sum(max_gains) / total) if total else 0.0,
+        "avg_giveback_r": _round4(sum(givebacks) / total) if total else 0.0,
+    }
+
+
+def _exit_rule_metrics(rule: dict[str, str], rows: list[dict[str, object]], current_net_r: float, current_avg_r: float) -> dict[str, object]:
+    rule_id = rule["rule_id"]
+    total = len(rows)
+    simulated = [_simulate_exit_rule(rule_id, float(row.get("r_result") or 0.0), float(row.get("max_gain_r") or 0.0)) for row in rows]
+    gross_win = sum(value for value in simulated if value > 0)
+    gross_loss = abs(sum(value for value in simulated if value < 0))
+    wins = sum(1 for value in simulated if value > 0.000001)
+    losses = sum(1 for value in simulated if value < -0.000001)
+    net_r = sum(simulated)
+    avg_r = net_r / total if total else 0.0
+    pf = gross_win / gross_loss if gross_loss > 0 else None
+    improved = 0
+    worsened = 0
+    prevented = 0
+    giveback_total = 0.0
+    for row, sim_r in zip(rows, simulated):
+        actual = float(row.get("r_result") or 0.0)
+        max_gain = float(row.get("max_gain_r") or 0.0)
+        if sim_r > actual + 0.000001:
+            improved += 1
+        if sim_r < actual - 0.000001:
+            worsened += 1
+        if actual <= -0.9 and sim_r > actual + 0.000001:
+            prevented += 1
+        giveback_total += max(max_gain - sim_r, 0.0)
+    recommendation = "baseline"
+    if rule_id != "current_actual":
+        if total < 30:
+            recommendation = "needs_more_data"
+        elif net_r > 0 and pf is not None and pf > 1:
+            recommendation = "strong_candidate"
+        elif net_r > current_net_r:
+            recommendation = "candidate"
+        else:
+            recommendation = "diagnostic_only"
+    return {
+        "rule_id": rule_id,
+        "label": rule["label"],
+        "description": rule["description"],
+        "total_trades": total,
+        "simulated_net_r": _round4(net_r) or 0.0,
+        "simulated_avg_r": _round4(avg_r) if total else 0.0,
+        "simulated_wins": wins,
+        "simulated_losses": losses,
+        "simulated_win_rate": _round4(wins / total) if total else 0.0,
+        "simulated_profit_factor": _round4(pf) if pf is not None else None,
+        "delta_net_r_vs_actual": _round4(net_r - current_net_r) or 0.0,
+        "delta_avg_r_vs_actual": _round4(avg_r - current_avg_r) if total else 0.0,
+        "prevented_full_losses": prevented,
+        "improved_trades": improved,
+        "worsened_trades": worsened,
+        "avg_simulated_giveback_r": _round4(giveback_total / total) if total else 0.0,
+        "recommendation": recommendation,
+    }
+
+
+def _exit_simulator_group_rows(rows: list[dict[str, object]], key_name: str, output_name: str) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(key_name) or "UNKNOWN")].append(row)
+    output: list[dict[str, object]] = []
+    for key, group in grouped.items():
+        current = _exit_simulator_current_metrics(group)
+        rule_rows = [_exit_rule_metrics(rule, group, float(current["current_net_r"] or 0.0), float(current["current_avg_r"] or 0.0)) for rule in EXIT_SIMULATOR_RULES]
+        best = max(rule_rows, key=lambda item: (float(item.get("simulated_net_r") or 0.0), str(item.get("rule_id") or ""))) if rule_rows else None
+        output.append({
+            output_name: key,
+            "total_trades": current["total_trades"],
+            "current_net_r": current["current_net_r"],
+            "best_rule_id": best.get("rule_id") if best else None,
+            "best_simulated_net_r": best.get("simulated_net_r") if best else 0.0,
+            "best_delta_net_r": best.get("delta_net_r_vs_actual") if best else 0.0,
+            "avg_giveback_r": current["avg_giveback_r"],
+            "reached_1r_count": sum(1 for row in group if float(row.get("max_gain_r") or 0.0) >= 1.0),
+        })
+    return sorted(output, key=lambda row: (-int(row["total_trades"]), str(row[output_name])))
+
+
+def _exit_simulator_trade_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    output: list[dict[str, object]] = []
+    for row in sorted(rows, key=_learning_order_key, reverse=True)[:50]:
+        actual = float(row.get("r_result") or 0.0)
+        max_gain = float(row.get("max_gain_r") or 0.0)
+        simulations = [(rule["rule_id"], _simulate_exit_rule(rule["rule_id"], actual, max_gain)) for rule in EXIT_SIMULATOR_RULES]
+        best_rule_id, best_r = max(simulations, key=lambda item: (item[1], item[0]))
+        output.append({
+            "symbol": row.get("symbol") or "UNKNOWN",
+            "timeframe": row.get("timeframe") or "UNKNOWN",
+            "signal_kind": row.get("signal_kind") or "UNKNOWN",
+            "side": row.get("side"),
+            "actual_r": _round4(actual) or 0.0,
+            "max_gain_r": _round4(max_gain) or 0.0,
+            "actual_giveback_r": _round4(max(max_gain - actual, 0.0)) or 0.0,
+            "best_rule_id_for_trade": best_rule_id,
+            "best_simulated_r_for_trade": _round4(best_r) or 0.0,
+            "best_delta_r_for_trade": _round4(best_r - actual) or 0.0,
+            "exit_reason": row.get("exit_reason") or "UNKNOWN",
+            "moved_to_breakeven": bool(row.get("moved_to_breakeven")),
+            "exit_time": row.get("exit_time"),
+        })
+    return output
+
+
+def _read_executor_exit_simulator() -> dict[str, object]:
+    payload = _empty_exit_simulator_payload()
+    if not SIGNALS_DB_PATH.exists():
+        return payload
+
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = _read_learning_closed_trades(conn)
+    except sqlite3.Error:
+        return payload
+    finally:
+        conn.close()
+
+    if not rows:
+        return payload
+
+    current = _exit_simulator_current_metrics(rows)
+    current_net = float(current["current_net_r"] or 0.0)
+    current_avg = float(current["current_avg_r"] or 0.0)
+    rules = [_exit_rule_metrics(rule, rows, current_net, current_avg) for rule in EXIT_SIMULATOR_RULES]
+    best_by_net = max(rules, key=lambda item: (float(item.get("simulated_net_r") or 0.0), str(item.get("rule_id") or "")))
+    best_by_pf = max(
+        rules,
+        key=lambda item: (
+            -1.0 if item.get("simulated_profit_factor") is None else float(item.get("simulated_profit_factor") or 0.0),
+            float(item.get("simulated_net_r") or 0.0),
+            str(item.get("rule_id") or ""),
+        ),
+    )
+    payload.update({
+        "summary": {
+            **current,
+            "best_rule_by_net_r": best_by_net.get("rule_id"),
+            "best_rule_by_profit_factor": best_by_pf.get("rule_id"),
+            "best_simulated_net_r": best_by_net.get("simulated_net_r"),
+            "best_delta_net_r": best_by_net.get("delta_net_r_vs_actual"),
+            "sample_warning": {
+                "warning": int(current.get("total_trades") or 0) < 30,
+                "message": "Sample is small; use this as diagnostics only.",
+            },
+        },
+        "rules": rules,
+        "by_kind": _exit_simulator_group_rows(rows, "signal_kind", "kind"),
+        "by_timeframe": _exit_simulator_group_rows(rows, "timeframe", "timeframe"),
+        "trade_simulations": _exit_simulator_trade_rows(rows),
+    })
+    return payload
 
 def _read_learning_effectiveness() -> dict[str, object]:
     payload = _empty_learning_effectiveness_payload()
@@ -1671,6 +1964,11 @@ def create_app() -> FastAPI:
     @app.get("/api/learning-effectiveness")
     async def learning_effectiveness():
         return _read_learning_effectiveness()
+
+
+    @app.get("/api/executor-exit-simulator")
+    async def executor_exit_simulator():
+        return _read_executor_exit_simulator()
 
 
     @app.get("/api/signal-profit-potential")
