@@ -24,3 +24,5 @@ data/*outcome*.json
 data/*outcome*.csv
 data/*runtime*.json
 runtime/
+reports_profit_backtest/*.csv
+reports_profit_backtest/*.json

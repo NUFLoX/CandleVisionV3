@@ -4,6 +4,8 @@ import subprocess
 import sys
 import time
 
+from tools.profit_backtest_report import generate_profit_backtest_report
+
 DEFAULT_POLL_SECONDS = 30
 DEFAULT_LEARNING_EVERY_MINUTES = 60
 DEFAULT_LEARNING_DB = "data\\signals.db"
@@ -13,6 +15,10 @@ DEFAULT_LEARNING_MIN_SAMPLE = 5
 DEFAULT_WATCHLIST_AT = "23:30"
 DEFAULT_WATCHLIST_DB = "data\\signals.db"
 DEFAULT_WATCHLIST_OUT_DIR = "reports_watchlist"
+DEFAULT_PROFIT_BACKTEST_EVERY_MINUTES = 60
+DEFAULT_PROFIT_BACKTEST_DB = "data\\signals.db"
+DEFAULT_PROFIT_BACKTEST_OUT_DIR = "reports_profit_backtest"
+DEFAULT_PROFIT_BACKTEST_STAKE_USD = 10
 
 
 def env_bool(name, default):
@@ -28,6 +34,19 @@ def env_int(name, default, minimum=None):
         return default
     try:
         value = int(raw)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return default
+    return value
+
+
+def env_float(name, default, minimum=None):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
     except ValueError:
         return default
     if minimum is not None and value < minimum:
@@ -102,6 +121,14 @@ def learning_report_command():
     ]
 
 
+def profit_backtest_report_options():
+    return {
+        "db_path": env_text("PROFIT_BACKTEST_DB", DEFAULT_PROFIT_BACKTEST_DB),
+        "out_dir": env_text("PROFIT_BACKTEST_OUT_DIR", DEFAULT_PROFIT_BACKTEST_OUT_DIR),
+        "stake_usd": env_float("PROFIT_BACKTEST_STAKE_USD", DEFAULT_PROFIT_BACKTEST_STAKE_USD, 0),
+    }
+
+
 def watchlist_report_command():
     return [
         sys.executable,
@@ -111,6 +138,18 @@ def watchlist_report_command():
         "--out-dir",
         env_text("WATCHLIST_REPORT_OUT_DIR", DEFAULT_WATCHLIST_OUT_DIR),
     ]
+
+
+def run_profit_backtest_report():
+    print("profit-backtest report started", flush=True)
+    try:
+        options = profit_backtest_report_options()
+        generate_profit_backtest_report(**options)
+    except Exception as exc:
+        print("report failed: profit-backtest " + str(exc), flush=True)
+        return False
+    print("profit-backtest report finished", flush=True)
+    return True
 
 
 def run_report(label, command):
@@ -135,6 +174,10 @@ def scheduler_loop():
     )
     schedule_watchlist = env_bool("SCHEDULE_WATCHLIST_REPORT", True)
     watchlist_at = env_text("WATCHLIST_REPORT_AT", DEFAULT_WATCHLIST_AT)
+    schedule_profit_backtest = env_bool("SCHEDULE_PROFIT_BACKTEST_REPORT", True)
+    profit_backtest_every_minutes = env_int(
+        "PROFIT_BACKTEST_EVERY_MINUTES", DEFAULT_PROFIT_BACKTEST_EVERY_MINUTES, 1
+    )
 
     try:
         parse_hhmm(watchlist_at)
@@ -151,6 +194,7 @@ def scheduler_loop():
     print("scheduler started", flush=True)
     last_learning_run_at = None
     last_watchlist_run_key = None
+    last_profit_backtest_run_at = None
 
     while True:
         now = datetime.datetime.now()
@@ -159,6 +203,12 @@ def scheduler_loop():
         ):
             last_learning_run_at = now
             run_report("learning", learning_report_command())
+
+        if schedule_profit_backtest and learning_report_due(
+            now, last_profit_backtest_run_at, profit_backtest_every_minutes
+        ):
+            last_profit_backtest_run_at = now
+            run_profit_backtest_report()
 
         if schedule_watchlist and watchlist_report_due(
             now, watchlist_at, last_watchlist_run_key
