@@ -224,6 +224,7 @@ def test_signal_kind_groups_endpoint_returns_grouped_stats(tmp_path: Path, monke
 
 def test_signal_kind_groups_endpoint_empty_when_db_missing(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(server_module, "SIGNALS_DB_PATH", tmp_path / "missing.db")
+    monkeypatch.setattr(server_module, "PROFIT_BACKTEST_DIR", tmp_path / "missing_reports")
 
     app = server_module.create_app()
     with TestClient(app) as client:
@@ -235,7 +236,7 @@ def test_signal_kind_groups_endpoint_empty_when_db_missing(tmp_path: Path, monke
     assert payload["focus_groups"] == {"HIGH_POTENTIAL": [], "EXECUTION_STABLE": [], "EXPERIMENTAL": [], "OTHER": []}
     assert payload["profit_potential"]["available"] is False
     assert payload["profit_potential"]["by_kind"] == {}
-    assert payload["profit_potential"]["key_kinds"] == []
+    assert all(row["profit_potential"] is None for row in payload["profit_potential"]["key_kinds"])
     assert payload["high_potential_focus"]["profit_potential"]["available"] is False
 
 
@@ -255,7 +256,7 @@ def test_signal_kind_groups_endpoint_empty_when_signals_table_missing(tmp_path: 
     assert payload["focus_groups"] == {"HIGH_POTENTIAL": [], "EXECUTION_STABLE": [], "EXPERIMENTAL": [], "OTHER": []}
     assert payload["profit_potential"]["available"] is False
     assert payload["profit_potential"]["by_kind"] == {}
-    assert payload["profit_potential"]["key_kinds"] == []
+    assert all(row["profit_potential"] is None for row in payload["profit_potential"]["key_kinds"])
     assert payload["high_potential_focus"]["profit_potential"]["available"] is False
 
 
