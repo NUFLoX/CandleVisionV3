@@ -170,14 +170,15 @@ class SmartTradeExecutor:
             )
             return TradeDecision(EXIT, exit_reason, EXITED, exited)
 
-        if self._should_move_to_breakeven(updated, snapshot):
+        breakeven_reason = self._breakeven_move_reason(updated, snapshot)
+        if breakeven_reason is not None:
             next_state = TRAILING_PROFIT if updated.state == TRAILING_PROFIT else PROTECT_BREAKEVEN
             moved = replace(
                 updated,
                 state=next_state,
                 current_sl=self._breakeven_stop(updated),
             )
-            return TradeDecision(MOVE_SL_TO_BREAKEVEN, "sl_moved_to_breakeven", next_state, moved)
+            return TradeDecision(MOVE_SL_TO_BREAKEVEN, breakeven_reason, next_state, moved)
 
         hold_state = updated.state if updated.state in {ENTERED, PROTECT_BREAKEVEN, TRAILING_PROFIT} else ENTERED
         held = replace(updated, state=hold_state)
@@ -294,10 +295,21 @@ class SmartTradeExecutor:
             bars_in_trade=bars_in_trade,
         )
 
-    def _should_move_to_breakeven(self, position: TradePosition, snapshot: OrderflowSnapshot) -> bool:
+    def _breakeven_move_reason(self, position: TradePosition, snapshot: OrderflowSnapshot) -> Optional[str]:
         if position.state in {PROTECT_BREAKEVEN, TRAILING_PROFIT, EXITED}:
-            return False
+            return None
 
+        if self._should_move_to_breakeven(position, snapshot):
+            return "sl_moved_to_breakeven"
+
+        if position.state == ENTERED and position.max_gain_r >= 1.0:
+            if position.side in {BUY, SELL}:
+                return "sl_moved_to_breakeven_after_max_r"
+            raise ValueError(f"unsupported side: {position.side}")
+
+        return None
+
+    def _should_move_to_breakeven(self, position: TradePosition, snapshot: OrderflowSnapshot) -> bool:
         price = float(snapshot.price)
         target = 0.5 * position.initial_risk
 

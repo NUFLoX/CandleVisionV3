@@ -177,6 +177,86 @@ def test_half_r_confirmation_moves_stop_to_breakeven(tmp_path: Path) -> None:
     runner.signal_store.close()
 
 
+def test_max_gain_r_fallback_moves_long_stop_to_breakeven_when_snapshot_flow_is_weak(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    runner.signal_store.conn.execute(
+        "UPDATE executor_outcomes SET max_gain_r = ? WHERE signal_key = ?",
+        (1.2, key),
+    )
+    runner.signal_store.conn.commit()
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.2, buy_flow=100.0, sell_flow=110.0, volume_impulse=0.5)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    assert row is not None
+    assert row["action"] == "MOVE_SL_TO_BREAKEVEN"
+    assert row["reason"] == "sl_moved_to_breakeven_after_max_r"
+    assert row["state"] == "PROTECT_BREAKEVEN"
+    assert row["current_sl"] > 100.0
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["executor_entry_price"] == 100.0
+    assert diagnostics["executor_initial_sl"] == 99.0
+    assert diagnostics["breakeven_time"]
+    runner.signal_store.close()
+
+
+def test_max_gain_r_below_one_holds_long_when_snapshot_flow_is_weak(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    runner.signal_store.conn.execute(
+        "UPDATE executor_outcomes SET max_gain_r = ? WHERE signal_key = ?",
+        (0.99, key),
+    )
+    runner.signal_store.conn.commit()
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.2, buy_flow=100.0, sell_flow=110.0, volume_impulse=0.5)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    assert row is not None
+    assert row["action"] == "HOLD"
+    assert row["reason"] == "hold_position"
+    assert row["state"] == "ENTERED"
+    assert row["current_sl"] == 99.0
+    runner.signal_store.close()
+
+
+def test_already_protect_breakeven_does_not_duplicate_breakeven_event(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    runner.signal_store.conn.execute(
+        """
+        UPDATE executor_outcomes
+        SET state = ?, action = ?, reason = ?, current_sl = ?, max_gain_r = ?
+        WHERE signal_key = ?
+        """,
+        ("PROTECT_BREAKEVEN", "MOVE_SL_TO_BREAKEVEN", "sl_moved_to_breakeven", 100.1, 1.2, key),
+    )
+    runner.signal_store.conn.commit()
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.2, buy_flow=100.0, sell_flow=110.0, volume_impulse=0.5)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    assert row is not None
+    assert row["action"] == "HOLD"
+    assert row["reason"] == "hold_position"
+    assert row["state"] == "PROTECT_BREAKEVEN"
+    assert row["current_sl"] == 100.1
+    runner.signal_store.close()
+
+
 def test_sell_flow_dominance_exits_long_paper_position(tmp_path: Path) -> None:
     runner = make_runner(tmp_path)
     signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
@@ -478,6 +558,7 @@ def test_refresh_open_position_can_exit_and_write_trade_without_new_signal(tmp_p
     assert len(trades) == 1
     assert trades[0]["signal_key"] == key
     runner.signal_store.close()
+
 
 def test_invalid_short_initial_sl_does_not_calculate_r_result() -> None:
     assert (
