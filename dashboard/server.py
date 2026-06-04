@@ -934,8 +934,12 @@ def _finalize_signal_kind_groups(groups: dict[tuple[str, str, str, str, str], di
     return sorted(rows, key=lambda row: (row.signal_focus_group, row.kind, row.timeframe, row.source))
 
 
-def _empty_high_potential_focus() -> dict[str, object]:
-    return {
+def _empty_focus_groups() -> dict[str, list[object]]:
+    return {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")}
+
+
+def _empty_high_potential_focus(profit_payload: dict[str, object] | None = None) -> dict[str, object]:
+    payload: dict[str, object] = {
         "high_potential_summary": [],
         "by_kind": [],
         "by_timeframe": [],
@@ -943,6 +947,18 @@ def _empty_high_potential_focus() -> dict[str, object]:
         "by_kind_timeframe": [],
         "management_recommendations": [],
         "focus_group_comparison": [],
+    }
+    if profit_payload is not None:
+        payload["profit_potential"] = profit_payload
+    return payload
+
+
+def _empty_signal_kind_groups_payload(profit_payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "groups": [],
+        "focus_groups": _empty_focus_groups(),
+        "high_potential_focus": _empty_high_potential_focus(profit_payload),
+        "profit_potential": profit_payload,
     }
 
 
@@ -1243,23 +1259,10 @@ def create_app() -> FastAPI:
     @app.get("/api/signal-kind-groups")
     async def signal_kind_groups():
         profit_payload = _read_profit_potential_payload()
-
-        if not SIGNALS_DB_PATH.exists():
-            return {
-                "groups": [],
-                "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")},
-                "high_potential_focus": _high_potential_focus_payload([], profit_payload),
-                "profit_potential": profit_payload,
-            }
-
         rows = _read_signal_metric_rows()
+
         if not rows:
-            return {
-                "groups": [],
-                "focus_groups": {group: [] for group in ("HIGH_POTENTIAL", "EXECUTION_STABLE", "EXPERIMENTAL", "OTHER")},
-                "high_potential_focus": _high_potential_focus_payload([], profit_payload),
-                "profit_potential": profit_payload,
-            }
+            return _empty_signal_kind_groups_payload(profit_payload)
         grouped: dict[tuple[str, str, str, str, str], dict[str, float | int]] = defaultdict(_signal_kind_group_empty)
         for row in rows:
             kind = normalize_signal_kind(row["kind"]) or "UNKNOWN"
@@ -1302,16 +1305,10 @@ def create_app() -> FastAPI:
     @app.get("/api/high-potential-focus")
     async def high_potential_focus():
         profit_payload = _read_profit_potential_payload()
-        if not SIGNALS_DB_PATH.exists():
-            payload = _empty_high_potential_focus()
-            payload["profit_potential"] = profit_payload
-            return payload
-
         rows = _read_signal_metric_rows()
+
         if not rows:
-            payload = _empty_high_potential_focus()
-            payload["profit_potential"] = profit_payload
-            return payload
+            return _empty_high_potential_focus(profit_payload)
 
         return _high_potential_focus_payload(rows, profit_payload)
 

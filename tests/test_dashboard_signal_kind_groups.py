@@ -237,6 +237,8 @@ def test_signal_kind_groups_endpoint_empty_when_db_missing(tmp_path: Path, monke
     assert payload["profit_potential"]["available"] is False
     assert payload["profit_potential"]["by_kind"] == {}
     assert all(row["profit_potential"] is None for row in payload["profit_potential"]["key_kinds"])
+    assert payload["high_potential_focus"]["by_kind"] == []
+    assert payload["high_potential_focus"]["high_potential_summary"] == []
     assert payload["high_potential_focus"]["profit_potential"]["available"] is False
 
 
@@ -257,6 +259,8 @@ def test_signal_kind_groups_endpoint_empty_when_signals_table_missing(tmp_path: 
     assert payload["profit_potential"]["available"] is False
     assert payload["profit_potential"]["by_kind"] == {}
     assert all(row["profit_potential"] is None for row in payload["profit_potential"]["key_kinds"])
+    assert payload["high_potential_focus"]["by_kind"] == []
+    assert payload["high_potential_focus"]["high_potential_summary"] == []
     assert payload["high_potential_focus"]["profit_potential"]["available"] is False
 
 
