@@ -649,3 +649,40 @@ def test_run_accumulation_bat_contains_executor_defaults() -> None:
     assert 'set "TRADE_EXECUTOR_MODE=paper"' in text
     assert "echo RUN_TRADE_EXECUTOR=%RUN_TRADE_EXECUTOR%" in text
     assert "echo TRADE_EXECUTOR_MODE=%TRADE_EXECUTOR_MODE%" in text
+
+
+def test_new_executor_entry_diagnostics_do_not_preserve_stale_breakeven_time(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    previous_diagnostics = {
+        "executor_entry_time": "2026-06-02T15:00:00+00:00",
+        "executor_entry_price": 1.0,
+        "executor_initial_sl": 0.95,
+        "executor_side": "Buy",
+        "executor_signal_key": "XLMUSDT|linear|5|PRE_IMPULSE_ZONE|Buy",
+        "executor_timeframe": "5",
+        "breakeven_time": "2026-06-02T15:08:53+00:00",
+    }
+    previous_row = runner.signal_store.upsert_executor_decision(
+        signal_key="XLMUSDT|linear|5|PRE_IMPULSE_ZONE|Buy",
+        symbol="XLMUSDT",
+        side="Buy",
+        state="EXITED",
+        action="EXIT",
+        reason="exit_stop_loss_hit",
+        entry_price=1.0,
+        current_sl=1.0,
+        exit_price=1.0,
+        max_gain_r=1.2,
+        max_drawdown_r=-0.1,
+        bars_in_trade=4,
+        diagnostics_json=previous_diagnostics,
+    )
+    fresh_diagnostics: dict[str, object] = {}
+
+    runner._preserve_executor_entry_diagnostics(fresh_diagnostics, previous_row, preserve_breakeven_time=False)
+
+    assert fresh_diagnostics["executor_entry_time"] == previous_diagnostics["executor_entry_time"]
+    assert fresh_diagnostics["executor_entry_price"] == previous_diagnostics["executor_entry_price"]
+    assert fresh_diagnostics["executor_initial_sl"] == previous_diagnostics["executor_initial_sl"]
+    assert "breakeven_time" not in fresh_diagnostics
+    runner.signal_store.close()

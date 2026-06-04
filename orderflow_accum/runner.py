@@ -868,8 +868,10 @@ class AccumulationRunner:
         if not isinstance(diagnostics_json, dict):
             diagnostics_json = self._parse_executor_diagnostics(diagnostics_json)
             diagnostics["diagnostics_json"] = diagnostics_json
-        self._preserve_executor_entry_diagnostics(diagnostics_json, previous_row)
-        if position is not None and str(decision.action) in {ENTER_LONG, ENTER_SHORT}:
+        is_new_entry = position is not None and str(decision.action) in {ENTER_LONG, ENTER_SHORT}
+        self._preserve_executor_entry_diagnostics(diagnostics_json, previous_row, preserve_breakeven_time=not is_new_entry)
+        if is_new_entry:
+            diagnostics_json.pop("breakeven_time", None)
             diagnostics_json.update(
                 {
                     "executor_entry_time": datetime.now(UTC).isoformat(),
@@ -1003,25 +1005,37 @@ class AccumulationRunner:
         return cls._executor_entry_snapshot_from_diagnostics(diagnostics)
 
     @classmethod
-    def _executor_entry_snapshot_from_diagnostics(cls, diagnostics: dict[str, object]) -> dict[str, object]:
-        return {
-            key: diagnostics.get(key)
-            for key in (
-                "executor_entry_time",
-                "executor_entry_price",
-                "executor_initial_sl",
-                "executor_side",
-                "executor_signal_key",
-                "executor_timeframe",
-                "breakeven_time",
-            )
-            if diagnostics.get(key) not in (None, "")
-        }
+    def _executor_entry_snapshot_from_diagnostics(
+        cls, diagnostics: dict[str, object], *, include_breakeven_time: bool = True
+    ) -> dict[str, object]:
+        keys = [
+            "executor_entry_time",
+            "executor_entry_price",
+            "executor_initial_sl",
+            "executor_side",
+            "executor_signal_key",
+            "executor_timeframe",
+        ]
+        if include_breakeven_time:
+            keys.append("breakeven_time")
+        return {key: diagnostics.get(key) for key in keys if diagnostics.get(key) not in (None, "")}
 
     @classmethod
-    def _preserve_executor_entry_diagnostics(cls, diagnostics: dict[str, object], previous_row) -> None:
+    def _preserve_executor_entry_diagnostics(
+        cls, diagnostics: dict[str, object], previous_row, *, preserve_breakeven_time: bool = True
+    ) -> None:
         """Preserve executor entry snapshot fields across HOLD/BREAKEVEN/EXIT diagnostic rewrites."""
-        for key, value in cls._executor_entry_snapshot_from_row(previous_row).items():
+        if previous_row is None:
+            snapshot = {}
+        else:
+            try:
+                previous_diagnostics = cls._parse_executor_diagnostics(previous_row["diagnostics_json"])
+            except (KeyError, IndexError):
+                previous_diagnostics = {}
+            snapshot = cls._executor_entry_snapshot_from_diagnostics(
+                previous_diagnostics, include_breakeven_time=preserve_breakeven_time
+            )
+        for key, value in snapshot.items():
             if diagnostics.get(key) in (None, ""):
                 diagnostics[key] = value
 

@@ -147,6 +147,41 @@ def _init_ledger_db(path: Path) -> None:
         )
 
 
+
+def _insert_executor_outcome(
+    db_path: Path,
+    *,
+    signal_key: str,
+    symbol: str,
+    side: str = "Buy",
+    state: str = "ENTERED",
+    action: str = "HOLD",
+    entry_price: float = 1.0,
+    current_sl: float = 0.95,
+    max_gain_r: float = 0.0,
+    diagnostics_json: dict | None = None,
+    updated_at: str = "2026-06-04T12:30:00+00:00",
+) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO signals (signal_key, symbol, timeframe, kind) VALUES (?, ?, ?, ?)",
+            (signal_key, symbol, "5", "PRE_IMPULSE_ZONE"),
+        )
+        conn.execute(
+            """
+            INSERT INTO executor_outcomes (
+                signal_key, symbol, side, state, action, reason, entry_price, current_sl, exit_price,
+                max_gain_r, max_drawdown_r, bars_in_trade, updated_at, created_at, diagnostics_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal_key, symbol, side, state, action, "test", entry_price, current_sl, None,
+                max_gain_r, -0.1, 2, updated_at, "2026-06-04T12:00:00+00:00",
+                json.dumps(diagnostics_json or {}),
+            ),
+        )
+
+
 def test_executor_ledger_missing_database_returns_safe_empty_payload(tmp_path: Path, monkeypatch) -> None:
     response = _client_for_db(tmp_path / "missing.db", monkeypatch).get("/api/executor-ledger")
 
@@ -248,3 +283,84 @@ def test_executor_ledger_includes_signal_taxonomy_fields_when_possible(tmp_path:
     assert win["signal_focus_group"]
     assert open_row["signal_kind"] == "ACCUMULATION_WATCH"
     assert open_row["signal_focus_group"]
+
+
+def test_executor_ledger_open_buy_trade_hides_stale_breakeven_time(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "signals.db"
+    _init_ledger_db(db_path)
+    old_breakeven_time = "2026-06-02T15:08:53+00:00"
+    _insert_executor_outcome(
+        db_path,
+        signal_key="XLMUSDT|linear|5|PRE_IMPULSE_ZONE|Buy",
+        symbol="XLMUSDT",
+        state="ENTERED",
+        entry_price=1.0,
+        current_sl=0.95,
+        max_gain_r=0.3933,
+        diagnostics_json={"breakeven_time": old_breakeven_time},
+    )
+
+    payload = _client_for_db(db_path, monkeypatch).get("/api/executor-ledger").json()
+    row = next(row for row in payload["open_trades"] if row["symbol"] == "XLMUSDT")
+
+    assert row["breakeven_time"] == old_breakeven_time
+    assert row["breakeven_active"] is False
+    assert row["breakeven_display_time"] is None
+    assert row["stale_breakeven_time"] is True
+
+
+def test_executor_ledger_open_buy_protect_breakeven_displays_breakeven_time(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "signals.db"
+    _init_ledger_db(db_path)
+    breakeven_time = "2026-06-04T12:05:00+00:00"
+    _insert_executor_outcome(
+        db_path,
+        signal_key="BNBUSDT|linear|5|PRE_IMPULSE_ZONE|Buy",
+        symbol="BNBUSDT",
+        state="PROTECT_BREAKEVEN",
+        entry_price=1.0,
+        current_sl=1.001,
+        diagnostics_json={"breakeven_time": breakeven_time},
+    )
+
+    payload = _client_for_db(db_path, monkeypatch).get("/api/executor-ledger").json()
+    row = next(row for row in payload["open_trades"] if row["symbol"] == "BNBUSDT")
+
+    assert row["breakeven_active"] is True
+    assert row["breakeven_display_time"] == breakeven_time
+    assert row["stale_breakeven_time"] is False
+
+
+def test_executor_ledger_open_buy_entered_with_sl_above_entry_is_breakeven_active(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "signals.db"
+    _init_ledger_db(db_path)
+    _insert_executor_outcome(
+        db_path,
+        signal_key="LINKUSDT|linear|5|PRE_IMPULSE_ZONE|Buy",
+        symbol="LINKUSDT",
+        state="ENTERED",
+        entry_price=1.0,
+        current_sl=1.001,
+        diagnostics_json={},
+    )
+
+    payload = _client_for_db(db_path, monkeypatch).get("/api/executor-ledger").json()
+    row = next(row for row in payload["open_trades"] if row["symbol"] == "LINKUSDT")
+
+    assert row["breakeven_active"] is True
+    assert row["breakeven_display_time"] is None
+    assert row["stale_breakeven_time"] is False
+
+
+def test_executor_ledger_closed_trades_keep_moved_to_breakeven_and_breakeven_time(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "signals.db"
+    _init_ledger_db(db_path)
+
+    payload = _client_for_db(db_path, monkeypatch).get("/api/executor-ledger").json()
+    win = next(row for row in payload["closed_trades"] if row["trade_key"] == "win")
+    loss = next(row for row in payload["closed_trades"] if row["trade_key"] == "loss")
+
+    assert win["moved_to_breakeven"] is True
+    assert win["breakeven_time"] == "2026-06-04T10:20:00+00:00"
+    assert loss["moved_to_breakeven"] is False
+    assert loss["breakeven_time"] is None
