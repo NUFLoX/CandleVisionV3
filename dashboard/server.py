@@ -1298,6 +1298,7 @@ def create_app() -> FastAPI:
             payload = _empty_high_potential_focus()
             payload["profit_potential"] = _empty_signal_kind_profit_potential_payload()
             return payload
+
         profit_payload = _read_profit_potential_payload()
         return _high_potential_focus_payload(_read_signal_metric_rows(), profit_payload)
 
