@@ -24,6 +24,10 @@ SELL = "Sell"
 BTC_BEARISH = "BTC_BEARISH"
 BTC_DUMP_RISK = "BTC_DUMP_RISK"
 
+MANAGEMENT_POLICY_LEGACY = "legacy"
+MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R = "trailing_40pct_giveback_after_1r"
+EXIT_TRAILING_40PCT_GIVEBACK_AFTER_1R = "exit_trailing_40pct_giveback_after_1r"
+
 
 @dataclass(frozen=True)
 class TradeSetup:
@@ -98,6 +102,9 @@ class SmartTradeExecutor:
         sell_fee_buffer_multiplier: float = 0.999,
         support_buffer_multiplier: float = 0.997,
         resistance_buffer_multiplier: float = 1.003,
+        management_policy: str = MANAGEMENT_POLICY_LEGACY,
+        protect_after_1r: bool = False,
+        min_protected_r_after_1r: float = 0.25,
     ) -> None:
         self.min_long_score = min_long_score
         self.max_spread_bps = max_spread_bps
@@ -112,6 +119,9 @@ class SmartTradeExecutor:
         self.sell_fee_buffer_multiplier = sell_fee_buffer_multiplier
         self.support_buffer_multiplier = support_buffer_multiplier
         self.resistance_buffer_multiplier = resistance_buffer_multiplier
+        self.management_policy = str(management_policy or MANAGEMENT_POLICY_LEGACY).strip().lower()
+        self.protect_after_1r = bool(protect_after_1r)
+        self.min_protected_r_after_1r = max(float(min_protected_r_after_1r), 0.0)
 
     def evaluate_entry(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> TradeDecision:
         if setup.side == BUY:
@@ -159,6 +169,15 @@ class SmartTradeExecutor:
             return TradeDecision(HOLD, "position_already_exited", EXITED, position)
 
         updated = self._refresh_position_metrics(position, snapshot)
+        updated, management_exit_reason = self._apply_management_v2(updated, snapshot)
+        if management_exit_reason is not None:
+            exited = replace(
+                updated,
+                state=EXITED,
+                exit_price=float(snapshot.price),
+                exit_reason=management_exit_reason,
+            )
+            return TradeDecision(EXIT, management_exit_reason, EXITED, exited)
 
         exit_reason = self._exit_reason(updated, snapshot)
         if exit_reason is not None:
@@ -294,6 +313,51 @@ class SmartTradeExecutor:
             max_drawdown_r=max(position.max_drawdown_r, drawdown_r),
             bars_in_trade=bars_in_trade,
         )
+
+    def _apply_management_v2(
+        self, position: TradePosition, snapshot: OrderflowSnapshot
+    ) -> tuple[TradePosition, Optional[str]]:
+        if self.management_policy != MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R:
+            return position, None
+
+        if position.max_gain_r < 1.0:
+            return position, None
+
+        protected = self._protect_after_1r_stop(position) if self.protect_after_1r else position
+        current_r = self._current_unrealized_r(
+            protected.side,
+            protected.entry_price,
+            float(snapshot.price),
+            protected.initial_risk,
+        )
+        trailing_floor_r = protected.max_gain_r * 0.60
+        protected_floor_r = max(trailing_floor_r, self.min_protected_r_after_1r)
+
+        if current_r <= protected_floor_r:
+            return replace(protected, state=TRAILING_PROFIT), EXIT_TRAILING_40PCT_GIVEBACK_AFTER_1R
+
+        return replace(protected, state=TRAILING_PROFIT), None
+
+    def _protect_after_1r_stop(self, position: TradePosition) -> TradePosition:
+        if position.side == BUY:
+            protected_sl = position.entry_price + self.min_protected_r_after_1r * position.initial_risk
+            return replace(position, current_sl=max(position.current_sl, protected_sl))
+
+        if position.side == SELL:
+            protected_sl = position.entry_price - self.min_protected_r_after_1r * position.initial_risk
+            return replace(position, current_sl=min(position.current_sl, protected_sl))
+
+        raise ValueError(f"unsupported side: {position.side}")
+
+    @staticmethod
+    def _current_unrealized_r(side: str, entry_price: float, price: float, initial_risk: float) -> float:
+        if initial_risk <= 0:
+            raise ValueError("initial risk must be positive")
+        if side == BUY:
+            return (price - entry_price) / initial_risk
+        if side == SELL:
+            return (entry_price - price) / initial_risk
+        raise ValueError(f"unsupported side: {side}")
 
     def _breakeven_move_reason(self, position: TradePosition, snapshot: OrderflowSnapshot) -> Optional[str]:
         if position.state in {PROTECT_BREAKEVEN, TRAILING_PROFIT, EXITED}:

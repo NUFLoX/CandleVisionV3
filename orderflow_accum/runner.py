@@ -40,6 +40,7 @@ from .trade_executor import (
     WATCH,
     OrderflowSnapshot,
     SmartTradeExecutor,
+    MANAGEMENT_POLICY_LEGACY,
     TradeDecision,
     TradePosition,
     TradeSetup,
@@ -73,7 +74,7 @@ class AccumulationRunner:
             os.getenv("RUN_TRADE_EXECUTOR", "false").strip().lower() == "true"
             and self.trade_executor_mode == "paper"
         )
-        self.trade_executor = SmartTradeExecutor() if self.trade_executor_enabled else None
+        self.trade_executor = self._build_trade_executor() if self.trade_executor_enabled else None
         self.executor_exit_shadow_enabled = os.getenv("EXECUTOR_EXIT_SHADOW_ENABLED", "false").strip().lower() == "true"
         self.executor_exit_shadow_policy = os.getenv("EXECUTOR_EXIT_SHADOW_POLICY", DEFAULT_EXIT_SHADOW_POLICY).strip() or DEFAULT_EXIT_SHADOW_POLICY
         self.trade_learning = TradeLearningEngine(self.signal_store, logger=self.logger)
@@ -91,6 +92,32 @@ class AccumulationRunner:
             "PRE_DUMP_ZONE",
             "CONFIRMED_BREAKDOWN",
         }
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        value = os.getenv(name)
+        if value is None or not value.strip():
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            return default
+
+    def _build_trade_executor(self) -> SmartTradeExecutor:
+        if self.trade_executor_mode != "paper":
+            return SmartTradeExecutor(management_policy=MANAGEMENT_POLICY_LEGACY)
+        return SmartTradeExecutor(
+            management_policy=os.getenv("EXECUTOR_MANAGEMENT_POLICY", MANAGEMENT_POLICY_LEGACY),
+            protect_after_1r=self._env_bool("EXECUTOR_PROTECT_AFTER_1R", False),
+            min_protected_r_after_1r=self._env_float("EXECUTOR_MIN_PROTECTED_R_AFTER_1R", 0.25),
+        )
 
     def _filter_symbols(self, symbols: list[ScanTarget]) -> list[ScanTarget]:
         out: list[ScanTarget] = []

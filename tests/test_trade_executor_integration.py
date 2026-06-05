@@ -642,13 +642,30 @@ def test_executor_state_does_not_overwrite_signal_status_or_outcome(tmp_path: Pa
     runner.signal_store.close()
 
 
+def test_management_v2_only_runs_in_paper_mode(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path, enabled=True, mode="live")
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    assert runner.trade_executor is None
+    assert row_count(runner.signal_store) == 0
+    runner.signal_store.close()
+
+
 def test_run_accumulation_bat_contains_executor_defaults() -> None:
     text = Path("run_accumulation_v1.bat").read_text(encoding="utf-8")
 
     assert 'set "RUN_TRADE_EXECUTOR=true"' in text
     assert 'set "TRADE_EXECUTOR_MODE=paper"' in text
+    assert 'set "EXECUTOR_MANAGEMENT_POLICY=trailing_40pct_giveback_after_1r"' in text
+    assert 'set "EXECUTOR_PROTECT_AFTER_1R=true"' in text
+    assert 'set "EXECUTOR_MIN_PROTECTED_R_AFTER_1R=0.25"' in text
     assert "echo RUN_TRADE_EXECUTOR=%RUN_TRADE_EXECUTOR%" in text
     assert "echo TRADE_EXECUTOR_MODE=%TRADE_EXECUTOR_MODE%" in text
+    assert "echo EXECUTOR_MANAGEMENT_POLICY=%EXECUTOR_MANAGEMENT_POLICY%" in text
+    assert "echo EXECUTOR_PROTECT_AFTER_1R=%EXECUTOR_PROTECT_AFTER_1R%" in text
+    assert "echo EXECUTOR_MIN_PROTECTED_R_AFTER_1R=%EXECUTOR_MIN_PROTECTED_R_AFTER_1R%" in text
 
 
 def test_new_executor_entry_diagnostics_do_not_preserve_stale_breakeven_time(tmp_path: Path) -> None:
