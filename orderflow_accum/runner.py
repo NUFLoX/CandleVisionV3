@@ -72,7 +72,7 @@ class AccumulationRunner:
         self.csv_logger = SignalCsvLogger("accumulation_signals.csv")
         self.rejection_logger = RejectionCsvLogger("rejection_reasons.csv")
         self.signal_store = SignalStore()
-        self.trade_executor_mode = os.getenv("TRADE_EXECUTOR_MODE", "paper").strip().lower()
+        self.trade_executor_mode = self._resolve_trade_executor_mode(settings)
         self.trade_executor_enabled = (
             (os.getenv("RUN_TRADE_EXECUTOR", "false").strip().lower() == "true" and self.trade_executor_mode == "paper")
             or self.trade_executor_mode == "testnet"
@@ -100,6 +100,20 @@ class AccumulationRunner:
             "PRE_DUMP_ZONE",
             "CONFIRMED_BREAKDOWN",
         }
+
+    @staticmethod
+    def _normalize_trade_executor_mode(value: object | None) -> str:
+        mode = str(value or "paper").strip().lower()
+        return mode or "paper"
+
+    @classmethod
+    def _resolve_trade_executor_mode(cls, settings: Settings) -> str:
+        configured_mode = getattr(
+            settings,
+            "trade_executor_mode",
+            os.getenv("TRADE_EXECUTOR_MODE", "paper"),
+        )
+        return cls._normalize_trade_executor_mode(configured_mode)
 
     @staticmethod
     def _env_bool(name: str, default: bool = False) -> bool:
@@ -930,7 +944,8 @@ class AccumulationRunner:
         return f"testnet|{signal_key}"
 
     def _apply_testnet_diagnostics(self, diagnostics_json: dict[str, object], result: dict[str, object] | None) -> None:
-        if self.trade_executor_mode != "testnet":
+        mode = getattr(self, "trade_executor_mode", "paper")
+        if self._normalize_trade_executor_mode(mode) != "testnet":
             return
         result = result or {}
         diagnostics_json.update(
@@ -1060,7 +1075,8 @@ class AccumulationRunner:
             float(row["max_drawdown_r"] or 0.0),
         )
         if str(row["action"]) == EXIT:
-            if self.trade_executor_mode == "testnet":
+            mode = self._normalize_trade_executor_mode(getattr(self, "trade_executor_mode", "paper"))
+            if mode == "testnet":
                 exit_result = self._execute_testnet_exit(signal_key, signal, snapshot)
                 diagnostics_json = self._parse_executor_diagnostics(row["diagnostics_json"])
                 self._apply_testnet_diagnostics(diagnostics_json, exit_result)
