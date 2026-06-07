@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import pandas as pd
 import pytest
 
 from orderflow_accum.models import Signal
@@ -89,7 +90,7 @@ def make_signal(**overrides) -> Signal:
         "take_profit_1": 102.0,
         "take_profit_2": 104.0,
         "reasons": ["long_promotion_rules_met"],
-        "meta": {"tf": "5", "market": "linear", "btc_regime": "BTC_NEUTRAL"},
+        "meta": {"tf": "5", "market": "linear", "btc_regime": "BTC_NEUTRAL", "market_regime": "BTC_NEUTRAL"},
     }
     data.update(overrides)
     return Signal(**data)
@@ -206,6 +207,8 @@ def test_runner_persists_executor_snapshot_diagnostics_and_lifecycle_features(tm
     diagnostics = json.loads(row["diagnostics_json"])
     assert diagnostics["flow_ratio"] == runner.trade_executor.flow_ratio
     assert diagnostics["max_spread_bps"] == runner.trade_executor.max_spread_bps
+    assert diagnostics["btc_regime"] == "BTC_NEUTRAL"
+    assert diagnostics["market_regime"] == "BTC_NEUTRAL"
 
     assert runner.trade_learning.events
     features = runner.trade_learning.events[0]["features"]
@@ -214,6 +217,62 @@ def test_runner_persists_executor_snapshot_diagnostics_and_lifecycle_features(tm
     assert features["required_buy_flow"] == 90.0 * runner.trade_executor.flow_ratio
     runner.signal_store.close()
 
+
+
+def test_market_regime_block_diagnostics_are_persisted(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_DUMP_RISK",
+            "market_regime": "BTC_DUMP_RISK",
+            "executor_snapshot": make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.5),
+        }
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    assert row["action"] == "WATCH"
+    assert row["reason"] == "entry_blocked_market_regime"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["btc_regime"] == "BTC_DUMP_RISK"
+    assert diagnostics["market_regime"] == "BTC_DUMP_RISK"
+    assert diagnostics["market_regime_blocked"] is True
+    assert diagnostics["market_regime_reason"] == "entry_blocked_market_regime"
+    features = runner.trade_learning.events[0]["features"]
+    assert features["btc_regime"] == "BTC_DUMP_RISK"
+    assert features["market_regime"] == "BTC_DUMP_RISK"
+    assert features["market_regime_blocked"] is True
+    runner.signal_store.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_enriches_raw_btc_frames_before_regime_analysis(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    runner.settings.btc_regime_intervals = ["60"]
+
+    class FakeRest:
+        async def fetch_klines(self, symbol: str, *, interval: str, limit: int, category: str):
+            assert symbol == "BTCUSDT"
+            return pd.DataFrame(
+                {
+                    "open": [100, 98, 96, 94, 92],
+                    "high": [101, 99, 97, 95, 93],
+                    "low": [97, 95, 93, 91, 89],
+                    "close": [98, 96, 94, 92, 90],
+                    "volume": [10, 11, 12, 13, 14],
+                    "turnover": [1000, 1050, 1100, 1150, 1200],
+                }
+            )
+
+    frames = await runner._fetch_btc_regime_frames(FakeRest())
+
+    assert "60" in frames
+    assert {"ema_20", "ema_50", "close_pos", "atr_14", "volume_ratio"}.issubset(frames["60"].columns)
+    runner.signal_store.close()
 
 def test_missing_snapshot_diagnostics_do_not_crash_and_store_nulls(tmp_path: Path) -> None:
     runner = make_runner(tmp_path)

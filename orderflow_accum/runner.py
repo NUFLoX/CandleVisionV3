@@ -21,6 +21,7 @@ from .chart_render import render_signal_chart
 from .signal_logger import RejectionCsvLogger, SignalCsvLogger
 from .signal_store import SignalStore
 from .confirmed_promoter import ConfirmedPromoter
+from .indicators import add_indicators
 from .executor_exit_shadow import (
     DEFAULT_EXIT_SHADOW_POLICY,
     current_unrealized_r,
@@ -276,18 +277,7 @@ class AccumulationRunner:
                 },
             )
 
-            btc_frames = {}
-
-            try:
-                for tf in self.settings.btc_regime_intervals:
-                    btc_frames[tf] = await rest.fetch_klines(
-                        "BTCUSDT",
-                        interval=tf,
-                        limit=120,
-                        category="linear",
-                    )
-            except Exception:
-                btc_frames = {}
+            btc_frames = await self._fetch_btc_regime_frames(rest)
 
             regime = self.regime_analyzer.analyze_btc(btc_frames)
 
@@ -309,7 +299,7 @@ class AccumulationRunner:
 
                         for signal in long_signals:
                             signal.score = round(signal.score + float(regime.long_penalty or 0.0), 2)
-                            signal.meta["btc_regime"] = regime.btc_regime
+                            self._apply_market_regime_meta(signal, regime)
 
                         short_signals = []
 
@@ -317,7 +307,7 @@ class AccumulationRunner:
                             short_signals = self.short_engine.analyze(symbol, df, state, regime)
 
                             for signal in short_signals:
-                                signal.meta["btc_regime"] = regime.btc_regime
+                                self._apply_market_regime_meta(signal, regime)
 
                         signals = long_signals + short_signals
 
@@ -348,6 +338,29 @@ class AccumulationRunner:
                 await asyncio.sleep(0.05)
 
             await asyncio.sleep(max(self.settings.realtime_scan_every_seconds, 1))
+
+
+    async def _fetch_btc_regime_frames(self, rest: BybitRestClient) -> dict[str, object]:
+        btc_frames: dict[str, object] = {}
+        try:
+            for tf in self.settings.btc_regime_intervals:
+                btc_df = await rest.fetch_klines(
+                    "BTCUSDT",
+                    interval=tf,
+                    limit=120,
+                    category="linear",
+                )
+                btc_frames[tf] = add_indicators(btc_df) if btc_df is not None and not btc_df.empty else btc_df
+        except Exception:
+            return {}
+        return btc_frames
+
+    @staticmethod
+    def _apply_market_regime_meta(signal, regime) -> None:
+        btc_regime = str(getattr(regime, "btc_regime", "") or "BTC_NEUTRAL")
+        market_regime = str(getattr(regime, "market_regime", "") or btc_regime)
+        signal.meta["btc_regime"] = btc_regime
+        signal.meta["market_regime"] = market_regime
 
     async def _run_macro_scan(self, rest: BybitRestClient, symbols: list[ScanTarget]) -> None:
         self.logger.info("Macro base scan loop started for %s symbols", len(symbols))
@@ -883,8 +896,12 @@ class AccumulationRunner:
             elif diagnostic_volume_impulse is not None:
                 volume_ratio_to_required = diagnostic_volume_impulse / required_volume
 
+        btc_regime = str(meta.get("btc_regime") or "BTC_NEUTRAL")
+        market_regime = str(meta.get("market_regime") or btc_regime)
         diagnostics_json = {
             **thresholds,
+            "btc_regime": btc_regime,
+            "market_regime": market_regime,
             "volume_impulse_source": volume_diagnostics.get("volume_impulse_source"),
             "volume_impulse_missing": bool(volume_diagnostics.get("volume_impulse_missing", False)),
             "volume_impulse_raw": volume_diagnostics.get("volume_impulse_raw"),
@@ -919,6 +936,17 @@ class AccumulationRunner:
             )
         elif str(decision.action) == MOVE_SL_TO_BREAKEVEN and not diagnostics_json.get("breakeven_time"):
             diagnostics_json["breakeven_time"] = datetime.now(UTC).isoformat()
+        if str(decision.reason) == "entry_blocked_market_regime":
+            btc_regime = str(getattr(signal, "meta", {}).get("btc_regime") or "BTC_NEUTRAL")
+            market_regime = str(getattr(signal, "meta", {}).get("market_regime") or btc_regime)
+            diagnostics_json.update(
+                {
+                    "btc_regime": btc_regime,
+                    "market_regime": market_regime,
+                    "market_regime_blocked": True,
+                    "market_regime_reason": "entry_blocked_market_regime",
+                }
+            )
         if (
             str(decision.reason) == "entry_blocked_volume_impulse"
             and diagnostics_json.get("volume_impulse_source") == "missing_default"
@@ -994,6 +1022,10 @@ class AccumulationRunner:
                     "volume_current": diagnostics_json.get("volume_current") if isinstance(diagnostics_json, dict) else None,
                     "volume_impulse_ratio_to_required": diagnostics_json.get("volume_impulse_ratio_to_required") if isinstance(diagnostics_json, dict) else None,
                     "blocker_root_cause": diagnostics_json.get("blocker_root_cause") if isinstance(diagnostics_json, dict) else None,
+                    "btc_regime": diagnostics_json.get("btc_regime") if isinstance(diagnostics_json, dict) else None,
+                    "market_regime": diagnostics_json.get("market_regime") if isinstance(diagnostics_json, dict) else None,
+                    "market_regime_blocked": diagnostics_json.get("market_regime_blocked") if isinstance(diagnostics_json, dict) else None,
+                    "market_regime_reason": diagnostics_json.get("market_regime_reason") if isinstance(diagnostics_json, dict) else None,
                 },
             )
 
@@ -1420,6 +1452,7 @@ class AccumulationRunner:
                 "tf": timeframe,
                 "market": market,
                 "btc_regime": diagnostics.get("btc_regime") or "BTC_NEUTRAL",
+                "market_regime": diagnostics.get("market_regime") or diagnostics.get("btc_regime") or "BTC_NEUTRAL",
             },
         )
 
