@@ -201,6 +201,15 @@ def _position() -> TradePosition:
     )
 
 
+def test_testnet_diagnostics_default_to_paper_when_mode_missing(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    diagnostics = {"existing": True}
+
+    runner._apply_testnet_diagnostics(diagnostics, {"ok": True, "status": "placed", "order_id": "tn-1"})
+
+    assert diagnostics == {"existing": True}
+    runner.signal_store.close()
+
 def test_open_executor_outcome_diagnostics_updated_when_shadow_enabled(tmp_path: Path) -> None:
     runner = make_runner(tmp_path)
     signal = make_signal(meta={"tf": "5", "market": "linear"})

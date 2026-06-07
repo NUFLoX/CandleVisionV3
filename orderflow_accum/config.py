@@ -35,6 +35,9 @@ def _csv_env(name: str, default: str = "") -> list[str]:
 class Settings:
     bybit_testnet: bool = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
     signals_only: bool = os.getenv("SIGNALS_ONLY", "true").lower() == "true"
+    trade_executor_mode: str = field(
+        default_factory=lambda: os.getenv("TRADE_EXECUTOR_MODE", "paper").strip().lower() or "paper"
+    )
     quote_coin: str = os.getenv("ACC_QUOTE_COIN", "USDT").upper()
 
     signal_mode: str = os.getenv("ACC_SIGNAL_MODE", "CONFIRMED_MODE").strip().upper()
