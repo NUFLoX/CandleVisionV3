@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -146,8 +147,41 @@ def test_trailing_40pct_giveback_after_1r(monkeypatch, tmp_path: Path) -> None:
 
     trailing = _rule(payload, "trailing_40pct_giveback_after_1r")
     assert trailing["simulated_net_r"] == 1.2
-    assert payload["trade_simulations"][0]["best_simulated_r_for_trade"] == 1.2
+    assert payload["trade_simulations"][0]["actual_r"] == -1.0
 
+
+@pytest.mark.parametrize(
+    ("max_gain_r", "protected_r"),
+    [
+        (0.99, -1.0),
+        (1.0, 0.5),
+        (1.49, 0.5),
+        (1.5, 1.0),
+        (2.0, 1.5),
+        (3.0, 2.5),
+    ],
+)
+def test_step_lock_0_5r_buffer_after_1r_simulator(max_gain_r: float, protected_r: float) -> None:
+    assert server_module._simulate_exit_rule("step_lock_0_5r_buffer_after_1r", -1.0, max_gain_r) == protected_r
+
+def test_step_lock_0_5r_buffer_after_1r_api_rule(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "signals.db"
+    _init_db(
+        db_path,
+        [
+            ("trade1", "BTCUSDT|linear|5|PRE_IMPULSE_ZONE|Buy", "BTCUSDT", "5", "Buy", "EXITED", "STOP_LOSS", -1.0, 2.0, -1.0, 0, "2026-06-04T10:00:00+00:00", "2026-06-04T10:00:00+00:00", None),
+        ],
+    )
+
+    with _client_for_db(db_path, monkeypatch) as client:
+        payload = client.get("/api/executor-exit-simulator").json()
+
+    step_lock = _rule(payload, "step_lock_0_5r_buffer_after_1r")
+    trailing = _rule(payload, "trailing_40pct_giveback_after_1r")
+    assert step_lock["simulated_net_r"] == 1.5
+    assert trailing["simulated_net_r"] == 1.2
+    assert payload["trade_simulations"][0]["best_rule_id_for_trade"] == "step_lock_0_5r_buffer_after_1r"
+    assert payload["trade_simulations"][0]["best_simulated_r_for_trade"] == 1.5
 
 def test_grouping_by_kind_and_timeframe_works_from_signal_key(monkeypatch, tmp_path: Path) -> None:
     db_path = tmp_path / "signals.db"

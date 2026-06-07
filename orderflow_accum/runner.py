@@ -1093,6 +1093,7 @@ class AccumulationRunner:
             "exit_shadow_triggered",
             "exit_shadow_triggered_at",
             "exit_shadow_exit_r",
+            "exit_shadow_exit_reason",
             "exit_shadow_delta_vs_actual_open_r",
         ]
         return {key: diagnostics.get(key) for key in keys if key in diagnostics}
@@ -1160,6 +1161,7 @@ class AccumulationRunner:
                 "exit_shadow_exit_r": self._optional_float(
                     evaluation.exit_r if evaluation.exit_r is not None else previous_diagnostics.get("exit_shadow_exit_r")
                 ),
+                "exit_shadow_exit_reason": evaluation.exit_reason or previous_diagnostics.get("exit_shadow_exit_reason"),
                 "exit_shadow_delta_vs_actual_open_r": (
                     self._optional_float(evaluation.exit_r if evaluation.exit_r is not None else previous_diagnostics.get("exit_shadow_exit_r")) - current_r
                     if self._optional_float(evaluation.exit_r if evaluation.exit_r is not None else previous_diagnostics.get("exit_shadow_exit_r")) is not None
@@ -1177,7 +1179,7 @@ class AccumulationRunner:
                     "event_type": "EXECUTOR_SHADOW_EXIT",
                     "status": "SHADOW_EXIT",
                     "action": "SHADOW_TRAILING_EXIT",
-                    "reason": "shadow_trailing_40pct_after_1r_triggered",
+                    "reason": evaluation.exit_reason or "shadow_trailing_40pct_after_1r_triggered",
                     "price": current_price,
                     "score": self._optional_float(getattr(signal, "score", None)),
                     "btc_regime": str(getattr(signal, "meta", {}).get("btc_regime") or "") or None,
@@ -1356,6 +1358,7 @@ class AccumulationRunner:
             diagnostics_payload["exit_shadow_triggered"] = bool(diagnostics_payload.get("exit_shadow_triggered"))
             diagnostics_payload["exit_shadow_triggered_at"] = diagnostics_payload.get("exit_shadow_triggered_at")
             diagnostics_payload["exit_shadow_exit_r"] = shadow_exit_r
+            diagnostics_payload["exit_shadow_exit_reason"] = diagnostics_payload.get("exit_shadow_exit_reason")
             diagnostics_payload["exit_shadow_actual_r"] = r_result
             diagnostics_payload["exit_shadow_delta_r"] = (shadow_exit_r - r_result) if shadow_exit_r is not None and r_result is not None else None
 

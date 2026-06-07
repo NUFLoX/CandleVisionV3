@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 
 def _stub_module(name: str, **attrs) -> None:
     module = ModuleType(name)
@@ -41,7 +43,12 @@ _stub_module("orderflow_accum.telegram_notify", TelegramNotifier=_StubService)
 _stub_module("orderflow_accum.ws_clients", MarketStream=_StubService)
 _stub_module("orderflow_accum.chart_render", render_signal_chart=lambda *args, **kwargs: None)
 
-from orderflow_accum.executor_exit_shadow import evaluate_exit_shadow_policy
+from orderflow_accum.executor_exit_shadow import (
+    EXIT_STEP_LOCK_0_5R_BUFFER_AFTER_1R,
+    POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R,
+    current_unrealized_r,
+    evaluate_exit_shadow_policy,
+)
 from orderflow_accum.models import Signal
 from orderflow_accum.runner import AccumulationRunner
 from orderflow_accum.signal_store import SignalStore
@@ -111,6 +118,68 @@ def test_policy_does_not_trigger_below_1r_peak() -> None:
     assert evaluation.floor_r is None
     assert evaluation.triggered is False
     assert evaluation.exit_r is None
+
+
+def test_step_lock_policy_does_nothing_below_1r_peak() -> None:
+    evaluation = evaluate_exit_shadow_policy(
+        policy=POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R,
+        previous_peak_r=0.99,
+        current_r=0.0,
+    )
+
+    assert evaluation.policy == POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R
+    assert evaluation.floor_r is None
+    assert evaluation.triggered is False
+    assert evaluation.exit_r is None
+    assert evaluation.exit_reason is None
+
+@pytest.mark.parametrize(
+    ("max_gain_r", "protected_r"),
+    [
+        (1.0, 0.5),
+        (1.49, 0.5),
+        (1.5, 1.0),
+        (2.0, 1.5),
+        (3.0, 2.5),
+    ],
+)
+def test_step_lock_policy_protects_expected_half_r_steps(max_gain_r: float, protected_r: float) -> None:
+    evaluation = evaluate_exit_shadow_policy(
+        policy=POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R,
+        observed_max_gain_r=max_gain_r,
+        current_r=protected_r + 0.01,
+    )
+
+    assert evaluation.floor_r == protected_r
+    assert evaluation.triggered is False
+    assert evaluation.exit_r is None
+
+@pytest.mark.parametrize("current_r", [1.0, 0.99])
+def test_step_lock_policy_triggers_at_or_below_protected_r(current_r: float) -> None:
+    evaluation = evaluate_exit_shadow_policy(
+        policy=POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R,
+        observed_max_gain_r=1.5,
+        current_r=current_r,
+    )
+
+    assert evaluation.floor_r == 1.0
+    assert evaluation.triggered is True
+    assert evaluation.exit_r == 1.0
+    assert evaluation.exit_reason == EXIT_STEP_LOCK_0_5R_BUFFER_AFTER_1R
+
+def test_step_lock_policy_uses_sell_current_r_space() -> None:
+    current_r = current_unrealized_r(side="Sell", current_price=86.0, entry_price=100.0, initial_sl=110.0)
+    evaluation = evaluate_exit_shadow_policy(
+        policy=POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R,
+        observed_max_gain_r=2.0,
+        current_r=current_r,
+    )
+
+    assert current_r == 1.4
+    assert evaluation.floor_r == 1.5
+    assert evaluation.triggered is True
+    assert evaluation.exit_r == 1.5
+    assert evaluation.exit_reason == EXIT_STEP_LOCK_0_5R_BUFFER_AFTER_1R
 
 
 def _position() -> TradePosition:
