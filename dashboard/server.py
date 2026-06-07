@@ -34,6 +34,10 @@ from .schemas import (
 )
 from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
+from orderflow_accum.executor_exit_shadow import (
+    POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R,
+    step_lock_0_5r_buffer_floor,
+)
 from orderflow_accum.signal_taxonomy import HIGH_POTENTIAL_KINDS, normalize_signal_kind, signal_family, signal_focus_group
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -854,6 +858,11 @@ EXIT_SIMULATOR_RULES: tuple[dict[str, str], ...] = (
         "description": "If a trade reached +1R, simulate retaining 60% of the maximum favorable R excursion.",
     },
     {
+        "rule_id": POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R,
+        "label": "Step Lock 0.5R Buffer After 1R",
+        "description": "After +1R, protect profit at 0.5R step levels while leaving 0.5R breathing room.",
+    },
+    {
         "rule_id": "trailing_50pct_giveback_after_1r",
         "label": "Trail 50% Giveback After 1R",
         "description": "If a trade reached +1R, simulate retaining 50% of the maximum favorable R excursion.",
@@ -936,6 +945,9 @@ def _simulate_exit_rule(rule_id: str, r_result: float, max_gain_r: float) -> flo
         return r_result
     if rule_id == "trailing_40pct_giveback_after_1r":
         return max(r_result, max_gain_r * 0.60) if max_gain_r >= 1.0 else r_result
+    if rule_id == POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R:
+        protected_r = step_lock_0_5r_buffer_floor(max_gain_r)
+        return max(r_result, protected_r) if protected_r is not None else r_result
     if rule_id == "trailing_50pct_giveback_after_1r":
         return max(r_result, max_gain_r * 0.50) if max_gain_r >= 1.0 else r_result
     if rule_id == "take_half_at_1r_rest_actual":
