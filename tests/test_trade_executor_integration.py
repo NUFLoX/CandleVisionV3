@@ -741,3 +741,102 @@ def test_absorption_blocked_entry_is_stored_with_gate_diagnostics(tmp_path: Path
     assert "support" in diagnostics
     assert "resistance" in diagnostics
     runner.signal_store.close()
+
+class _FakeTestnetOrderExecutor:
+    def __init__(self, result: dict | None = None):
+        self.result = result or {"ok": True, "status": "placed", "order_id": "tn-1", "qty": 1.0, "notional_usdt": 100.0}
+        self.entry_calls = 0
+        self.exit_calls = 0
+        self.exit_payloads = []
+
+    def place_entry_order(self, **kwargs):
+        self.entry_calls += 1
+        return dict(self.result)
+
+    def place_exit_order(self, **kwargs):
+        self.exit_calls += 1
+        self.exit_payloads.append(kwargs)
+        return {"ok": True, "status": "placed", "order_id": "exit-1", "qty": 1.0, "notional_usdt": 101.0}
+
+
+def make_testnet_runner(tmp_path: Path, fake_executor: _FakeTestnetOrderExecutor) -> AccumulationRunner:
+    runner = AccumulationRunner.__new__(AccumulationRunner)
+    runner.settings = DummySettings()
+    runner.logger = logging.getLogger("test.testnet_executor")
+    runner.signal_store = SignalStore(db_path=str(tmp_path / "signals.db"))
+    runner.trade_executor_mode = "testnet"
+    runner.trade_executor_enabled = True
+    runner.trade_executor = SmartTradeExecutor()
+    runner.testnet_order_executor = fake_executor
+    runner.executor_exit_shadow_enabled = False
+    runner.trade_learning = None
+    return runner
+
+
+def test_testnet_mode_places_order_and_records_diagnostics(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert fake.entry_calls == 1
+    assert row["action"] == "ENTER_LONG"
+    assert diagnostics["trade_executor_mode"] == "testnet"
+    assert diagnostics["testnet_order_attempted"] is True
+    assert diagnostics["testnet_order_status"] == "placed"
+    assert diagnostics["testnet_order_id"] == "tn-1"
+    runner.signal_store.close()
+
+
+def test_non_testnet_mode_does_not_call_testnet_order_executor(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    fake = _FakeTestnetOrderExecutor()
+    runner.testnet_order_executor = fake
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    assert fake.entry_calls == 0
+    runner.signal_store.close()
+
+
+def test_testnet_entry_block_keeps_watch_state(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor({"ok": False, "status": "blocked", "reason": "entry_blocked_insufficient_testnet_balance"})
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row["action"] == "WATCH"
+    assert row["state"] == "TRADE_WATCH"
+    assert row["reason"] == "entry_blocked_insufficient_testnet_balance"
+    assert diagnostics["testnet_order_status"] == "blocked"
+    assert diagnostics["testnet_blocked_reason"] == "entry_blocked_insufficient_testnet_balance"
+    runner.signal_store.close()
+
+
+def test_testnet_exit_uses_reduce_only_executor_path(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=98.8, buy_flow=50.0, sell_flow=200.0, volume_impulse=1.6)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row["action"] == "EXIT"
+    assert fake.exit_calls == 1
+    assert fake.exit_payloads[0]["signal_key"] == key
+    assert diagnostics["testnet_order_status"] == "placed"
+    assert diagnostics["testnet_order_id"] == "exit-1"
+    runner.signal_store.close()

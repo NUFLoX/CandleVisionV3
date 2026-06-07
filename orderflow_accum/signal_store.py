@@ -175,6 +175,7 @@ class SignalStore:
         self.ensure_executor_trade_schema()
         self.ensure_trade_learning_schema()
         self.ensure_trade_diagnosis_schema()
+        self.ensure_testnet_order_schema()
 
         if user_version < self.SCHEMA_VERSION:
             cur.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
@@ -632,6 +633,142 @@ class SignalStore:
             """
         )
         self.conn.commit()
+
+
+    def ensure_testnet_order_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS testnet_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_key TEXT NOT NULL,
+                trade_key TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                category TEXT NOT NULL,
+                side TEXT NOT NULL,
+                order_type TEXT NOT NULL,
+                qty REAL,
+                notional_usdt REAL,
+                price REAL,
+                order_id TEXT,
+                order_link_id TEXT,
+                status TEXT NOT NULL,
+                reason TEXT,
+                request_json TEXT,
+                response_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_testnet_orders_signal_key ON testnet_orders(signal_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_testnet_orders_trade_key ON testnet_orders(trade_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_testnet_orders_status ON testnet_orders(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_testnet_orders_created_at ON testnet_orders(created_at)")
+        self.conn.commit()
+
+    def insert_testnet_order(self, order: dict[str, Any]) -> dict[str, Any]:
+        self.ensure_testnet_order_schema()
+        now = _utc_now()
+        created_at = str(order.get("created_at") or now)
+        updated_at = str(order.get("updated_at") or now)
+        request_json = order.get("request_json")
+        response_json = order.get("response_json")
+        if not isinstance(request_json, str):
+            request_json = self._json_dumps_safe(request_json or {})
+        if not isinstance(response_json, str):
+            response_json = self._json_dumps_safe(response_json or {})
+        cur = self.conn.execute(
+            """
+            INSERT INTO testnet_orders (
+                signal_key, trade_key, symbol, category, side, order_type, qty, notional_usdt, price,
+                order_id, order_link_id, status, reason, request_json, response_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(order.get("signal_key") or ""),
+                str(order.get("trade_key") or ""),
+                str(order.get("symbol") or ""),
+                str(order.get("category") or "linear"),
+                str(order.get("side") or ""),
+                str(order.get("order_type") or "Market"),
+                self._optional_float(order.get("qty")),
+                self._optional_float(order.get("notional_usdt")),
+                self._optional_float(order.get("price")),
+                self._optional_text(order.get("order_id")),
+                self._optional_text(order.get("order_link_id")),
+                str(order.get("status") or "blocked"),
+                self._optional_text(order.get("reason")),
+                request_json,
+                response_json,
+                created_at,
+                updated_at,
+            ),
+        )
+        self.conn.commit()
+        row = self.conn.execute("SELECT * FROM testnet_orders WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row) if row is not None else {}
+
+    def get_testnet_order_by_signal(self, signal_key: str) -> dict[str, Any] | None:
+        self.ensure_testnet_order_schema()
+        row = self.conn.execute(
+            "SELECT * FROM testnet_orders WHERE signal_key = ? AND status IN ('placed', 'filled') ORDER BY id DESC LIMIT 1",
+            (signal_key,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_latest_open_testnet_order(self, signal_key: str) -> dict[str, Any] | None:
+        self.ensure_testnet_order_schema()
+        row = self.conn.execute(
+            """
+            SELECT * FROM testnet_orders
+            WHERE signal_key = ? AND side = 'Buy' AND status IN ('placed', 'filled')
+              AND NOT EXISTS (
+                  SELECT 1 FROM testnet_orders closes
+                  WHERE closes.signal_key = testnet_orders.signal_key
+                    AND closes.side = 'Sell'
+                    AND closes.status IN ('placed', 'filled')
+                    AND closes.created_at >= testnet_orders.created_at
+              )
+            ORDER BY id DESC LIMIT 1
+            """,
+            (signal_key,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def count_open_testnet_positions(self) -> int:
+        self.ensure_testnet_order_schema()
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) FROM testnet_orders entries
+            WHERE entries.side = 'Buy' AND entries.status IN ('placed', 'filled')
+              AND NOT EXISTS (
+                  SELECT 1 FROM testnet_orders closes
+                  WHERE closes.signal_key = entries.signal_key
+                    AND closes.side = 'Sell'
+                    AND closes.status IN ('placed', 'filled')
+                    AND closes.created_at >= entries.created_at
+              )
+            """
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def count_testnet_orders_since(self, iso_since: str) -> int:
+        self.ensure_testnet_order_schema()
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM testnet_orders WHERE status IN ('placed', 'filled') AND created_at >= ?",
+            (iso_since,),
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def list_testnet_orders(self, limit: int = 100) -> list[dict[str, Any]]:
+        self.ensure_testnet_order_schema()
+        rows = self.conn.execute(
+            "SELECT * FROM testnet_orders ORDER BY created_at DESC, id DESC LIMIT ?",
+            (max(1, int(limit or 100)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def ensure_trade_diagnosis_schema(self) -> None:
         cur = self.conn.cursor()

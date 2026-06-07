@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from dashboard.ingest_client import DashboardIngestClient
 
 from .bybit_rest import BybitRestClient, ScanTarget
+from .bybit_testnet_executor import BybitTestnetOrderExecutor
 from .config import Settings
 from .console_ui import ConsoleUI
 from .engines import MacroAccumulationEngine, RealtimeAccumulationEngine
@@ -73,10 +74,15 @@ class AccumulationRunner:
         self.signal_store = SignalStore()
         self.trade_executor_mode = os.getenv("TRADE_EXECUTOR_MODE", "paper").strip().lower()
         self.trade_executor_enabled = (
-            os.getenv("RUN_TRADE_EXECUTOR", "false").strip().lower() == "true"
-            and self.trade_executor_mode == "paper"
+            (os.getenv("RUN_TRADE_EXECUTOR", "false").strip().lower() == "true" and self.trade_executor_mode == "paper")
+            or self.trade_executor_mode == "testnet"
         )
         self.trade_executor = self._build_trade_executor() if self.trade_executor_enabled else None
+        self.testnet_order_executor = (
+            BybitTestnetOrderExecutor(self.signal_store, notifier=self.telegram, logger_=self.logger)
+            if self.trade_executor_mode == "testnet"
+            else None
+        )
         self.executor_exit_shadow_enabled = os.getenv("EXECUTOR_EXIT_SHADOW_ENABLED", "false").strip().lower() == "true"
         self.executor_exit_shadow_policy = os.getenv("EXECUTOR_EXIT_SHADOW_POLICY", DEFAULT_EXIT_SHADOW_POLICY).strip() or DEFAULT_EXIT_SHADOW_POLICY
         self.trade_learning = TradeLearningEngine(self.signal_store, logger=self.logger)
@@ -918,7 +924,61 @@ class AccumulationRunner:
         values["diagnostics_json"] = diagnostics_json
         return values
 
-    def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None, snapshot=None, setup=None):
+
+    @staticmethod
+    def _testnet_trade_key(signal_key: str) -> str:
+        return f"testnet|{signal_key}"
+
+    def _apply_testnet_diagnostics(self, diagnostics_json: dict[str, object], result: dict[str, object] | None) -> None:
+        if self.trade_executor_mode != "testnet":
+            return
+        result = result or {}
+        diagnostics_json.update(
+            {
+                "trade_executor_mode": "testnet",
+                "testnet_order_attempted": bool(result.get("status") in {"placed", "failed"}),
+                "testnet_order_status": result.get("status") or "not_attempted",
+                "testnet_order_id": result.get("order_id"),
+                "notional_usdt": self._optional_float(result.get("notional_usdt")),
+                "qty": self._optional_float(result.get("qty")),
+                "testnet_blocked_reason": result.get("reason") if not result.get("ok") else None,
+            }
+        )
+
+    def _execute_testnet_entry(self, signal_key: str, signal, snapshot: OrderflowSnapshot) -> dict[str, object]:
+        executor = getattr(self, "testnet_order_executor", None)
+        if executor is None:
+            return {"ok": False, "status": "blocked", "reason": "entry_blocked_testnet_executor_missing"}
+        return executor.place_entry_order(
+            signal_key=signal_key,
+            trade_key=self._testnet_trade_key(signal_key),
+            symbol=str(signal.symbol),
+            price=float(snapshot.price),
+        )
+
+    def _execute_testnet_exit(self, signal_key: str, signal, snapshot: OrderflowSnapshot | None) -> dict[str, object]:
+        executor = getattr(self, "testnet_order_executor", None)
+        if executor is None:
+            return {"ok": False, "status": "blocked", "reason": "exit_blocked_testnet_executor_missing"}
+        price = float(snapshot.price) if snapshot is not None else float(signal.entry)
+        self.logger.info("Testnet exit attempt symbol=%s signal_key=%s price=%s", signal.symbol, signal_key, price)
+        result = executor.place_exit_order(
+            signal_key=signal_key,
+            trade_key=self._testnet_trade_key(signal_key),
+            symbol=str(signal.symbol),
+            price=price,
+        )
+        self.logger.info(
+            "Testnet exit result symbol=%s signal_key=%s status=%s order_id=%s reason=%s",
+            signal.symbol,
+            signal_key,
+            result.get("status"),
+            result.get("order_id"),
+            result.get("reason"),
+        )
+        return result
+
+    def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None, snapshot=None, setup=None, testnet_result=None):
         previous_row = self.signal_store.get_executor_outcome(signal_key)
         diagnostics = self._paper_executor_diagnostics(signal, snapshot)
         diagnostics_json = diagnostics.get("diagnostics_json")
@@ -964,6 +1024,7 @@ class AccumulationRunner:
             and diagnostics_json.get("volume_impulse_source") == "missing_default"
         ):
             diagnostics_json["blocker_root_cause"] = "missing_volume_impulse_mapping"
+        self._apply_testnet_diagnostics(diagnostics_json, testnet_result)
         self._apply_executor_exit_shadow(
             signal_key=signal_key,
             signal=signal,
@@ -999,6 +1060,26 @@ class AccumulationRunner:
             float(row["max_drawdown_r"] or 0.0),
         )
         if str(row["action"]) == EXIT:
+            if self.trade_executor_mode == "testnet":
+                exit_result = self._execute_testnet_exit(signal_key, signal, snapshot)
+                diagnostics_json = self._parse_executor_diagnostics(row["diagnostics_json"])
+                self._apply_testnet_diagnostics(diagnostics_json, exit_result)
+                row = self.signal_store.upsert_executor_decision(
+                    signal_key=signal_key,
+                    symbol=str(signal.symbol),
+                    side=str(signal.side),
+                    state=str(decision.next_state),
+                    action=str(decision.action),
+                    reason=str(decision.reason),
+                    entry_price=float(position.entry_price) if position is not None else self._optional_float(signal.entry),
+                    current_sl=float(position.current_sl) if position is not None else self._optional_float(signal.stop_loss),
+                    exit_price=float(position.exit_price) if position is not None and position.exit_price is not None else None,
+                    exit_reason=position.exit_reason if position is not None else None,
+                    max_gain_r=float(position.max_gain_r) if position is not None else 0.0,
+                    max_drawdown_r=float(position.max_drawdown_r) if position is not None else 0.0,
+                    bars_in_trade=int(position.bars_in_trade) if position is not None else 0,
+                    diagnostics_json=diagnostics_json,
+                )
             self._best_effort_store_executor_trade(signal_key, signal, decision, position, row, previous_row, diagnostics_json)
 
         trade_learning = getattr(self, "trade_learning", None)
@@ -1580,6 +1661,20 @@ class AccumulationRunner:
 
         entry_decision = self.trade_executor.evaluate_entry(setup, snapshot)
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
+            if self.trade_executor_mode == "testnet":
+                testnet_result = self._execute_testnet_entry(signal_key, signal, snapshot)
+                if not testnet_result.get("ok"):
+                    watch_decision = TradeDecision(WATCH, str(testnet_result.get("reason") or "entry_blocked_testnet"), "TRADE_WATCH", None)
+                    self._store_paper_executor_decision(
+                        signal_key, signal, watch_decision, None, snapshot, setup=setup, testnet_result=testnet_result
+                    )
+                    return
+                position = self.trade_executor.open_position(setup, snapshot)
+                entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
+                self._store_paper_executor_decision(
+                    signal_key, signal, entry_decision, position, snapshot, setup=setup, testnet_result=testnet_result
+                )
+                return
             position = self.trade_executor.open_position(setup, snapshot)
             entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
             self._store_paper_executor_decision(signal_key, signal, entry_decision, position, snapshot, setup=setup)
