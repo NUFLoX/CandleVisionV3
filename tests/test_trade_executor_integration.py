@@ -34,6 +34,8 @@ class _StubScanTarget:
         self.market = market
 
 
+_stub_module("numpy")
+_stub_module("pandas")
 _stub_module("dashboard.ingest_client", DashboardIngestClient=_StubService)
 _stub_module("orderflow_accum.bybit_rest", BybitRestClient=_StubBybitRestClient, ScanTarget=_StubScanTarget)
 _stub_module("orderflow_accum.console_ui", ConsoleUI=_StubService)
@@ -702,4 +704,40 @@ def test_new_executor_entry_diagnostics_do_not_preserve_stale_breakeven_time(tmp
     assert fresh_diagnostics["executor_entry_price"] == previous_diagnostics["executor_entry_price"]
     assert fresh_diagnostics["executor_initial_sl"] == previous_diagnostics["executor_initial_sl"]
     assert "breakeven_time" not in fresh_diagnostics
+    runner.signal_store.close()
+
+
+def test_absorption_blocked_entry_is_stored_with_gate_diagnostics(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(
+        kind="ABSORPTION_ZONE",
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_NEUTRAL",
+            "market_regime": "RISK_ON",
+            "executor_snapshot": make_snapshot(buy_flow=110.0, sell_flow=100.0, volume_impulse=1.4),
+        },
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    assert row["action"] == "WATCH"
+    assert row["reason"] == "entry_blocked_absorption_weak_confirmation"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["absorption_strict_gate"] is True
+    assert diagnostics["absorption_gate_passed"] is False
+    assert diagnostics["absorption_gate_reason"] == "entry_blocked_absorption_weak_confirmation"
+    assert diagnostics["btc_regime"] == "BTC_NEUTRAL"
+    assert diagnostics["market_regime"] == "RISK_ON"
+    assert diagnostics["buy_flow"] == 110.0
+    assert diagnostics["sell_flow"] == 100.0
+    assert diagnostics["volume_impulse"] == 1.4
+    assert diagnostics["required_volume_impulse"] == 1.2
+    assert diagnostics["spread_bps"] == 4.0
+    assert diagnostics["ask_wall_strength"] == 0.2
+    assert "support" in diagnostics
+    assert "resistance" in diagnostics
     runner.signal_store.close()

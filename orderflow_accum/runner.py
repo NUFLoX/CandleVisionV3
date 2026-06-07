@@ -39,6 +39,7 @@ from .trade_executor import (
     PROTECT_BREAKEVEN,
     TRAILING_PROFIT,
     WATCH,
+    ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION,
     OrderflowSnapshot,
     SmartTradeExecutor,
     MANAGEMENT_POLICY_LEGACY,
@@ -535,6 +536,8 @@ class AccumulationRunner:
             timeframe=str(signal.meta.get("tf") or "1"),
             btc_regime=str(signal.meta.get("btc_regime") or "BTC_NEUTRAL"),
             reasons=list(signal.reasons or []),
+            signal_kind=str(getattr(signal, "kind", "") or ""),
+            market_regime=str(signal.meta.get("market_regime") or signal.meta.get("btc_regime") or "BTC_NEUTRAL"),
         )
 
     _VOLUME_IMPULSE_META_FIELDS = (
@@ -843,6 +846,7 @@ class AccumulationRunner:
             "bid_wall_entry_limit": self._optional_float(getattr(executor, "bid_wall_entry_limit", None)),
             "strong_reversal_ratio": self._optional_float(getattr(executor, "strong_reversal_ratio", None)),
             "strong_wall_exit_threshold": self._optional_float(getattr(executor, "strong_wall_exit_threshold", None)),
+            "absorption_flow_ratio": self._optional_float(getattr(executor, "absorption_flow_ratio", None)),
         }
         meta = dict(getattr(signal, "meta", {}) or {})
         override = meta.get("executor_snapshot")
@@ -908,12 +912,13 @@ class AccumulationRunner:
             "volume_baseline": self._optional_float(volume_diagnostics.get("volume_baseline")),
             "volume_current": self._optional_float(volume_diagnostics.get("volume_current")),
             "volume_impulse_ratio_to_required": volume_ratio_to_required,
+            "signal_kind": str(getattr(signal, "kind", "") or ""),
             **self._volume_impulse_report_cap_fields(volume_impulse, required_volume),
         }
         values["diagnostics_json"] = diagnostics_json
         return values
 
-    def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None, snapshot=None):
+    def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None, snapshot=None, setup=None):
         previous_row = self.signal_store.get_executor_outcome(signal_key)
         diagnostics = self._paper_executor_diagnostics(signal, snapshot)
         diagnostics_json = diagnostics.get("diagnostics_json")
@@ -947,6 +952,13 @@ class AccumulationRunner:
                     "market_regime_reason": "entry_blocked_market_regime",
                 }
             )
+        if str(decision.reason) == ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION:
+            if setup is None:
+                setup = self._paper_executor_setup(signal)
+            if snapshot is not None and self.trade_executor is not None:
+                diagnostics_json.update(self.trade_executor.absorption_gate_diagnostics(setup, snapshot))
+            diagnostics_json["absorption_gate_reason"] = ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION
+
         if (
             str(decision.reason) == "entry_blocked_volume_impulse"
             and diagnostics_json.get("volume_impulse_source") == "missing_default"
@@ -1557,24 +1569,24 @@ class AccumulationRunner:
         if weak:
             current_state = str(existing["state"]) if existing is not None else "TRADE_WATCH"
             decision = TradeDecision(WATCH, "paper_executor_missing_snapshot_data", current_state, None)
-            self._store_paper_executor_decision(signal_key, signal, decision, None, snapshot)
+            self._store_paper_executor_decision(signal_key, signal, decision, None, snapshot, setup=setup)
             return
 
         if existing is not None and str(existing["state"]) in {ENTERED, PROTECT_BREAKEVEN, TRAILING_PROFIT}:
             position = self._position_from_executor_row(signal, existing)
             decision = self.trade_executor.update_position(position, snapshot)
-            self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot)
+            self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot, setup=setup)
             return
 
         entry_decision = self.trade_executor.evaluate_entry(setup, snapshot)
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
             position = self.trade_executor.open_position(setup, snapshot)
             entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
-            self._store_paper_executor_decision(signal_key, signal, entry_decision, position, snapshot)
+            self._store_paper_executor_decision(signal_key, signal, entry_decision, position, snapshot, setup=setup)
             return
 
         watch_decision = TradeDecision(WATCH, entry_decision.reason, "TRADE_WATCH", None)
-        self._store_paper_executor_decision(signal_key, signal, watch_decision, None, snapshot)
+        self._store_paper_executor_decision(signal_key, signal, watch_decision, None, snapshot, setup=setup)
 
     async def _emit_signal(self, rest: BybitRestClient, signal, state=None) -> None:
         market = str(

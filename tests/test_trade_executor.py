@@ -5,6 +5,7 @@ import math
 from orderflow_accum.trade_executor import (
     BTC_BEARISH,
     BTC_DUMP_RISK,
+    ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION,
     BUY,
     ENTERED,
     ENTER_LONG,
@@ -344,3 +345,103 @@ def test_sell_setup_blocked_when_score_is_low():
     assert decision.action == WATCH
     assert decision.reason == "entry_blocked_low_score"
     assert decision.position is None
+
+
+def test_absorption_buy_with_weak_buy_flow_is_blocked_by_strict_gate():
+    executor = SmartTradeExecutor()
+    setup = make_buy_setup(signal_kind="ABSORPTION_ZONE")
+    snapshot = make_snapshot(buy_flow=110.0, sell_flow=100.0)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION
+    assert decision.position is None
+
+
+def test_absorption_buy_with_weak_volume_impulse_is_blocked_by_strict_gate():
+    executor = SmartTradeExecutor()
+    setup = make_buy_setup(signal_kind="ABSORPTION_ZONE")
+    snapshot = make_snapshot(volume_impulse=1.19)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION
+
+
+def test_absorption_buy_with_btc_dump_risk_is_blocked_by_strict_gate():
+    executor = SmartTradeExecutor()
+    setup = make_buy_setup(signal_kind="ABSORPTION_ZONE", btc_regime=BTC_DUMP_RISK)
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.4)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION
+
+
+def test_absorption_buy_with_strong_confirmation_can_enter_long():
+    executor = SmartTradeExecutor()
+    setup = make_buy_setup(signal_kind="ABSORPTION_ZONE", market_regime="RISK_ON")
+    snapshot = make_snapshot(
+        price=100.0,
+        buy_flow=140.0,
+        sell_flow=90.0,
+        volume_impulse=1.4,
+        spread_bps=4.0,
+        ask_wall_strength=0.2,
+        support=99.0,
+    )
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == ENTER_LONG
+    assert decision.reason == "entry_allowed_long"
+
+
+def test_pre_impulse_buy_behavior_remains_unchanged_for_weak_flow():
+    executor = SmartTradeExecutor()
+    setup = make_buy_setup(signal_kind="PRE_IMPULSE_ZONE")
+    snapshot = make_snapshot(buy_flow=110.0, sell_flow=100.0)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_buy_flow"
+
+
+def test_breakout_pressure_buy_behavior_remains_unchanged_for_weak_flow():
+    executor = SmartTradeExecutor()
+    setup = make_buy_setup(signal_kind="BREAKOUT_PRESSURE")
+    snapshot = make_snapshot(buy_flow=110.0, sell_flow=100.0)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_buy_flow"
+
+
+def test_absorption_gate_diagnostics_include_required_fields_when_blocked():
+    executor = SmartTradeExecutor()
+    setup = make_buy_setup(signal_kind="ABSORPTION_ZONE", market_regime="RISK_OFF")
+    snapshot = make_snapshot(buy_flow=100.0, sell_flow=100.0, volume_impulse=1.0)
+
+    diagnostics = executor.absorption_gate_diagnostics(setup, snapshot)
+
+    assert diagnostics["absorption_strict_gate"] is True
+    assert diagnostics["absorption_gate_passed"] is False
+    assert diagnostics["absorption_gate_reason"] == ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION
+    for field in (
+        "btc_regime",
+        "market_regime",
+        "buy_flow",
+        "sell_flow",
+        "volume_impulse",
+        "required_volume_impulse",
+        "spread_bps",
+        "ask_wall_strength",
+        "support",
+        "resistance",
+    ):
+        assert field in diagnostics

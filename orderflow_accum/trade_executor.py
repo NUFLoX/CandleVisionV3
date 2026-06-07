@@ -23,6 +23,11 @@ SELL = "Sell"
 
 BTC_BEARISH = "BTC_BEARISH"
 BTC_DUMP_RISK = "BTC_DUMP_RISK"
+BTC_BULLISH = "BTC_BULLISH"
+RISK_OFF = "RISK_OFF"
+RISK_ON = "RISK_ON"
+ABSORPTION_ZONE = "ABSORPTION_ZONE"
+ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION = "entry_blocked_absorption_weak_confirmation"
 
 MANAGEMENT_POLICY_LEGACY = "legacy"
 MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R = "trailing_40pct_giveback_after_1r"
@@ -40,6 +45,8 @@ class TradeSetup:
     btc_regime: str
     reasons: Sequence[str]
     created_at: Optional[str] = None
+    signal_kind: str = ""
+    market_regime: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -105,7 +112,9 @@ class SmartTradeExecutor:
         management_policy: str = MANAGEMENT_POLICY_LEGACY,
         protect_after_1r: bool = False,
         min_protected_r_after_1r: float = 0.25,
+        absorption_flow_ratio: float = 1.15,
     ) -> None:
+        self.absorption_flow_ratio = max(float(absorption_flow_ratio), 1.0)
         self.min_long_score = min_long_score
         self.max_spread_bps = max_spread_bps
         self.flow_ratio = flow_ratio
@@ -125,18 +134,91 @@ class SmartTradeExecutor:
 
     def evaluate_entry(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> TradeDecision:
         if setup.side == BUY:
+            if self._is_absorption_setup(setup) and not self._absorption_long_gate_passed(setup, snapshot):
+                return TradeDecision(WATCH, ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION, WATCH_ENTRY, None)
             blockers = self._long_entry_blockers(setup, snapshot)
             if blockers:
                 return TradeDecision(WATCH, blockers[0], WATCH_ENTRY, None)
             return TradeDecision(ENTER_LONG, "entry_allowed_long", ENTERED, None)
 
         if setup.side == SELL:
+            if self._is_absorption_setup(setup) and not self._absorption_short_gate_passed(setup, snapshot):
+                return TradeDecision(WATCH, ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION, WATCH_ENTRY, None)
             blockers = self._short_entry_blockers(setup, snapshot)
             if blockers:
                 return TradeDecision(WATCH, blockers[0], WATCH_ENTRY, None)
             return TradeDecision(ENTER_SHORT, "entry_allowed_short", ENTERED, None)
 
         return TradeDecision(WATCH, "entry_blocked_unknown_side", WATCH_ENTRY, None)
+
+    def absorption_gate_diagnostics(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> dict[str, object]:
+        gate_passed = True
+        if setup.side == BUY:
+            gate_passed = self._absorption_long_gate_passed(setup, snapshot)
+        elif setup.side == SELL:
+            gate_passed = self._absorption_short_gate_passed(setup, snapshot)
+
+        return {
+            "absorption_strict_gate": True,
+            "absorption_gate_passed": gate_passed,
+            "absorption_gate_reason": None if gate_passed else ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION,
+            "btc_regime": setup.btc_regime,
+            "market_regime": setup.market_regime,
+            "buy_flow": float(snapshot.buy_flow),
+            "sell_flow": float(snapshot.sell_flow),
+            "volume_impulse": float(snapshot.volume_impulse),
+            "required_volume_impulse": float(self.min_entry_volume_impulse),
+            "spread_bps": float(snapshot.spread_bps),
+            "ask_wall_strength": float(snapshot.ask_wall_strength),
+            "bid_wall_strength": float(snapshot.bid_wall_strength),
+            "support": snapshot.support,
+            "resistance": snapshot.resistance,
+        }
+
+    def _is_absorption_setup(self, setup: TradeSetup) -> bool:
+        if str(setup.signal_kind or "").upper() == ABSORPTION_ZONE:
+            return True
+        return any(str(reason).upper() == ABSORPTION_ZONE for reason in (setup.reasons or []))
+
+    def _absorption_long_gate_passed(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> bool:
+        market_regime = str(setup.market_regime or "").upper()
+        if setup.btc_regime in {BTC_BEARISH, BTC_DUMP_RISK}:
+            return False
+        if market_regime == RISK_OFF:
+            return False
+        if snapshot.buy_flow < snapshot.sell_flow * self.absorption_flow_ratio:
+            return False
+        if snapshot.volume_impulse < self.min_entry_volume_impulse:
+            return False
+        if snapshot.spread_bps > self.max_spread_bps:
+            return False
+        if snapshot.ask_wall_strength > self.ask_wall_entry_limit:
+            return False
+        if snapshot.support is not None and snapshot.price < snapshot.support:
+            return False
+        if setup.entry_hint > 0 and snapshot.price < setup.entry_hint:
+            return False
+        return True
+
+    def _absorption_short_gate_passed(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> bool:
+        market_regime = str(setup.market_regime or "").upper()
+        if setup.btc_regime == BTC_BULLISH:
+            return False
+        if market_regime == RISK_ON:
+            return False
+        if snapshot.sell_flow < snapshot.buy_flow * self.absorption_flow_ratio:
+            return False
+        if snapshot.volume_impulse < self.min_entry_volume_impulse:
+            return False
+        if snapshot.spread_bps > self.max_spread_bps:
+            return False
+        if snapshot.bid_wall_strength > self.bid_wall_entry_limit:
+            return False
+        if snapshot.resistance is not None and snapshot.price > snapshot.resistance:
+            return False
+        if setup.entry_hint > 0 and snapshot.price > setup.entry_hint:
+            return False
+        return True
 
     def open_position(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> TradePosition:
         entry_decision = self.evaluate_entry(setup, snapshot)
