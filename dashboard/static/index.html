@@ -70,8 +70,10 @@
         const [activeSetups, setActiveSetups] = useState([]);
         const [activeExecutorTrades, setActiveExecutorTrades] = useState({ rows: [], summary: {} });
         const [executorLedger, setExecutorLedger] = useState({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] });
-        const emptyLearningEffectiveness = { summary: {}, windows: [], problem_patterns: [], by_kind: [], by_timeframe: [], by_exit_reason: [], recent_trades: [] };
+        const emptyLearningEffectiveness = { summary: {}, windows: [], problem_patterns: [], by_kind: [], by_timeframe: [], by_exit_reason: [], recent_trades: [], regime_effectiveness: { by_btc_regime: [], by_market_regime: [] } };
         const [learningEffectiveness, setLearningEffectiveness] = useState(emptyLearningEffectiveness);
+        const emptyRegimePerformance = { summary: {}, by_btc_regime: [], by_market_regime: [], blocked_entries: { total_blocked: 0, by_btc_regime: [], by_market_regime: [], by_symbol: [], by_timeframe: [], latest: [] } };
+        const [regimePerformance, setRegimePerformance] = useState(emptyRegimePerformance);
         const emptyExitSimulator = { summary: {}, rules: [], by_kind: [], by_timeframe: [], trade_simulations: [] };
         const [exitSimulator, setExitSimulator] = useState(emptyExitSimulator);
         const emptyExitShadow = { summary: {}, open_shadow_trades: [], closed_shadow_results: [], shadow_events: [] };
@@ -92,6 +94,7 @@
         const loadActiveExecutorTrades = async () => setActiveExecutorTrades(await api('/api/executor-active-trades?limit=500'));
         const loadExecutorLedger = async () => setExecutorLedger(await api('/api/executor-ledger?limit=50'));
         const loadLearningEffectiveness = async () => setLearningEffectiveness(await api('/api/learning-effectiveness'));
+        const loadRegimePerformance = async () => setRegimePerformance(await api('/api/executor-regime-performance'));
         const loadExitSimulator = async () => setExitSimulator(await api('/api/executor-exit-simulator'));
         const loadExitShadow = async () => setExitShadow(await api('/api/executor-exit-shadow'));
         const loadSetupPerformance = async () => setSetupPerf(await api('/api/setup-performance'));
@@ -99,6 +102,7 @@
         const refreshExitAnalytics = async () => {
           await Promise.all([
             loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness)),
+            loadRegimePerformance().catch(() => setRegimePerformance(emptyRegimePerformance)),
             loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator)),
             loadExitShadow().catch(() => setExitShadow(emptyExitShadow)),
           ]);
@@ -120,6 +124,7 @@
           loadActiveExecutorTrades().catch(() => setActiveExecutorTrades({ rows: [], summary: {} }));
           loadExecutorLedger().catch(() => setExecutorLedger({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] }));
           loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness));
+          loadRegimePerformance().catch(() => setRegimePerformance(emptyRegimePerformance));
           loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator));
           loadExitShadow().catch(() => setExitShadow(emptyExitShadow));
           loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] }));
@@ -134,6 +139,7 @@
             loadActiveExecutorTrades().catch(() => setActiveExecutorTrades({ rows: [], summary: {} }));
             loadExecutorLedger().catch(() => setExecutorLedger({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] }));
             loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness));
+            loadRegimePerformance().catch(() => setRegimePerformance(emptyRegimePerformance));
             loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator));
             loadExitShadow().catch(() => setExitShadow(emptyExitShadow));
           }, 30000);
@@ -247,6 +253,7 @@
           <ActiveExecutorTradesPanel payload={activeExecutorTrades} onRefresh={loadActiveExecutorTrades} />
           <ExecutorLedgerPanel payload={executorLedger} onRefresh={loadExecutorLedger} />
           <LearningEffectivenessPanel payload={learningEffectiveness} onRefresh={refreshExitAnalytics} />
+          <ExecutorRegimePerformancePanel payload={regimePerformance} onRefresh={loadRegimePerformance} />
           <ExecutorExitSimulatorPanel payload={exitSimulator} onRefresh={refreshExitAnalytics} />
           <ExecutorExitShadowPanel payload={exitShadow} onRefresh={refreshExitAnalytics} />
           <SetupPerformancePanel perf={setupPerf} onRefresh={loadSetupPerformance} />
@@ -634,6 +641,39 @@
               <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Actual R</th><th className="px-3 py-2">Shadow R</th><th className="px-3 py-2">Delta R</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Exit Reason</th><th className="px-3 py-2">Exit Time</th></tr></thead>
               <tbody>{closedRows.map((row, idx) => <tr key={`${row.symbol}-${row.exit_time}-${idx}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.symbol}</td><td className="px-3 py-2">{row.timeframe || '-'}</td><td className={`px-3 py-2 font-semibold ${Number(row.actual_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.actual_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.shadow_exit_r, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(row.shadow_delta_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.shadow_delta_r, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(row.max_gain_r, 4)}</td><td className="px-3 py-2">{row.exit_reason || '-'}</td><td className="px-3 py-2">{row.exit_time || '-'}</td></tr>)}</tbody>
               {closedRows.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No closed shadow results yet.</caption>}
+            </LedgerTable>
+          </div>
+        </Card>;
+      }
+
+
+      function ExecutorRegimePerformancePanel({ payload, onRefresh }) {
+        const byBtc = payload?.by_btc_regime || [];
+        const byMarket = payload?.by_market_regime || [];
+        const blocked = payload?.blocked_entries || {};
+        const blockedByMarket = blocked.by_market_regime || [];
+        const latest = blocked.latest || [];
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const fmtPct = (value) => value === null || value === undefined ? '-' : `${(Number(value || 0) * 100).toFixed(1)}%`;
+        const fmtDate = (value) => value ? new Date(value).toLocaleString() : '-';
+        const PerfRows = ({ rows, keyName }) => <>
+          <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Regime</th><th className="px-3 py-2">Trades</th><th className="px-3 py-2">W/L/F</th><th className="px-3 py-2">Win Rate</th><th className="px-3 py-2">Net R</th><th className="px-3 py-2">Avg R</th><th className="px-3 py-2">PF</th><th className="px-3 py-2">Avg Max R</th><th className="px-3 py-2">Avg DD R</th></tr></thead>
+          <tbody>{rows.map((row) => <tr key={row[keyName]} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row[keyName]}</td><td className="px-3 py-2">{row.total_trades}</td><td className="px-3 py-2"><span className="text-emerald-300">{row.wins}</span>/<span className="text-red-300">{row.losses}</span>/{row.breakeven_or_flat}</td><td className="px-3 py-2">{fmtPct(row.win_rate)}</td><td className={`px-3 py-2 font-semibold ${Number(row.net_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.net_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.avg_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.profit_factor, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(row.avg_max_gain_r, 4)}</td><td className="px-3 py-2 text-red-300">{fmtNum(row.avg_max_drawdown_r, 4)}</td></tr>)}</tbody>
+        </>;
+        return <Card title="Executor Performance by BTC Regime" action={<button onClick={onRefresh} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh regimes</button>}>
+          <div className="space-y-5">
+            <div className="grid gap-3 md:grid-cols-3">
+              <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3"><p className="text-xs uppercase tracking-wide text-slate-500">Closed Trades</p><p className="mt-2 text-2xl font-black">{payload?.summary?.total_closed_trades ?? 0}</p></div>
+              <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3"><p className="text-xs uppercase tracking-wide text-slate-500">Known BTC Regime</p><p className="mt-2 text-2xl font-black text-emerald-200">{payload?.summary?.known_btc_regime_trades ?? 0}</p></div>
+              <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3"><p className="text-xs uppercase tracking-wide text-slate-500">Blocked by Market Regime</p><p className="mt-2 text-2xl font-black text-amber-200">{blocked.total_blocked ?? 0}</p></div>
+            </div>
+            <LedgerTable title="BTC Regime Performance"><PerfRows rows={byBtc} keyName="btc_regime" />{byBtc.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No BTC regime trades yet.</caption>}</LedgerTable>
+            <LedgerTable title="Market Regime Performance"><PerfRows rows={byMarket} keyName="market_regime" />{byMarket.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No market regime trades yet.</caption>}</LedgerTable>
+            <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3"><h3 className="mb-2 text-sm font-bold text-slate-200">Blocked by Market Regime</h3><div className="flex flex-wrap gap-2">{blockedByMarket.map((row) => <Badge key={row.market_regime} tone={Number(row.total || 0) > 0 ? 'amber' : 'slate'}>{row.market_regime}: {row.total}</Badge>)}</div></div>
+            <LedgerTable title="Latest Blocked Entries">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Side</th><th className="px-3 py-2">Action</th><th className="px-3 py-2">Reason</th><th className="px-3 py-2">BTC</th><th className="px-3 py-2">Market</th><th className="px-3 py-2">Price</th><th className="px-3 py-2">Updated</th></tr></thead>
+              <tbody>{latest.map((row, idx) => <tr key={`${row.source}-${row.signal_key}-${idx}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.symbol}</td><td className="px-3 py-2">{row.timeframe || '-'}</td><td className="px-3 py-2">{row.side || '-'}</td><td className="px-3 py-2">{row.action || '-'}</td><td className="px-3 py-2">{row.reason || '-'}</td><td className="px-3 py-2">{row.btc_regime || 'UNKNOWN'}</td><td className="px-3 py-2">{row.market_regime || 'UNKNOWN'}</td><td className="px-3 py-2">{fmtNum(row.price, 6)}</td><td className="px-3 py-2">{fmtDate(row.updated_at || row.created_at)}</td></tr>)}</tbody>
+              {latest.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No market-regime blocked entries yet.</caption>}
             </LedgerTable>
           </div>
         </Card>;
