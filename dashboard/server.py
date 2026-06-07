@@ -60,6 +60,11 @@ PROFIT_POTENTIAL_METRICS = (
     "first_touch_win_rate",
 )
 
+BTC_REGIME_KEYS = ("BTC_BULLISH", "BTC_NEUTRAL", "BTC_BEARISH", "BTC_DUMP_RISK", "UNKNOWN")
+MARKET_REGIME_KEYS = ("RISK_ON", "NEUTRAL", "RISK_OFF", "UNKNOWN")
+REGIME_BLOCK_REASONS = ("entry_blocked_market_regime", "entry_blocked_btc_regime")
+
+
 
 class WebSocketHub:
     def __init__(self) -> None:
@@ -1131,6 +1136,308 @@ def _read_executor_exit_simulator() -> dict[str, object]:
     })
     return payload
 
+
+def _normalized_regime(value: object, default: str = "UNKNOWN") -> str:
+    text = str(value or "").strip().upper()
+    return text or default
+
+
+def _regime_value_from_json(payload: dict[str, object], key: str) -> str | None:
+    value = _diagnostic_value(payload, key)
+    if value is None:
+        return None
+    normalized = _normalized_regime(value)
+    return normalized if normalized != "UNKNOWN" else None
+
+
+def _latest_lifecycle_regimes(conn: sqlite3.Connection, signal_keys: list[str]) -> dict[str, dict[str, str | None]]:
+    columns = _table_columns(conn, "trade_lifecycle_events")
+    if not signal_keys or not columns or "signal_key" not in columns:
+        return {}
+
+    placeholders = ",".join("?" for _ in signal_keys)
+    select_columns = [
+        _executor_select_expr(columns, "signal_key", table_alias="tle"),
+        _executor_select_expr(columns, "btc_regime", table_alias="tle"),
+        _executor_select_expr(columns, "market_regime", table_alias="tle"),
+        _executor_select_expr(columns, "features_json", table_alias="tle"),
+    ]
+    order_expr = "tle.created_at" if "created_at" in columns else "tle.rowid"
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM trade_lifecycle_events tle
+        WHERE tle.signal_key IN ({placeholders})
+        ORDER BY {order_expr} DESC, tle.rowid DESC
+        """,
+        signal_keys,
+    ).fetchall()
+
+    regimes: dict[str, dict[str, str | None]] = {}
+    for row in rows:
+        signal_key = str(row["signal_key"] or "")
+        if not signal_key or signal_key in regimes:
+            continue
+        features = _safe_json_object(row["features_json"])
+        regimes[signal_key] = {
+            "btc_regime": _regime_value_from_json({"btc_regime": row["btc_regime"]}, "btc_regime") or _regime_value_from_json(features, "btc_regime"),
+            "market_regime": _regime_value_from_json({"market_regime": row["market_regime"]}, "market_regime") or _regime_value_from_json(features, "market_regime"),
+        }
+    return regimes
+
+
+def _read_executor_regime_closed_trades(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    columns = _table_columns(conn, "executor_trades")
+    if not columns or "r_result" not in columns:
+        return []
+
+    select_columns = [
+        _executor_select_expr(columns, name, table_alias="et")
+        for name in (
+            "trade_key", "signal_key", "symbol", "timeframe", "side", "r_result",
+            "max_gain_r", "max_drawdown_r", "exit_time", "updated_at", "diagnostics_json",
+        )
+    ]
+    order_expr = "et.exit_time" if "exit_time" in columns else ("et.updated_at" if "updated_at" in columns else "et.rowid")
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM executor_trades et
+        {_closed_trade_where(columns)}
+        ORDER BY {order_expr} ASC, et.rowid ASC
+        """
+    ).fetchall()
+
+    signal_keys = []
+    for row in rows:
+        signal_key = str(row["signal_key"] or "")
+        if signal_key and signal_key not in signal_keys:
+            signal_keys.append(signal_key)
+    lifecycle_regimes = _latest_lifecycle_regimes(conn, signal_keys)
+
+    trades: list[dict[str, object]] = []
+    for row in rows:
+        r_result = _safe_float(row["r_result"])
+        if r_result is None:
+            continue
+        diagnostics = _safe_json_object(row["diagnostics_json"])
+        signal_key = str(row["signal_key"] or "")
+        fallback = lifecycle_regimes.get(signal_key, {})
+        btc_regime = _regime_value_from_json(diagnostics, "btc_regime") or fallback.get("btc_regime") or "UNKNOWN"
+        market_regime = _regime_value_from_json(diagnostics, "market_regime") or fallback.get("market_regime") or "UNKNOWN"
+        trades.append(
+            {
+                "trade_key": str(row["trade_key"] or ""),
+                "signal_key": signal_key,
+                "symbol": str(row["symbol"] or "UNKNOWN"),
+                "timeframe": str(row["timeframe"] or "UNKNOWN"),
+                "side": str(row["side"] or "") or None,
+                "r_result": r_result,
+                "max_gain_r": _safe_float(row["max_gain_r"]) or 0.0,
+                "max_drawdown_r": _safe_float(row["max_drawdown_r"]) or 0.0,
+                "btc_regime": btc_regime,
+                "market_regime": market_regime,
+                "exit_time": str(row["exit_time"] or row["updated_at"] or "") or None,
+            }
+        )
+    return trades
+
+
+def _regime_performance_metrics(rows: list[dict[str, object]]) -> dict[str, object]:
+    metrics = _learning_metrics(rows)
+    return {
+        "total_trades": metrics["total_trades"],
+        "wins": metrics["wins"],
+        "losses": metrics["losses"],
+        "breakeven_or_flat": metrics["breakeven_or_flat"],
+        "win_rate": metrics["win_rate"],
+        "net_r": metrics["net_r"],
+        "avg_r": metrics["avg_r"],
+        "gross_win_r": metrics["gross_win_r"],
+        "gross_loss_r": metrics["gross_loss_r"],
+        "profit_factor": metrics["profit_factor"],
+        "avg_max_gain_r": metrics["avg_max_gain_r"],
+        "avg_max_drawdown_r": metrics["avg_max_drawdown_r"],
+    }
+
+
+def _regime_group_rows(rows: list[dict[str, object]], key_name: str, output_name: str, expected_keys: tuple[str, ...]) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        grouped[_normalized_regime(row.get(key_name))].append(row)
+    for key in expected_keys:
+        grouped.setdefault(key, [])
+
+    output = []
+    for key, group in grouped.items():
+        output.append({output_name: key, **_regime_performance_metrics(group)})
+    return sorted(output, key=lambda row: (0 if str(row[output_name]) in expected_keys else 1, expected_keys.index(str(row[output_name])) if str(row[output_name]) in expected_keys else str(row[output_name])))
+
+
+def _blocked_reason_match(row: sqlite3.Row) -> bool:
+    haystack = f"{row['action'] or ''} {row['reason'] or ''}".lower()
+    return any(reason in haystack for reason in REGIME_BLOCK_REASONS)
+
+
+def _read_blocked_executor_outcomes(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    columns = _table_columns(conn, "executor_outcomes")
+    if not columns or not ({"action", "reason"} & columns):
+        return []
+    select_columns = [
+        _executor_select_expr(columns, name, table_alias="eo")
+        for name in ("signal_key", "symbol", "side", "action", "reason", "price", "entry_price", "created_at", "updated_at", "diagnostics_json")
+    ]
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM executor_outcomes eo
+        ORDER BY {('eo.updated_at' if 'updated_at' in columns else 'eo.rowid')} DESC, eo.rowid DESC
+        """
+    ).fetchall()
+    signal_keys = [str(row["signal_key"] or "") for row in rows if str(row["signal_key"] or "")]
+    lifecycle_regimes = _latest_lifecycle_regimes(conn, list(dict.fromkeys(signal_keys)))
+    blocked: list[dict[str, object]] = []
+    for row in rows:
+        if not _blocked_reason_match(row):
+            continue
+        diagnostics = _safe_json_object(row["diagnostics_json"])
+        signal_key = str(row["signal_key"] or "")
+        fallback = lifecycle_regimes.get(signal_key, {})
+        parsed = _parse_signal_key_parts(signal_key)
+        blocked.append(
+            {
+                "source": "executor_outcomes",
+                "signal_key": signal_key,
+                "symbol": str(row["symbol"] or "UNKNOWN"),
+                "timeframe": str(diagnostics.get("timeframe") or diagnostics.get("tf") or parsed.get("timeframe") or "UNKNOWN"),
+                "side": str(row["side"] or parsed.get("side") or "") or None,
+                "action": str(row["action"] or "") or None,
+                "reason": str(row["reason"] or "") or None,
+                "btc_regime": _regime_value_from_json(diagnostics, "btc_regime") or fallback.get("btc_regime") or "UNKNOWN",
+                "market_regime": _regime_value_from_json(diagnostics, "market_regime") or fallback.get("market_regime") or "UNKNOWN",
+                "price": _safe_float(row["price"]) if row["price"] is not None else _safe_float(row["entry_price"]),
+                "created_at": str(row["created_at"] or "") or None,
+                "updated_at": str(row["updated_at"] or row["created_at"] or "") or None,
+            }
+        )
+    return blocked
+
+
+def _read_blocked_lifecycle_events(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    columns = _table_columns(conn, "trade_lifecycle_events")
+    if not columns or not ({"action", "reason"} & columns):
+        return []
+    select_columns = [
+        _executor_select_expr(columns, name, table_alias="tle")
+        for name in (
+            "signal_key", "symbol", "timeframe", "side", "action", "reason", "price",
+            "btc_regime", "market_regime", "features_json", "created_at",
+        )
+    ]
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM trade_lifecycle_events tle
+        ORDER BY {('tle.created_at' if 'created_at' in columns else 'tle.rowid')} DESC, tle.rowid DESC
+        """
+    ).fetchall()
+    blocked: list[dict[str, object]] = []
+    for row in rows:
+        if not _blocked_reason_match(row):
+            continue
+        features = _safe_json_object(row["features_json"])
+        blocked.append(
+            {
+                "source": "trade_lifecycle_events",
+                "signal_key": str(row["signal_key"] or ""),
+                "symbol": str(row["symbol"] or "UNKNOWN"),
+                "timeframe": str(row["timeframe"] or features.get("timeframe") or features.get("tf") or "UNKNOWN"),
+                "side": str(row["side"] or "") or None,
+                "action": str(row["action"] or "") or None,
+                "reason": str(row["reason"] or "") or None,
+                "btc_regime": _regime_value_from_json({"btc_regime": row["btc_regime"]}, "btc_regime") or _regime_value_from_json(features, "btc_regime") or "UNKNOWN",
+                "market_regime": _regime_value_from_json({"market_regime": row["market_regime"]}, "market_regime") or _regime_value_from_json(features, "market_regime") or "UNKNOWN",
+                "price": _safe_float(row["price"]),
+                "created_at": str(row["created_at"] or "") or None,
+                "updated_at": str(row["created_at"] or "") or None,
+            }
+        )
+    return blocked
+
+
+def _count_rows(rows: list[dict[str, object]], key_name: str, output_name: str, expected_keys: tuple[str, ...] = ()) -> list[dict[str, object]]:
+    counts = Counter(_normalized_regime(row.get(key_name)) for row in rows)
+    for key in expected_keys:
+        counts.setdefault(key, 0)
+    return [
+        {output_name: key, "total": total}
+        for key, total in sorted(counts.items(), key=lambda item: (0 if item[0] in expected_keys else 1, expected_keys.index(item[0]) if item[0] in expected_keys else item[0]))
+    ]
+
+
+def _read_executor_regime_performance() -> dict[str, object]:
+    payload: dict[str, object] = {
+        "summary": {
+            "total_closed_trades": 0,
+            "known_btc_regime_trades": 0,
+            "unknown_btc_regime_trades": 0,
+            "total_blocked_by_market_regime": 0,
+        },
+        "by_btc_regime": _regime_group_rows([], "btc_regime", "btc_regime", BTC_REGIME_KEYS),
+        "by_market_regime": _regime_group_rows([], "market_regime", "market_regime", MARKET_REGIME_KEYS),
+        "blocked_entries": {
+            "total_blocked": 0,
+            "by_btc_regime": _count_rows([], "btc_regime", "btc_regime", BTC_REGIME_KEYS),
+            "by_market_regime": _count_rows([], "market_regime", "market_regime", MARKET_REGIME_KEYS),
+            "by_symbol": [],
+            "by_timeframe": [],
+            "latest": [],
+        },
+    }
+    if not SIGNALS_DB_PATH.exists():
+        return payload
+
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        trades = _read_executor_regime_closed_trades(conn)
+        blocked = _read_blocked_executor_outcomes(conn)
+        seen_blocked = {(row.get("signal_key"), row.get("action"), row.get("reason")) for row in blocked}
+        for row in _read_blocked_lifecycle_events(conn):
+            identity = (row.get("signal_key"), row.get("action"), row.get("reason"))
+            if identity not in seen_blocked:
+                blocked.append(row)
+                seen_blocked.add(identity)
+    except sqlite3.Error:
+        return payload
+    finally:
+        conn.close()
+
+    by_btc = _regime_group_rows(trades, "btc_regime", "btc_regime", BTC_REGIME_KEYS)
+    by_market = _regime_group_rows(trades, "market_regime", "market_regime", MARKET_REGIME_KEYS)
+    latest = sorted(blocked, key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)[:20]
+    payload.update(
+        {
+            "summary": {
+                "total_closed_trades": len(trades),
+                "known_btc_regime_trades": sum(1 for row in trades if _normalized_regime(row.get("btc_regime")) != "UNKNOWN"),
+                "unknown_btc_regime_trades": sum(1 for row in trades if _normalized_regime(row.get("btc_regime")) == "UNKNOWN"),
+                "total_blocked_by_market_regime": len(blocked),
+            },
+            "by_btc_regime": by_btc,
+            "by_market_regime": by_market,
+            "blocked_entries": {
+                "total_blocked": len(blocked),
+                "by_btc_regime": _count_rows(blocked, "btc_regime", "btc_regime", BTC_REGIME_KEYS),
+                "by_market_regime": _count_rows(blocked, "market_regime", "market_regime", MARKET_REGIME_KEYS),
+                "by_symbol": _count_rows(blocked, "symbol", "symbol"),
+                "by_timeframe": _count_rows(blocked, "timeframe", "timeframe"),
+                "latest": latest,
+            },
+        }
+    )
+    return payload
+
 def _read_learning_effectiveness() -> dict[str, object]:
     payload = _empty_learning_effectiveness_payload()
     if not SIGNALS_DB_PATH.exists():
@@ -1151,6 +1458,7 @@ def _read_learning_effectiveness() -> dict[str, object]:
     summary = _learning_metrics(rows)
     summary["learning_status"] = _learning_status(rows, summary)
     by_exit_reason = _learning_exit_reason_rows(rows)
+    regime_payload = _read_executor_regime_performance()
     payload.update(
         {
             "summary": summary,
@@ -1175,6 +1483,10 @@ def _read_learning_effectiveness() -> dict[str, object]:
                 }
                 for row in sorted(rows, key=_learning_order_key, reverse=True)[:20]
             ],
+            "regime_effectiveness": {
+                "by_btc_regime": regime_payload.get("by_btc_regime", []),
+                "by_market_regime": regime_payload.get("by_market_regime", []),
+            },
         }
     )
     return payload
@@ -2179,6 +2491,11 @@ def create_app() -> FastAPI:
     @app.get("/api/learning-effectiveness")
     async def learning_effectiveness():
         return _read_learning_effectiveness()
+
+
+    @app.get("/api/executor-regime-performance")
+    async def executor_regime_performance():
+        return _read_executor_regime_performance()
 
 
     @app.get("/api/executor-exit-simulator")
