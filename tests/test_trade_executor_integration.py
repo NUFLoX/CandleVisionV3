@@ -766,7 +766,7 @@ def make_testnet_runner(tmp_path: Path, fake_executor: _FakeTestnetOrderExecutor
     runner.signal_store = SignalStore(db_path=str(tmp_path / "signals.db"))
     runner.trade_executor_mode = "testnet"
     runner.trade_executor_enabled = True
-    runner.trade_executor = SmartTradeExecutor()
+    runner.trade_executor = SmartTradeExecutor(trade_executor_mode="testnet")
     runner.testnet_order_executor = fake_executor
     runner.executor_exit_shadow_enabled = False
     runner.trade_learning = None

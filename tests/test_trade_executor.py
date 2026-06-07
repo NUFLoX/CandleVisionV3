@@ -4,6 +4,7 @@ import math
 
 from orderflow_accum.trade_executor import (
     BTC_BEARISH,
+    BTC_BULLISH,
     BTC_DUMP_RISK,
     ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION,
     BUY,
@@ -445,3 +446,102 @@ def test_absorption_gate_diagnostics_include_required_fields_when_blocked():
         "resistance",
     ):
         assert field in diagnostics
+
+
+def test_pre_impulse_testnet_btc_bullish_with_relaxed_buy_flow_can_enter_long():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(signal_kind="PRE_IMPULSE_ZONE", btc_regime=BTC_BULLISH)
+    snapshot = make_snapshot(buy_flow=106.0, sell_flow=100.0, volume_impulse=1.3)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == ENTER_LONG
+    assert decision.reason == "entry_allowed_long"
+    assert diagnostics["buy_flow_relaxed_for_testnet"] is True
+    assert diagnostics["testnet_entry_gate_relaxed"] is True
+
+
+def test_pre_impulse_paper_btc_bullish_keeps_strict_buy_flow_gate():
+    executor = SmartTradeExecutor(trade_executor_mode="paper")
+    setup = make_buy_setup(signal_kind="PRE_IMPULSE_ZONE", btc_regime=BTC_BULLISH)
+    snapshot = make_snapshot(buy_flow=106.0, sell_flow=100.0, volume_impulse=1.3)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_buy_flow"
+    assert diagnostics["buy_flow_relaxed_for_testnet"] is False
+
+
+def test_testnet_volume_impulse_relaxation_allows_85pct_required_threshold():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup()
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.02)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == ENTER_LONG
+    assert decision.reason == "entry_allowed_long"
+    assert diagnostics["volume_impulse_relaxed_for_testnet"] is True
+    assert math.isclose(diagnostics["volume_impulse_ratio_to_required"], 0.85)
+    assert diagnostics["testnet_entry_gate_relaxed"] is True
+
+
+def test_paper_volume_impulse_threshold_remains_strict():
+    executor = SmartTradeExecutor(trade_executor_mode="paper")
+    setup = make_buy_setup()
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.02)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_volume_impulse"
+
+
+def test_absorption_buy_testnet_enters_with_two_of_three_confirmations():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(signal_kind="ABSORPTION_ZONE", btc_regime=BTC_BULLISH, market_regime="BTC_BULLISH")
+    snapshot = make_snapshot(
+        buy_flow=106.0,
+        sell_flow=100.0,
+        volume_impulse=1.02,
+        ask_wall_strength=0.90,
+    )
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.absorption_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == ENTER_LONG
+    assert decision.reason == "entry_allowed_long"
+    assert diagnostics["absorption_gate_passed"] is True
+    assert diagnostics["testnet_entry_gate_relaxed"] is True
+
+
+def test_absorption_buy_testnet_watches_with_fewer_than_two_confirmations():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(signal_kind="ABSORPTION_ZONE", btc_regime="BTC_NEUTRAL", market_regime="BTC_NEUTRAL")
+    snapshot = make_snapshot(
+        buy_flow=104.0,
+        sell_flow=100.0,
+        volume_impulse=1.02,
+        ask_wall_strength=0.90,
+    )
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION
+
+
+def test_testnet_btc_bearish_still_blocks_normal_buy_entry():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(btc_regime=BTC_BEARISH)
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.5)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_market_regime"
