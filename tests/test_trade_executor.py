@@ -4,6 +4,7 @@ import math
 
 from orderflow_accum.trade_executor import (
     BTC_BEARISH,
+    BTC_DUMP_RISK,
     BUY,
     ENTERED,
     ENTER_LONG,
@@ -15,6 +16,7 @@ from orderflow_accum.trade_executor import (
     PROTECT_BREAKEVEN,
     SELL,
     WATCH,
+    WATCH_ENTRY,
     OrderflowSnapshot,
     SmartTradeExecutor,
     TradeSetup,
@@ -101,6 +103,30 @@ def test_buy_setup_enters_when_ask_wall_disappears_and_buy_flow_dominates():
     assert decision.reason == "entry_allowed_long"
     assert decision.next_state == ENTERED
 
+
+
+def test_buy_setup_blocks_btc_dump_risk_market_regime_before_new_long_entry():
+    executor = SmartTradeExecutor()
+    setup = make_buy_setup(btc_regime=BTC_DUMP_RISK)
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.5)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_market_regime"
+    assert decision.next_state == WATCH_ENTRY
+
+
+def test_buy_setup_blocks_btc_bearish_market_regime_before_normal_new_long_entry():
+    executor = SmartTradeExecutor()
+    setup = make_buy_setup(btc_regime=BTC_BEARISH)
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.5)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_market_regime"
+    assert decision.next_state == WATCH_ENTRY
 
 def test_buy_position_moves_sl_to_breakeven_after_half_r_confirmation():
     executor = SmartTradeExecutor()

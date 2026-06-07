@@ -207,10 +207,10 @@ class SmartTradeExecutor:
         blockers: list[str] = []
         if setup.side != BUY:
             blockers.append("entry_blocked_side_not_buy")
+        if setup.btc_regime in {BTC_BEARISH, BTC_DUMP_RISK}:
+            blockers.append("entry_blocked_market_regime")
         if setup.score < self.min_long_score:
             blockers.append("entry_blocked_low_score")
-        if setup.btc_regime in {BTC_BEARISH, BTC_DUMP_RISK}:
-            blockers.append("entry_blocked_btc_regime")
         if snapshot.spread_bps > self.max_spread_bps:
             blockers.append("entry_blocked_spread")
         if snapshot.buy_flow <= snapshot.sell_flow * self.flow_ratio:

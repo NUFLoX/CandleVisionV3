@@ -11,6 +11,11 @@ class MarketRegime:
     long_penalty: float = 0.0
     short_bonus: float = 0.0
     reasons: list[str] = field(default_factory=list)
+    market_regime: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.market_regime is None:
+            self.market_regime = self.btc_regime
 
 
 class MarketRegimeAnalyzer:
