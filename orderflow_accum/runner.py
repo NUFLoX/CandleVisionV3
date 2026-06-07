@@ -134,8 +134,9 @@ class AccumulationRunner:
 
     def _build_trade_executor(self) -> SmartTradeExecutor:
         if self.trade_executor_mode != "paper":
-            return SmartTradeExecutor(management_policy=MANAGEMENT_POLICY_LEGACY)
+            return SmartTradeExecutor(management_policy=MANAGEMENT_POLICY_LEGACY, trade_executor_mode=self.trade_executor_mode)
         return SmartTradeExecutor(
+            trade_executor_mode=self.trade_executor_mode,
             management_policy=os.getenv("EXECUTOR_MANAGEMENT_POLICY", MANAGEMENT_POLICY_LEGACY),
             protect_after_1r=self._env_bool("EXECUTOR_PROTECT_AFTER_1R", False),
             min_protected_r_after_1r=self._env_float("EXECUTOR_MIN_PROTECTED_R_AFTER_1R", 0.25),
@@ -1016,6 +1017,8 @@ class AccumulationRunner:
             )
         elif str(decision.action) == MOVE_SL_TO_BREAKEVEN and not diagnostics_json.get("breakeven_time"):
             diagnostics_json["breakeven_time"] = datetime.now(UTC).isoformat()
+        if setup is not None and snapshot is not None and self.trade_executor is not None:
+            diagnostics_json.update(self.trade_executor.entry_gate_diagnostics(setup, snapshot))
         if str(decision.reason) == "entry_blocked_market_regime":
             btc_regime = str(getattr(signal, "meta", {}).get("btc_regime") or "BTC_NEUTRAL")
             market_regime = str(getattr(signal, "meta", {}).get("market_regime") or btc_regime)
