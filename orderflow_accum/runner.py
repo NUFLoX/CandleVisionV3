@@ -133,12 +133,17 @@ class AccumulationRunner:
         except ValueError:
             return default
 
+    def _resolve_executor_management_policy(self) -> str:
+        configured_policy = getattr(self.settings, "executor_management_policy", None)
+        if configured_policy is None or not str(configured_policy).strip():
+            configured_policy = os.getenv("EXECUTOR_MANAGEMENT_POLICY", MANAGEMENT_POLICY_LEGACY)
+        policy = str(configured_policy or MANAGEMENT_POLICY_LEGACY).strip().lower()
+        return policy or MANAGEMENT_POLICY_LEGACY
+
     def _build_trade_executor(self) -> SmartTradeExecutor:
-        if self.trade_executor_mode != "paper":
-            return SmartTradeExecutor(management_policy=MANAGEMENT_POLICY_LEGACY, trade_executor_mode=self.trade_executor_mode)
         return SmartTradeExecutor(
             trade_executor_mode=self.trade_executor_mode,
-            management_policy=os.getenv("EXECUTOR_MANAGEMENT_POLICY", MANAGEMENT_POLICY_LEGACY),
+            management_policy=self._resolve_executor_management_policy(),
             protect_after_1r=self._env_bool("EXECUTOR_PROTECT_AFTER_1R", False),
             min_protected_r_after_1r=self._env_float("EXECUTOR_MIN_PROTECTED_R_AFTER_1R", 0.25),
         )
@@ -1160,6 +1165,11 @@ class AccumulationRunner:
         market_regime = str(meta.get("market_regime") or btc_regime)
         diagnostics_json = {
             **thresholds,
+            "executor_management_policy": (
+                getattr(self.trade_executor, "management_policy", MANAGEMENT_POLICY_LEGACY)
+                if self.trade_executor is not None
+                else MANAGEMENT_POLICY_LEGACY
+            ),
             "btc_regime": btc_regime,
             "market_regime": market_regime,
             "volume_impulse_source": volume_diagnostics.get("volume_impulse_source"),
