@@ -176,12 +176,213 @@ class SignalStore:
         self.ensure_trade_learning_schema()
         self.ensure_trade_diagnosis_schema()
         self.ensure_testnet_order_schema()
+        self.ensure_hybrid_entry_shadow_schema()
 
         if user_version < self.SCHEMA_VERSION:
             cur.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
 
         self.conn.commit()
 
+
+
+    def ensure_hybrid_entry_shadow_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hybrid_entry_shadow (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_key TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                side TEXT NOT NULL,
+                signal_kind TEXT,
+                scanner_entry REAL NOT NULL,
+                scanner_sl REAL NOT NULL,
+                original_risk REAL NOT NULL,
+                scenario TEXT NOT NULL,
+                status TEXT NOT NULL,
+                shadow_entry_price REAL,
+                shadow_sl REAL,
+                shadow_entry_time TEXT,
+                max_gain_r REAL NOT NULL DEFAULT 0,
+                max_drawdown_r REAL NOT NULL DEFAULT 0,
+                exit_r REAL,
+                reason TEXT,
+                features_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(signal_key, scenario)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_hybrid_entry_shadow_scenario
+            ON hybrid_entry_shadow(scenario, status, updated_at)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_hybrid_entry_shadow_symbol
+            ON hybrid_entry_shadow(symbol, timeframe, updated_at)
+            """
+        )
+        self.conn.commit()
+
+    def upsert_hybrid_entry_shadow(
+        self,
+        *,
+        signal_key: str,
+        symbol: str,
+        timeframe: str,
+        side: str,
+        signal_kind: str | None,
+        scanner_entry: float,
+        scanner_sl: float,
+        original_risk: float,
+        scenario: str,
+        status: str,
+        shadow_entry_price: float | None = None,
+        shadow_sl: float | None = None,
+        shadow_entry_time: str | None = None,
+        max_gain_r: float = 0.0,
+        max_drawdown_r: float = 0.0,
+        exit_r: float | None = None,
+        reason: str | None = None,
+        features_json: str | dict[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_hybrid_entry_shadow_schema()
+        now = _utc_now()
+        existing = self.get_hybrid_entry_shadow(signal_key, scenario)
+        created = str(existing["created_at"]) if existing is not None else (created_at or now)
+        payload = self._json_dumps_safe(features_json or {}) if not isinstance(features_json, str) else features_json
+        self.conn.execute(
+            """
+            INSERT INTO hybrid_entry_shadow (
+                signal_key, symbol, timeframe, side, signal_kind, scanner_entry, scanner_sl, original_risk,
+                scenario, status, shadow_entry_price, shadow_sl, shadow_entry_time, max_gain_r, max_drawdown_r,
+                exit_r, reason, features_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_key, scenario) DO UPDATE SET
+                symbol=excluded.symbol,
+                timeframe=excluded.timeframe,
+                side=excluded.side,
+                signal_kind=excluded.signal_kind,
+                scanner_entry=excluded.scanner_entry,
+                scanner_sl=excluded.scanner_sl,
+                original_risk=excluded.original_risk,
+                status=excluded.status,
+                shadow_entry_price=excluded.shadow_entry_price,
+                shadow_sl=excluded.shadow_sl,
+                shadow_entry_time=excluded.shadow_entry_time,
+                max_gain_r=excluded.max_gain_r,
+                max_drawdown_r=excluded.max_drawdown_r,
+                exit_r=excluded.exit_r,
+                reason=excluded.reason,
+                features_json=excluded.features_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                signal_key,
+                symbol,
+                timeframe,
+                side,
+                signal_kind,
+                self._optional_float(scanner_entry),
+                self._optional_float(scanner_sl),
+                self._optional_float(original_risk),
+                scenario,
+                status,
+                self._optional_float(shadow_entry_price),
+                self._optional_float(shadow_sl),
+                shadow_entry_time,
+                float(max_gain_r or 0.0),
+                float(max_drawdown_r or 0.0),
+                self._optional_float(exit_r),
+                reason,
+                payload,
+                created,
+                now,
+            ),
+        )
+        self.conn.commit()
+        row = self.get_hybrid_entry_shadow(signal_key, scenario)
+        if row is None:
+            raise RuntimeError(f"hybrid entry shadow row was not stored: {signal_key} {scenario}")
+        return row
+
+    def get_hybrid_entry_shadow(self, signal_key: str, scenario: str) -> dict[str, Any] | None:
+        self.ensure_hybrid_entry_shadow_schema()
+        row = self.conn.execute(
+            "SELECT * FROM hybrid_entry_shadow WHERE signal_key = ? AND scenario = ?",
+            (signal_key, scenario),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_hybrid_entry_shadow(self, limit: int = 500) -> list[dict[str, Any]]:
+        self.ensure_hybrid_entry_shadow_schema()
+        safe_limit = max(1, int(limit or 500))
+        rows = self.conn.execute(
+            "SELECT * FROM hybrid_entry_shadow ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (safe_limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def hybrid_entry_shadow_summary(self) -> dict[str, Any]:
+        self.ensure_hybrid_entry_shadow_schema()
+        scenarios: dict[str, dict[str, Any]] = {}
+        for row in self.conn.execute(
+            """
+            SELECT scenario, COUNT(*) AS total,
+                   SUM(CASE WHEN status = 'ENTERED' THEN 1 ELSE 0 END) AS entered,
+                   SUM(CASE WHEN status = 'MISSED' THEN 1 ELSE 0 END) AS missed,
+                   AVG(exit_r) AS avg_exit_r,
+                   AVG(max_gain_r) AS avg_max_gain_r,
+                   AVG(max_drawdown_r) AS avg_max_drawdown_r
+            FROM hybrid_entry_shadow
+            GROUP BY scenario
+            """
+        ).fetchall():
+            scenarios[str(row["scenario"])] = {
+                "total": int(row["total"] or 0),
+                "entered": int(row["entered"] or 0),
+                "missed": int(row["missed"] or 0),
+                "avg_exit_r": self._optional_float(row["avg_exit_r"]),
+                "avg_max_gain_r": self._optional_float(row["avg_max_gain_r"]),
+                "avg_max_drawdown_r": self._optional_float(row["avg_max_drawdown_r"]),
+            }
+
+        current = self.conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN action IN ('ENTER_LONG', 'ENTER_SHORT') THEN 1 ELSE 0 END) AS entered,
+                   AVG(max_gain_r) AS avg_max_gain_r,
+                   AVG(max_drawdown_r) AS avg_max_drawdown_r
+            FROM executor_outcomes
+            """
+        ).fetchone()
+        current_executor = {
+            "total": int(current["total"] or 0),
+            "entered": int(current["entered"] or 0),
+            "avg_max_gain_r": self._optional_float(current["avg_max_gain_r"]),
+            "avg_max_drawdown_r": self._optional_float(current["avg_max_drawdown_r"]),
+        }
+        best_name = None
+        best_value = None
+        for name, stats in scenarios.items():
+            value = stats.get("avg_exit_r")
+            if value is not None and (best_value is None or value > best_value):
+                best_name = name
+                best_value = value
+        return {
+            "current_executor": current_executor,
+            "pullback_shadow": scenarios.get("pullback_shadow", {"total": 0, "entered": 0, "missed": 0}),
+            "momentum_0_5r_shadow": scenarios.get("momentum_0_5r_shadow", {"total": 0, "entered": 0, "missed": 0}),
+            "hybrid_best": {"scenario": best_name, "avg_exit_r": best_value},
+            "scenarios": scenarios,
+        }
 
     def ensure_executor_schema(self) -> None:
         cur = self.conn.cursor()
@@ -683,6 +884,7 @@ class SignalStore:
 
     def insert_testnet_order(self, order: dict[str, Any]) -> dict[str, Any]:
         self.ensure_testnet_order_schema()
+        self.ensure_hybrid_entry_shadow_schema()
         now = _utc_now()
         created_at = str(order.get("created_at") or now)
         updated_at = str(order.get("updated_at") or now)
@@ -726,6 +928,7 @@ class SignalStore:
 
     def get_testnet_order_by_signal(self, signal_key: str) -> dict[str, Any] | None:
         self.ensure_testnet_order_schema()
+        self.ensure_hybrid_entry_shadow_schema()
         row = self.conn.execute(
             "SELECT * FROM testnet_orders WHERE signal_key = ? AND status IN ('placed', 'filled') ORDER BY id DESC LIMIT 1",
             (signal_key,),
@@ -734,6 +937,7 @@ class SignalStore:
 
     def get_latest_open_testnet_order(self, signal_key: str) -> dict[str, Any] | None:
         self.ensure_testnet_order_schema()
+        self.ensure_hybrid_entry_shadow_schema()
         row = self.conn.execute(
             """
             SELECT * FROM testnet_orders
@@ -753,6 +957,7 @@ class SignalStore:
 
     def count_open_testnet_positions(self) -> int:
         self.ensure_testnet_order_schema()
+        self.ensure_hybrid_entry_shadow_schema()
         row = self.conn.execute(
             """
             SELECT COUNT(*) FROM testnet_orders entries
@@ -770,6 +975,7 @@ class SignalStore:
 
     def count_testnet_orders_since(self, iso_since: str) -> int:
         self.ensure_testnet_order_schema()
+        self.ensure_hybrid_entry_shadow_schema()
         row = self.conn.execute(
             "SELECT COUNT(*) FROM testnet_orders WHERE status IN ('placed', 'filled') AND created_at >= ?",
             (iso_since,),
@@ -778,6 +984,7 @@ class SignalStore:
 
     def list_testnet_orders(self, limit: int = 100) -> list[dict[str, Any]]:
         self.ensure_testnet_order_schema()
+        self.ensure_hybrid_entry_shadow_schema()
         rows = self.conn.execute(
             "SELECT * FROM testnet_orders ORDER BY created_at DESC, id DESC LIMIT ?",
             (max(1, int(limit or 100)),),
