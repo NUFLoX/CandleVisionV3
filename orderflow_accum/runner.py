@@ -1979,9 +1979,6 @@ class AccumulationRunner:
         upsert = self.signal_store.upsert_signal(signal, market=market)
         promoted, promoted_to, promoted_reasons = self._maybe_promote_confirmed(signal, upsert, market)
         confirmed_status = promoted_to or upsert.to_status
-        upsert = self.signal_store.upsert_signal(signal, market=market)
-        promoted, promoted_to, promoted_reasons = self._maybe_promote_confirmed(signal, upsert, market)
-        confirmed_status = promoted_to or upsert.to_status
 
         signal_key = self._signal_key(signal, market)
         self._record_signal_lifecycle(signal, signal_key, upsert, confirmed_status)
