@@ -1297,3 +1297,120 @@ def test_active_recovery_prefers_executor_trade_initial_sl_before_current_sl(tmp
     assert diagnostics["invalid_initial_risk"] is False
     assert abs(diagnostics["initial_risk"] - (1.13365 - 1.1141475)) < 1e-12
     runner.signal_store.close()
+
+
+def _hybrid_row(runner: AccumulationRunner, signal: Signal, scenario: str) -> dict:
+    row = runner.signal_store.get_hybrid_entry_shadow(signal_key(signal), scenario)
+    assert row is not None
+    return row
+
+
+def test_hybrid_shadow_observation_created_without_changing_executor_decision(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot(buy_flow=100.0, sell_flow=100.0)})
+    key = signal_key(signal)
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    outcome = runner.signal_store.get_executor_outcome(key)
+    assert outcome["action"] == "WATCH"
+    assert _hybrid_row(runner, signal, "pullback_shadow")["status"] in {"OBSERVING", "ENTERED"}
+    assert _hybrid_row(runner, signal, "momentum_0_5r_shadow")["status"] == "OBSERVING"
+    runner.signal_store.close()
+
+
+def test_hybrid_momentum_half_r_creates_shadow_entry_when_orderflow_confirms(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    signal = make_signal(
+        stop_loss=98.0,
+        meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot(price=101.0, buy_flow=150.0, sell_flow=90.0, volume_impulse=1.5)},
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = _hybrid_row(runner, signal, "momentum_0_5r_shadow")
+    features = json.loads(row["features_json"])
+    assert row["status"] == "ENTERED"
+    assert row["shadow_entry_price"] == 101.0
+    assert features["momentum_triggered_at_r"] == 0.5
+    runner.signal_store.close()
+
+
+def test_hybrid_momentum_does_not_enter_in_btc_bearish_or_dump_risk(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    signal = make_signal(
+        stop_loss=98.0,
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_DUMP_RISK",
+            "executor_snapshot": make_snapshot(price=101.0, buy_flow=150.0, sell_flow=90.0, volume_impulse=1.5),
+        },
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = _hybrid_row(runner, signal, "momentum_0_5r_shadow")
+    features = json.loads(row["features_json"])
+    assert row["status"] == "OBSERVING"
+    assert features["btc_regime_ok"] is False
+    runner.signal_store.close()
+
+
+def test_hybrid_momentum_does_not_chase_after_one_r(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    signal = make_signal(
+        stop_loss=98.0,
+        meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot(price=102.1, buy_flow=150.0, sell_flow=90.0, volume_impulse=1.5)},
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = _hybrid_row(runner, signal, "momentum_0_5r_shadow")
+    features = json.loads(row["features_json"])
+    assert row["status"] == "MISSED"
+    assert row["reason"] == "missed_momentum_too_late"
+    assert features["missed_momentum_too_late"] is True
+    runner.signal_store.close()
+
+
+def test_hybrid_pullback_can_create_shadow_entry_after_retest_holds(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    signal = make_signal(
+        stop_loss=98.0,
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "executor_snapshot": make_snapshot(price=99.8, buy_flow=110.0, sell_flow=100.0, support=99.5, vwap=99.75),
+        },
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = _hybrid_row(runner, signal, "pullback_shadow")
+    features = json.loads(row["features_json"])
+    assert row["status"] == "ENTERED"
+    assert row["reason"] == "pullback_retest_held_orderflow_recovered"
+    assert features["pullback_depth_r"] > 0
+    assert features["support_holds"] is True
+    runner.signal_store.close()
+
+
+def test_hybrid_shadow_does_not_place_bybit_testnet_order_when_actual_entry_blocked(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(
+        stop_loss=98.0,
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_DUMP_RISK",
+            "executor_snapshot": make_snapshot(price=101.0, buy_flow=150.0, sell_flow=90.0, volume_impulse=1.5),
+        },
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    assert fake.entry_calls == 0
+    assert _hybrid_row(runner, signal, "momentum_0_5r_shadow")["status"] == "OBSERVING"
+    runner.signal_store.close()

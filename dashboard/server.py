@@ -1633,6 +1633,103 @@ def _read_executor_exit_shadow() -> dict[str, object]:
         conn.close()
 
 
+
+def _empty_hybrid_entry_shadow_payload() -> dict[str, object]:
+    return {
+        "summary": {
+            "current_executor": {"total": 0, "entered": 0, "avg_max_gain_r": None, "avg_max_drawdown_r": None},
+            "pullback_shadow": {"total": 0, "entered": 0, "missed": 0},
+            "momentum_0_5r_shadow": {"total": 0, "entered": 0, "missed": 0},
+            "hybrid_best": {"scenario": None, "avg_exit_r": None},
+        },
+        "rows": [],
+    }
+
+
+def _read_hybrid_entry_shadow(limit: int = 200) -> dict[str, object]:
+    payload = _empty_hybrid_entry_shadow_payload()
+    if not SIGNALS_DB_PATH.exists():
+        return payload
+    conn = sqlite3.connect(str(SIGNALS_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        shadow_columns = _table_columns(conn, "hybrid_entry_shadow")
+        if not shadow_columns:
+            return payload
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM hybrid_entry_shadow
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 200)),),
+        ).fetchall()
+        parsed_rows = []
+        for row in rows:
+            item = dict(row)
+            item["features_json"] = _safe_json_object(item.get("features_json"))
+            parsed_rows.append(item)
+        payload["rows"] = parsed_rows
+
+        scenario_rows = conn.execute(
+            """
+            SELECT scenario, COUNT(*) AS total,
+                   SUM(CASE WHEN status = 'ENTERED' THEN 1 ELSE 0 END) AS entered,
+                   SUM(CASE WHEN status = 'MISSED' THEN 1 ELSE 0 END) AS missed,
+                   AVG(exit_r) AS avg_exit_r,
+                   AVG(max_gain_r) AS avg_max_gain_r,
+                   AVG(max_drawdown_r) AS avg_max_drawdown_r
+            FROM hybrid_entry_shadow
+            GROUP BY scenario
+            """
+        ).fetchall()
+        scenarios: dict[str, dict[str, object]] = {}
+        for row in scenario_rows:
+            scenarios[str(row["scenario"])] = {
+                "total": int(row["total"] or 0),
+                "entered": int(row["entered"] or 0),
+                "missed": int(row["missed"] or 0),
+                "avg_exit_r": _round4(_safe_float(row["avg_exit_r"])),
+                "avg_max_gain_r": _round4(_safe_float(row["avg_max_gain_r"])),
+                "avg_max_drawdown_r": _round4(_safe_float(row["avg_max_drawdown_r"])),
+            }
+        executor_columns = _table_columns(conn, "executor_outcomes")
+        current_executor = payload["summary"]["current_executor"]
+        if executor_columns:
+            current = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN action IN ('ENTER_LONG', 'ENTER_SHORT') THEN 1 ELSE 0 END) AS entered,
+                       AVG(max_gain_r) AS avg_max_gain_r,
+                       AVG(max_drawdown_r) AS avg_max_drawdown_r
+                FROM executor_outcomes
+                """
+            ).fetchone()
+            current_executor = {
+                "total": int(current["total"] or 0),
+                "entered": int(current["entered"] or 0),
+                "avg_max_gain_r": _round4(_safe_float(current["avg_max_gain_r"])),
+                "avg_max_drawdown_r": _round4(_safe_float(current["avg_max_drawdown_r"])),
+            }
+        best_name = None
+        best_value = None
+        for name, stats in scenarios.items():
+            value = _safe_float(stats.get("avg_exit_r"))
+            if value is not None and (best_value is None or value > best_value):
+                best_name = name
+                best_value = value
+        payload["summary"] = {
+            "current_executor": current_executor,
+            "pullback_shadow": scenarios.get("pullback_shadow", {"total": 0, "entered": 0, "missed": 0}),
+            "momentum_0_5r_shadow": scenarios.get("momentum_0_5r_shadow", {"total": 0, "entered": 0, "missed": 0}),
+            "hybrid_best": {"scenario": best_name, "avg_exit_r": _round4(best_value)},
+            "scenarios": scenarios,
+        }
+        return payload
+    finally:
+        conn.close()
+
 def _read_executor_exit_shadow_open(conn: sqlite3.Connection, columns: set[str], limit: int = 100) -> list[dict[str, object]]:
     if not {"state", "action", "diagnostics_json"}.issubset(columns):
         return []
@@ -2581,6 +2678,11 @@ def create_app() -> FastAPI:
     @app.get("/api/executor-exit-shadow")
     async def executor_exit_shadow():
         return _read_executor_exit_shadow()
+
+
+    @app.get("/api/hybrid-entry-shadow")
+    async def hybrid_entry_shadow(limit: Annotated[int, Query(ge=1, le=1000)] = 200):
+        return _read_hybrid_entry_shadow(limit=limit)
 
 
     @app.get("/api/signal-profit-potential")

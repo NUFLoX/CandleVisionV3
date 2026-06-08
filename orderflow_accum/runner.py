@@ -23,6 +23,7 @@ from .signal_logger import RejectionCsvLogger, SignalCsvLogger
 from .signal_store import SignalStore
 from .confirmed_promoter import ConfirmedPromoter
 from .indicators import add_indicators
+from .hybrid_entry_shadow import HybridEntryShadowEngine
 from .executor_exit_shadow import (
     DEFAULT_EXIT_SHADOW_POLICY,
     current_unrealized_r,
@@ -83,6 +84,11 @@ class AccumulationRunner:
             BybitTestnetOrderExecutor(self.signal_store, notifier=self.telegram, logger_=self.logger)
             if self.trade_executor_mode == "testnet"
             else None
+        )
+        self.hybrid_entry_shadow = HybridEntryShadowEngine(
+            min_volume_impulse=self._env_float("HYBRID_ENTRY_SHADOW_MIN_VOLUME_IMPULSE", 1.2),
+            max_spread_bps=self._env_float("HYBRID_ENTRY_SHADOW_MAX_SPREAD_BPS", 15.0),
+            ask_wall_entry_limit=self._env_float("HYBRID_ENTRY_SHADOW_ASK_WALL_LIMIT", 0.65),
         )
         self.executor_exit_shadow_enabled = os.getenv("EXECUTOR_EXIT_SHADOW_ENABLED", "false").strip().lower() == "true"
         self.executor_exit_shadow_policy = os.getenv("EXECUTOR_EXIT_SHADOW_POLICY", DEFAULT_EXIT_SHADOW_POLICY).strip() or DEFAULT_EXIT_SHADOW_POLICY
@@ -1973,6 +1979,22 @@ class AccumulationRunner:
                 self.logger.exception("Failed to refresh open executor position %s", row["signal_key"])
         return refreshed
 
+
+    def _observe_hybrid_entry_shadow(self, signal_key: str, setup: TradeSetup, snapshot: OrderflowSnapshot) -> None:
+        engine = getattr(self, "hybrid_entry_shadow", None)
+        if engine is None:
+            executor = getattr(self, "trade_executor", None)
+            engine = HybridEntryShadowEngine(
+                min_volume_impulse=self._optional_float(getattr(executor, "min_entry_volume_impulse", None)) or 1.2,
+                max_spread_bps=self._optional_float(getattr(executor, "max_spread_bps", None)) or 15.0,
+                ask_wall_entry_limit=self._optional_float(getattr(executor, "ask_wall_entry_limit", None)) or 0.65,
+            )
+            self.hybrid_entry_shadow = engine
+        try:
+            engine.observe(store=self.signal_store, signal_key=signal_key, setup=setup, snapshot=snapshot)
+        except Exception:
+            self.logger.exception("Hybrid entry shadow observation failed for %s", signal_key)
+
     def _process_paper_executor(self, signal, market: str, confirmed_status: str | None, state=None) -> None:
         if not self.trade_executor_enabled or self.trade_executor is None:
             return
@@ -1983,6 +2005,7 @@ class AccumulationRunner:
         existing = self.signal_store.get_executor_outcome(signal_key)
         snapshot, weak = self._paper_executor_snapshot(signal, state)
         setup = self._paper_executor_setup(signal)
+        self._observe_hybrid_entry_shadow(signal_key, setup, snapshot)
 
         if weak:
             current_state = str(existing["state"]) if existing is not None else "TRADE_WATCH"
