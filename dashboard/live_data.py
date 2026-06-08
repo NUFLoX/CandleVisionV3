@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from config.settings import API_TIMEOUT, BYBIT_REST_BASE_URL
+from .market_state_logic import normalize_altcoin_market_state
 from .schemas import BotLog, BotStatus, CoinMetrics, MarketState, PressureStrip
 from .store import normalize_symbol
 
@@ -271,22 +272,21 @@ def _pressure_from_bybit(coin_metrics: dict[str, CoinMetrics]) -> list[PressureS
 def _build_market_state(coin_metrics: dict[str, CoinMetrics], pressure_strips: list[PressureStrip]) -> MarketState:
     btc = coin_metrics.get("BTCUSDT")
     btc_score = btc.accumulation_score if btc else 0.0
-    usdt = next((strip.value for strip in pressure_strips if strip.key == "usdt_d"), 0.0)
     total3 = next((strip.value for strip in pressure_strips if strip.key == "total3"), 0.0)
     btc_filter = "DANGER" if btc_score < 3.5 else "CAUTION" if btc_score < 5.5 else "STABLE"
-    altcoin_mode = "RISK-OFF" if usdt > 8 and total3 < 35 else "SELECTIVE" if total3 < 45 else "RISK-ON"
     liquidity = "HIGH" if btc and btc.volume_24h_usd >= 5_000_000_000 else "MEDIUM"
     market_regime = "BULL" if total3 >= 45 and btc_score >= 5.5 else "BEAR" if btc_score < 3.5 else "RANGE"
-    return MarketState(
+    market_state = MarketState(
         btc_filter=btc_filter,
-        altcoin_mode=altcoin_mode,
+        altcoin_mode="WAITING",
         liquidity=liquidity,
         market_regime=market_regime,
         usdt_dominance_trend="real-time-level",
         total3_strength="strong" if total3 >= 45 else "weak",
-        can_emit_alt_signals=btc_filter != "DANGER" and altcoin_mode != "RISK-OFF",
+        can_emit_alt_signals=False,
         updated_at=datetime.now(timezone.utc),
     )
+    return normalize_altcoin_market_state(market_state, pressure_strips)
 
 
 def _accumulation_score(rsi: float, price: float, ema20: float, ema50: float, imbalance: float, volume_spike: str) -> float:
