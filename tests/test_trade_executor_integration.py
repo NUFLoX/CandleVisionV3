@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -876,6 +877,60 @@ def test_testnet_risk_off_exception_records_diagnostics_json(tmp_path: Path) -> 
     assert diagnostics["required_volume_impulse"] == 1.2
     assert diagnostics["ask_wall_strength"] == 0.2
     assert diagnostics["spread_bps"] == 4.0
+    runner.signal_store.close()
+
+
+def test_percent_move_is_normalized_before_active_r_conversion(tmp_path: Path) -> None:
+    entry = 1.13365
+    initial_risk = entry - 1.1141475
+
+    active_r = AccumulationRunner._active_r_from_fractional_price_move(
+        entry_price=entry,
+        initial_risk=initial_risk,
+        move=2.26,
+    )
+
+    assert math.isclose(active_r, (entry * 0.0226) / initial_risk, rel_tol=0.0, abs_tol=1e-12)
+    assert 1.30 < active_r < 1.32
+
+
+def test_active_buy_suspicious_r_recomputes_from_stored_price_extremes(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(
+        symbol="ENAUSDT",
+        entry=1.13365,
+        stop_loss=1.1141475,
+        meta={"tf": "5", "market": "linear"},
+    )
+    key = signal_key(signal)
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="ENAUSDT",
+        side="Buy",
+        state="TRAILING_PROFIT",
+        action="HOLD",
+        reason="hold_position",
+        entry_price=1.13365,
+        current_sl=1.1379025,
+        max_gain_r=131.0,
+        max_drawdown_r=0.1,
+        bars_in_trade=7,
+        diagnostics_json={
+            "executor_entry_price": 1.13365,
+            "executor_initial_sl": 1.1141475,
+            "executor_max_price": 1.1592,
+            "executor_min_price": 1.13365,
+        },
+    )
+
+    position = runner._position_from_executor_row(signal, runner.signal_store.get_executor_outcome(key))
+    diagnostics = json.loads(runner.signal_store.get_executor_outcome(key)["diagnostics_json"])
+
+    assert 1.30 < position.max_gain_r < 1.32
+    assert position.max_gain_r < 10.0
+    assert diagnostics["active_r_recomputed_from_price_extremes"] is True
+    assert diagnostics["suspicious_active_r_scale"] is False
+    assert diagnostics["active_r_scale_original_max_gain_r"] == 131.0
     runner.signal_store.close()
 
 
