@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 from threading import Lock
 
@@ -20,13 +21,37 @@ class ConsoleUI:
         self._started_at = datetime.now()
         self._stats = {"macro": 0, "orderflow": 0, "ws": "BOOT"}
 
-    def print_banner(self, version: str, quote: str, testnet: bool, signals_only: bool, signal_mode: str | None = None) -> None:
+    def print_banner(
+        self,
+        version: str,
+        quote: str,
+        testnet: bool,
+        signals_only: bool,
+        signal_mode: str | None = None,
+        market_data_testnet: bool | None = None,
+    ) -> None:
         mode = "SIGNALS ONLY" if signals_only else "TRADE READY"
-        network = "TESTNET" if testnet else "MAINNET"
+        if market_data_testnet is None:
+            market_data_testnet = os.getenv("BYBIT_MARKET_DATA_TESTNET", "false").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        market_data_network = "TESTNET" if market_data_testnet else "MAINNET"
+        order_network = "TESTNET" if testnet else "MAINNET"
         title = Text(" CandleVision Accumulation ", style="bold bright_cyan")
         body = Table.grid(padding=(0, 2))
         body.add_row("Version", f"[bold white]{version}[/bold white]")
-        body.add_row("Network", f"[bold magenta]{network}[/bold magenta]")
+        body.add_row(
+            "Market data",
+            f"[bold magenta]{market_data_network}[/bold magenta] "
+            f"([dim]market_data_testnet={market_data_testnet}[/dim])",
+        )
+        body.add_row(
+            "Orders",
+            f"[bold magenta]{order_network}[/bold magenta] ([dim]order_testnet={testnet}[/dim])",
+        )
         body.add_row("Mode", f"[bold green]{mode}[/bold green]")
         body.add_row("Quote", f"[bold yellow]{quote}[/bold yellow]")
         if signal_mode:
