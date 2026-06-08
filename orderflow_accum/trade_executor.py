@@ -29,6 +29,7 @@ RISK_OFF = "RISK_OFF"
 RISK_ON = "RISK_ON"
 ABSORPTION_ZONE = "ABSORPTION_ZONE"
 PRE_IMPULSE_ZONE = "PRE_IMPULSE_ZONE"
+BREAKOUT_PRESSURE = "BREAKOUT_PRESSURE"
 ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION = "entry_blocked_absorption_weak_confirmation"
 
 MANAGEMENT_POLICY_LEGACY = "legacy"
@@ -119,12 +120,16 @@ class SmartTradeExecutor:
         testnet_volume_impulse_relaxation: float = 0.85,
         testnet_absorption_flow_ratio: float = 1.05,
         testnet_pre_impulse_bullish_flow_ratio: float = 1.05,
+        testnet_risk_off_volume_impulse_relaxation: float = 0.75,
     ) -> None:
         self.absorption_flow_ratio = max(float(absorption_flow_ratio), 1.0)
         self.trade_executor_mode = str(trade_executor_mode or "paper").strip().lower()
         self.testnet_volume_impulse_relaxation = min(max(float(testnet_volume_impulse_relaxation), 0.0), 1.0)
         self.testnet_absorption_flow_ratio = max(float(testnet_absorption_flow_ratio), 1.0)
         self.testnet_pre_impulse_bullish_flow_ratio = max(float(testnet_pre_impulse_bullish_flow_ratio), 1.0)
+        self.testnet_risk_off_volume_impulse_relaxation = min(
+            max(float(testnet_risk_off_volume_impulse_relaxation), 0.0), 1.0
+        )
         self.min_long_score = min_long_score
         self.max_spread_bps = max_spread_bps
         self.flow_ratio = flow_ratio
@@ -193,13 +198,17 @@ class SmartTradeExecutor:
             volume_ratio_to_required = float(snapshot.volume_impulse) / float(self.min_entry_volume_impulse)
         volume_relaxed = self._volume_impulse_passed(snapshot, relaxed=True) and not self._volume_impulse_passed(snapshot)
         buy_flow_relaxed = self._buy_flow_passed(setup, snapshot, relaxed=True) and not self._buy_flow_passed(setup, snapshot)
+        risk_off_exception = self._testnet_risk_off_exception_passed(setup, snapshot)
         testnet_entry_gate_relaxed = self._is_testnet_mode() and (volume_relaxed or buy_flow_relaxed)
+        testnet_entry_gate_relaxed = testnet_entry_gate_relaxed or risk_off_exception
         if self._is_testnet_mode() and self._is_absorption_setup(setup) and setup.side == BUY:
             confirmations = self._testnet_absorption_long_confirmations(snapshot)
             testnet_entry_gate_relaxed = testnet_entry_gate_relaxed or (sum(confirmations.values()) >= 2 and not self._strict_absorption_long_confirmations_passed(snapshot))
         return {
             "trade_executor_mode": self.trade_executor_mode,
             "testnet_entry_gate_relaxed": bool(testnet_entry_gate_relaxed),
+            "testnet_risk_off_exception": bool(risk_off_exception),
+            "testnet_relaxation_reason": "strong_testnet_entry_during_risk_off" if risk_off_exception else None,
             "volume_impulse_relaxed_for_testnet": bool(volume_relaxed),
             "volume_impulse_ratio_to_required": volume_ratio_to_required,
             "buy_flow_relaxed_for_testnet": bool(buy_flow_relaxed),
@@ -211,6 +220,7 @@ class SmartTradeExecutor:
             "volume_impulse": float(snapshot.volume_impulse),
             "required_volume_impulse": float(self.min_entry_volume_impulse),
             "ask_wall_strength": float(snapshot.ask_wall_strength),
+            "spread_bps": float(snapshot.spread_bps),
         }
 
     def _is_absorption_setup(self, setup: TradeSetup) -> bool:
@@ -219,10 +229,9 @@ class SmartTradeExecutor:
         return any(str(reason).upper() == ABSORPTION_ZONE for reason in (setup.reasons or []))
 
     def _absorption_long_gate_passed(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> bool:
-        market_regime = str(setup.market_regime or "").upper()
         if setup.btc_regime in {BTC_BEARISH, BTC_DUMP_RISK}:
             return False
-        if market_regime == RISK_OFF:
+        if self._is_risk_off_regime(setup.market_regime):
             return False
         if snapshot.spread_bps > self.max_spread_bps:
             return False
@@ -323,19 +332,34 @@ class SmartTradeExecutor:
         blockers: list[str] = []
         if setup.side != BUY:
             blockers.append("entry_blocked_side_not_buy")
-        if setup.btc_regime in {BTC_BEARISH, BTC_DUMP_RISK}:
+        btc_dangerous = setup.btc_regime in {BTC_BEARISH, BTC_DUMP_RISK}
+        if btc_dangerous:
             blockers.append("entry_blocked_market_regime")
+
+        market_risk_off = self._is_risk_off_regime(setup.market_regime)
+        testnet_risk_off_candidate = self._testnet_risk_off_exception_candidate(setup)
+        if market_risk_off and not btc_dangerous and not testnet_risk_off_candidate:
+            blockers.append("entry_blocked_market_regime")
+
         if setup.score < self.min_long_score:
             blockers.append("entry_blocked_low_score")
         if snapshot.spread_bps > self.max_spread_bps:
             blockers.append("entry_blocked_spread")
         absorption_testnet_relaxed = self._is_testnet_mode() and self._is_absorption_setup(setup)
-        if not absorption_testnet_relaxed and not self._buy_flow_passed(setup, snapshot, relaxed=True):
-            blockers.append("entry_blocked_buy_flow")
-        if not absorption_testnet_relaxed and not self._volume_impulse_passed(snapshot, relaxed=True):
-            blockers.append("entry_blocked_volume_impulse")
-        if not absorption_testnet_relaxed and snapshot.ask_wall_strength > self.ask_wall_entry_limit:
-            blockers.append("entry_blocked_ask_wall")
+        if testnet_risk_off_candidate:
+            if not self._testnet_risk_off_buy_flow_passed(snapshot):
+                blockers.append("entry_blocked_buy_flow")
+            if not self._testnet_risk_off_volume_impulse_passed(snapshot):
+                blockers.append("entry_blocked_volume_impulse")
+            if snapshot.ask_wall_strength > self.ask_wall_entry_limit:
+                blockers.append("entry_blocked_ask_wall")
+        else:
+            if not absorption_testnet_relaxed and not self._buy_flow_passed(setup, snapshot, relaxed=True):
+                blockers.append("entry_blocked_buy_flow")
+            if not absorption_testnet_relaxed and not self._volume_impulse_passed(snapshot, relaxed=True):
+                blockers.append("entry_blocked_volume_impulse")
+            if not absorption_testnet_relaxed and snapshot.ask_wall_strength > self.ask_wall_entry_limit:
+                blockers.append("entry_blocked_ask_wall")
         if snapshot.support is not None and snapshot.price < snapshot.support:
             blockers.append("entry_blocked_below_support")
         if snapshot.ema20 is not None and snapshot.price < snapshot.ema20:
@@ -346,6 +370,48 @@ class SmartTradeExecutor:
 
     def _is_testnet_mode(self) -> bool:
         return self.trade_executor_mode == "testnet"
+
+    @staticmethod
+    def _normalize_regime(value: Optional[str]) -> str:
+        return str(value or "").strip().upper().replace("-", "_")
+
+    def _is_risk_off_regime(self, value: Optional[str]) -> bool:
+        return self._normalize_regime(value) == RISK_OFF
+
+    def _is_breakout_pressure_setup(self, setup: TradeSetup) -> bool:
+        if str(setup.signal_kind or "").upper() == BREAKOUT_PRESSURE:
+            return True
+        return any(str(reason).upper() == BREAKOUT_PRESSURE for reason in (setup.reasons or []))
+
+    def _is_strong_testnet_risk_off_signal(self, setup: TradeSetup) -> bool:
+        return self._is_pre_impulse_setup(setup) or self._is_breakout_pressure_setup(setup)
+
+    def _testnet_risk_off_exception_candidate(self, setup: TradeSetup) -> bool:
+        return (
+            self._is_testnet_mode()
+            and setup.side == BUY
+            and self._is_risk_off_regime(setup.market_regime)
+            and setup.btc_regime in {BTC_BULLISH, BTC_NEUTRAL}
+            and self._is_strong_testnet_risk_off_signal(setup)
+        )
+
+    def _testnet_risk_off_required_volume_impulse(self) -> float:
+        return self.min_entry_volume_impulse * self.testnet_risk_off_volume_impulse_relaxation
+
+    def _testnet_risk_off_buy_flow_passed(self, snapshot: OrderflowSnapshot) -> bool:
+        return snapshot.buy_flow > snapshot.sell_flow
+
+    def _testnet_risk_off_volume_impulse_passed(self, snapshot: OrderflowSnapshot) -> bool:
+        return snapshot.volume_impulse >= self._testnet_risk_off_required_volume_impulse()
+
+    def _testnet_risk_off_exception_passed(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> bool:
+        return (
+            self._testnet_risk_off_exception_candidate(setup)
+            and self._testnet_risk_off_buy_flow_passed(snapshot)
+            and self._testnet_risk_off_volume_impulse_passed(snapshot)
+            and snapshot.ask_wall_strength <= self.ask_wall_entry_limit
+            and snapshot.spread_bps <= self.max_spread_bps
+        )
 
     def _is_pre_impulse_setup(self, setup: TradeSetup) -> bool:
         if str(setup.signal_kind or "").upper() == PRE_IMPULSE_ZONE:

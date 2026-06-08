@@ -840,3 +840,40 @@ def test_testnet_exit_uses_reduce_only_executor_path(tmp_path: Path) -> None:
     assert diagnostics["testnet_order_status"] == "placed"
     assert diagnostics["testnet_order_id"] == "exit-1"
     runner.signal_store.close()
+
+
+def test_testnet_risk_off_exception_records_diagnostics_json(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(
+        kind="PRE_IMPULSE_ZONE",
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_BULLISH",
+            "market_regime": "RISK-OFF",
+            "executor_snapshot": make_snapshot(buy_flow=106.0, sell_flow=100.0, volume_impulse=0.90),
+        },
+    )
+    key = signal_key(signal)
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert fake.entry_calls == 1
+    assert row["action"] == "ENTER_LONG"
+    assert diagnostics["trade_executor_mode"] == "testnet"
+    assert diagnostics["testnet_risk_off_exception"] is True
+    assert diagnostics["testnet_entry_gate_relaxed"] is True
+    assert diagnostics["testnet_relaxation_reason"] == "strong_testnet_entry_during_risk_off"
+    assert diagnostics["signal_kind"] == "PRE_IMPULSE_ZONE"
+    assert diagnostics["btc_regime"] == "BTC_BULLISH"
+    assert diagnostics["market_regime"] == "RISK-OFF"
+    assert diagnostics["buy_flow"] == 106.0
+    assert diagnostics["sell_flow"] == 100.0
+    assert diagnostics["volume_impulse"] == 0.90
+    assert diagnostics["required_volume_impulse"] == 1.2
+    assert diagnostics["ask_wall_strength"] == 0.2
+    assert diagnostics["spread_bps"] == 4.0
+    runner.signal_store.close()
