@@ -545,3 +545,153 @@ def test_testnet_btc_bearish_still_blocks_normal_buy_entry():
 
     assert decision.action == WATCH
     assert decision.reason == "entry_blocked_market_regime"
+
+
+def test_testnet_btc_dump_risk_still_blocks_risk_off_pre_impulse_buy_entry():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(
+        signal_kind="PRE_IMPULSE_ZONE",
+        btc_regime=BTC_DUMP_RISK,
+        market_regime="RISK-OFF",
+    )
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.5)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_market_regime"
+    assert diagnostics["testnet_risk_off_exception"] is False
+
+
+def test_testnet_btc_bearish_still_blocks_risk_off_pre_impulse_buy_entry():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(
+        signal_kind="PRE_IMPULSE_ZONE",
+        btc_regime=BTC_BEARISH,
+        market_regime="RISK-OFF",
+    )
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.5)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_market_regime"
+    assert diagnostics["testnet_risk_off_exception"] is False
+
+
+def test_testnet_pre_impulse_btc_bullish_risk_off_strong_entry_can_enter_long():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(
+        signal_kind="PRE_IMPULSE_ZONE",
+        btc_regime=BTC_BULLISH,
+        market_regime="RISK-OFF",
+    )
+    snapshot = make_snapshot(buy_flow=106.0, sell_flow=100.0, volume_impulse=0.90)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == ENTER_LONG
+    assert decision.reason == "entry_allowed_long"
+    assert diagnostics["trade_executor_mode"] == "testnet"
+    assert diagnostics["testnet_risk_off_exception"] is True
+    assert diagnostics["testnet_entry_gate_relaxed"] is True
+    assert diagnostics["testnet_relaxation_reason"] == "strong_testnet_entry_during_risk_off"
+    assert diagnostics["signal_kind"] == "PRE_IMPULSE_ZONE"
+    assert diagnostics["btc_regime"] == BTC_BULLISH
+    assert diagnostics["market_regime"] == "RISK-OFF"
+    assert diagnostics["buy_flow"] == 106.0
+    assert diagnostics["sell_flow"] == 100.0
+    assert diagnostics["volume_impulse"] == 0.90
+    assert diagnostics["required_volume_impulse"] == executor.min_entry_volume_impulse
+    assert diagnostics["ask_wall_strength"] == 0.30
+    assert diagnostics["spread_bps"] == 8.0
+
+
+def test_testnet_breakout_pressure_btc_neutral_risk_off_strong_entry_can_enter_long():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(
+        signal_kind="BREAKOUT_PRESSURE",
+        btc_regime="BTC_NEUTRAL",
+        market_regime="RISK_OFF",
+    )
+    snapshot = make_snapshot(buy_flow=101.0, sell_flow=100.0, volume_impulse=0.90)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == ENTER_LONG
+    assert decision.reason == "entry_allowed_long"
+    assert diagnostics["testnet_risk_off_exception"] is True
+    assert diagnostics["testnet_entry_gate_relaxed"] is True
+    assert diagnostics["testnet_relaxation_reason"] == "strong_testnet_entry_during_risk_off"
+
+
+def test_testnet_absorption_zone_does_not_use_risk_off_exception():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(
+        signal_kind="ABSORPTION_ZONE",
+        btc_regime=BTC_BULLISH,
+        market_regime="RISK-OFF",
+    )
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.5)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == ENTRY_BLOCKED_ABSORPTION_WEAK_CONFIRMATION
+    assert diagnostics["testnet_risk_off_exception"] is False
+
+
+def test_testnet_pre_impulse_risk_off_remains_blocked_when_buy_flow_does_not_lead():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(
+        signal_kind="PRE_IMPULSE_ZONE",
+        btc_regime=BTC_BULLISH,
+        market_regime="RISK-OFF",
+    )
+    snapshot = make_snapshot(buy_flow=100.0, sell_flow=100.0, volume_impulse=1.5)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_buy_flow"
+    assert diagnostics["testnet_risk_off_exception"] is False
+
+
+def test_testnet_pre_impulse_risk_off_remains_blocked_below_75pct_volume_threshold():
+    executor = SmartTradeExecutor(trade_executor_mode="testnet")
+    setup = make_buy_setup(
+        signal_kind="PRE_IMPULSE_ZONE",
+        btc_regime=BTC_BULLISH,
+        market_regime="RISK-OFF",
+    )
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=100.0, volume_impulse=0.89)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_volume_impulse"
+    assert diagnostics["testnet_risk_off_exception"] is False
+
+
+def test_paper_pre_impulse_risk_off_behavior_remains_strictly_blocked():
+    executor = SmartTradeExecutor(trade_executor_mode="paper")
+    setup = make_buy_setup(
+        signal_kind="PRE_IMPULSE_ZONE",
+        btc_regime=BTC_BULLISH,
+        market_regime="RISK-OFF",
+    )
+    snapshot = make_snapshot(buy_flow=140.0, sell_flow=90.0, volume_impulse=1.5)
+
+    decision = executor.evaluate_entry(setup, snapshot)
+    diagnostics = executor.entry_gate_diagnostics(setup, snapshot)
+
+    assert decision.action == WATCH
+    assert decision.reason == "entry_blocked_market_regime"
+    assert diagnostics["testnet_risk_off_exception"] is False
