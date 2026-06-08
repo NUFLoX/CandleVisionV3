@@ -570,6 +570,20 @@ class SignalStore:
         row = self.conn.execute("SELECT * FROM executor_trades WHERE trade_key = ?", (trade_key,)).fetchone()
         return dict(row) if row is not None else None
 
+    def get_latest_executor_trade_for_signal(self, signal_key: str) -> dict[str, Any] | None:
+        self.ensure_executor_trade_schema()
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM executor_trades
+            WHERE signal_key = ?
+            ORDER BY exit_time DESC, updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (signal_key,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     def list_executor_trades(self, limit: int = 100, symbol: str | None = None) -> list[dict[str, Any]]:
         self.ensure_executor_trade_schema()
         safe_limit = max(1, int(limit or 100))

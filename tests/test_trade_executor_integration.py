@@ -877,3 +877,127 @@ def test_testnet_risk_off_exception_records_diagnostics_json(tmp_path: Path) -> 
     assert diagnostics["ask_wall_strength"] == 0.2
     assert diagnostics["spread_bps"] == 4.0
     runner.signal_store.close()
+
+
+def test_active_buy_recovery_uses_initial_sl_not_trailing_current_sl(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(
+        symbol="ENAUSDT",
+        entry=1.13365,
+        stop_loss=1.1141475,
+        meta={"tf": "5", "market": "linear"},
+    )
+    key = signal_key(signal)
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="ENAUSDT",
+        side="Buy",
+        state="TRAILING_PROFIT",
+        action="HOLD",
+        reason="hold_position",
+        entry_price=1.13365,
+        current_sl=1.1379025,
+        max_gain_r=2.0,
+        max_drawdown_r=0.1,
+        bars_in_trade=7,
+        diagnostics_json={"executor_entry_price": 1.13365, "executor_initial_sl": 1.1141475},
+    )
+
+    row = runner.signal_store.get_executor_outcome(key)
+    position = runner._position_from_executor_row(signal, row)
+    diagnostics = json.loads(runner.signal_store.get_executor_outcome(key)["diagnostics_json"])
+
+    assert position.current_sl == 1.1379025
+    assert position.stop_loss == 1.1141475
+    assert abs(position.initial_risk - (1.13365 - 1.1141475)) < 1e-12
+    assert position.max_gain_r == 2.0
+    assert diagnostics["risk_basis"] == "initial_sl"
+    assert diagnostics["initial_risk"] == position.initial_risk
+    assert diagnostics["invalid_initial_risk"] is False
+    assert "risk_basis_warning" not in diagnostics
+    runner.signal_store.close()
+
+
+def test_active_buy_missing_initial_sl_current_sl_above_entry_sets_warning_and_zeroes_r(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(
+        symbol="ENAUSDT",
+        entry=1.13365,
+        stop_loss=1.1141475,
+        meta={"tf": "5", "market": "linear"},
+    )
+    key = signal_key(signal)
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="ENAUSDT",
+        side="Buy",
+        state="TRAILING_PROFIT",
+        action="HOLD",
+        reason="hold_position",
+        entry_price=1.13365,
+        current_sl=1.1379025,
+        max_gain_r=131.0,
+        max_drawdown_r=0.1,
+        bars_in_trade=7,
+        diagnostics_json={"executor_entry_price": 1.13365},
+    )
+
+    row = runner.signal_store.get_executor_outcome(key)
+    position = runner._position_from_executor_row(signal, row)
+    updated = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(updated["diagnostics_json"])
+
+    assert position.max_gain_r == 0.0
+    assert updated["max_gain_r"] == 0.0
+    assert diagnostics["risk_basis"] == "initial_sl"
+    assert diagnostics["risk_basis_warning"] == "fallback_current_sl_missing_initial_sl"
+    assert diagnostics["invalid_initial_risk"] is True
+    assert diagnostics["initial_risk"] is None
+    runner.signal_store.close()
+
+
+def test_active_recovery_prefers_executor_trade_initial_sl_before_current_sl(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(symbol="ENAUSDT", entry=1.13365, meta={"tf": "5", "market": "linear"})
+    key = signal_key(signal)
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="ENAUSDT",
+        side="Buy",
+        state="TRAILING_PROFIT",
+        action="HOLD",
+        reason="hold_position",
+        entry_price=1.13365,
+        current_sl=1.1379025,
+        max_gain_r=1.5,
+        max_drawdown_r=0.2,
+        bars_in_trade=4,
+        diagnostics_json={"executor_entry_price": 1.13365},
+    )
+    runner.signal_store.upsert_executor_trade(
+        {
+            "trade_key": f"{key}|closed",
+            "signal_key": key,
+            "symbol": "ENAUSDT",
+            "timeframe": "5",
+            "side": "Buy",
+            "state": "EXITED",
+            "entry_price": 1.13365,
+            "exit_price": 1.15,
+            "initial_sl": 1.1141475,
+            "final_sl": 1.1379025,
+            "current_sl": 1.1379025,
+            "exit_time": "2026-06-04T10:00:00+00:00",
+            "max_gain_r": 1.5,
+            "max_drawdown_r": 0.2,
+        }
+    )
+
+    position = runner._position_from_executor_row(signal, runner.signal_store.get_executor_outcome(key))
+    diagnostics = json.loads(runner.signal_store.get_executor_outcome(key)["diagnostics_json"])
+
+    assert position.stop_loss == 1.1141475
+    assert diagnostics["risk_source"] == "executor_trades.initial_sl"
+    assert diagnostics["invalid_initial_risk"] is False
+    assert abs(diagnostics["initial_risk"] - (1.13365 - 1.1141475)) < 1e-12
+    runner.signal_store.close()
