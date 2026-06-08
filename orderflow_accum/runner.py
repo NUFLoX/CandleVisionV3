@@ -896,6 +896,8 @@ class AccumulationRunner:
         suspicious_gain = original_gain > cls.ACTIVE_R_SUSPICIOUS_THRESHOLD
         suspicious_drawdown = abs(original_drawdown) > cls.ACTIVE_R_SUSPICIOUS_THRESHOLD
         if not suspicious_gain and not suspicious_drawdown:
+            if diagnostics_json.get("suspicious_active_r_scale") is True:
+                return max_gain_r, max_drawdown_r, {}
             return max_gain_r, max_drawdown_r, {"suspicious_active_r_scale": False}
 
         recovered_gain = 0.0 if suspicious_gain else original_gain
