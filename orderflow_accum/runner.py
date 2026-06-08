@@ -53,6 +53,7 @@ from .ws_clients import MarketStream
 
 class AccumulationRunner:
     VOLUME_IMPULSE_REPORT_CAP = 50.0
+    ACTIVE_R_SUSPICIOUS_THRESHOLD = 25.0
 
     def __init__(self, settings: Settings, ui: ConsoleUI | None = None, version: str = "ACCUM V1.4.2 DIAG"):
         self.settings = settings
@@ -826,24 +827,147 @@ class AccumulationRunner:
         parsed = cls._optional_float(value)
         return default if parsed is None else parsed
 
+    @staticmethod
+    def _normalize_fraction_or_percent(value: float) -> float:
+        parsed = float(value)
+        if abs(parsed) > 1.0:
+            return parsed / 100.0
+        return parsed
+
+    @classmethod
+    def _active_r_from_fractional_price_move(
+        cls, *, entry_price: float, initial_risk: float, move: float
+    ) -> float:
+        if initial_risk <= 0:
+            raise ValueError("initial_risk must be positive")
+        normalized_move = cls._normalize_fraction_or_percent(move)
+        return abs(float(entry_price) * normalized_move) / float(initial_risk)
+
+    @classmethod
+    def _active_price_extremes_from_diagnostics(
+        cls, diagnostics: dict[str, object]
+    ) -> tuple[float | None, float | None]:
+        max_price = cls._optional_float(diagnostics.get("executor_max_price"))
+        if max_price is None:
+            max_price = cls._optional_float(diagnostics.get("max_price"))
+        min_price = cls._optional_float(diagnostics.get("executor_min_price"))
+        if min_price is None:
+            min_price = cls._optional_float(diagnostics.get("min_price"))
+        return max_price, min_price
+
+    @classmethod
+    def _normalize_active_r_scale(
+        cls,
+        *,
+        side: str,
+        entry_price: float,
+        initial_risk: float | None,
+        max_gain_r: float,
+        max_drawdown_r: float,
+        diagnostics_json: dict[str, object],
+    ) -> tuple[float, float, dict[str, object]]:
+        if initial_risk is None or initial_risk <= 0:
+            return max_gain_r, max_drawdown_r, {}
+        suspicious_gain = abs(float(max_gain_r)) > cls.ACTIVE_R_SUSPICIOUS_THRESHOLD
+        suspicious_drawdown = abs(float(max_drawdown_r)) > cls.ACTIVE_R_SUSPICIOUS_THRESHOLD
+        if not suspicious_gain and not suspicious_drawdown:
+            return max_gain_r, max_drawdown_r, {"suspicious_active_r_scale": False}
+
+        updates: dict[str, object] = {
+            "suspicious_active_r_scale": True,
+            "active_r_scale_original_max_gain_r": float(max_gain_r),
+            "active_r_scale_original_max_drawdown_r": float(max_drawdown_r),
+        }
+        max_price, min_price = cls._active_price_extremes_from_diagnostics(diagnostics_json)
+        if max_price is not None and min_price is not None:
+            recomputed_gain, recomputed_drawdown = SmartTradeExecutor.price_distance_r_metrics(
+                side=side,
+                entry_price=float(entry_price),
+                initial_risk=float(initial_risk),
+                max_price=float(max_price),
+                min_price=float(min_price),
+            )
+            updates.update(
+                {
+                    "active_r_recomputed_from_price_extremes": True,
+                    "suspicious_active_r_scale": False,
+                    "active_r_scale_fix": "price_extremes",
+                }
+            )
+            return recomputed_gain, recomputed_drawdown, updates
+
+        gain_pct = cls._optional_float(diagnostics_json.get("max_gain_pct"))
+        if gain_pct is None:
+            gain_pct = cls._optional_float(diagnostics_json.get("max_gain_percent"))
+        drawdown_pct = cls._optional_float(diagnostics_json.get("max_drawdown_pct"))
+        if drawdown_pct is None:
+            drawdown_pct = cls._optional_float(diagnostics_json.get("max_drawdown_percent"))
+        if gain_pct is not None or drawdown_pct is not None:
+            recomputed_gain = (
+                cls._active_r_from_fractional_price_move(
+                    entry_price=float(entry_price), initial_risk=float(initial_risk), move=float(gain_pct)
+                )
+                if gain_pct is not None
+                else float(max_gain_r)
+            )
+            recomputed_drawdown = (
+                cls._active_r_from_fractional_price_move(
+                    entry_price=float(entry_price), initial_risk=float(initial_risk), move=float(drawdown_pct)
+                )
+                if drawdown_pct is not None
+                else float(max_drawdown_r)
+            )
+            updates.update(
+                {
+                    "active_r_recomputed_from_percent_move": True,
+                    "active_r_scale_fix": "percent_move_normalized",
+                }
+            )
+            return recomputed_gain, recomputed_drawdown, updates
+
+        updates.update(
+            {
+                "active_r_price_extremes_missing": True,
+                "active_r_scale_fix": "legacy_x100_r_normalized",
+            }
+        )
+        normalized_gain = float(max_gain_r) / 100.0 if suspicious_gain else float(max_gain_r)
+        normalized_drawdown = float(max_drawdown_r) / 100.0 if suspicious_drawdown else float(max_drawdown_r)
+        return normalized_gain, normalized_drawdown, updates
+
     def _position_from_executor_row(self, signal, row) -> TradePosition:
         side = str(row["side"] or signal.side)
         entry_snapshot = self._executor_entry_snapshot_from_row(row)
         entry = float(entry_snapshot.get("executor_entry_price") or row["entry_price"] or signal.entry or 0.0)
-        stop, risk_diagnostics = self._resolve_active_initial_sl(signal_key=str(row["signal_key"]), row=row, signal=signal, entry_price=entry, side=side)
+        stop, risk_diagnostics = self._resolve_active_initial_sl(
+            signal_key=str(row["signal_key"]), row=row, signal=signal, entry_price=entry, side=side
+        )
         initial_risk = self._active_initial_risk(entry, stop)
         invalid_initial_risk = self._invalid_active_initial_risk(entry, stop, side)
         if invalid_initial_risk:
             initial_risk = max(abs(entry) * 0.01, 1e-9)
         max_gain_r = 0.0 if invalid_initial_risk else float(row["max_gain_r"] or 0.0)
         max_drawdown_r = 0.0 if invalid_initial_risk else float(row["max_drawdown_r"] or 0.0)
+        active_r_diagnostics: dict[str, object] = {}
+        if not invalid_initial_risk:
+            row_diagnostics = self._parse_executor_diagnostics(
+                row["diagnostics_json"] if "diagnostics_json" in row.keys() else None
+            )
+            max_gain_r, max_drawdown_r, active_r_diagnostics = self._normalize_active_r_scale(
+                side=side,
+                entry_price=entry,
+                initial_risk=initial_risk,
+                max_gain_r=max_gain_r,
+                max_drawdown_r=max_drawdown_r,
+                diagnostics_json=row_diagnostics,
+            )
         self._persist_active_risk_diagnostics(
             row=row,
             entry_price=entry,
             initial_sl=stop,
             initial_risk=None if invalid_initial_risk else initial_risk,
             invalid_initial_risk=invalid_initial_risk,
-            risk_diagnostics=risk_diagnostics,
+            risk_diagnostics={**risk_diagnostics, **active_r_diagnostics},
             max_gain_r=max_gain_r,
             max_drawdown_r=max_drawdown_r,
         )
@@ -1165,6 +1289,24 @@ class AccumulationRunner:
             diagnostics_json=diagnostics_json,
             previous_row=previous_row,
         )
+        max_gain_r = float(position.max_gain_r) if position is not None else 0.0
+        max_drawdown_r = float(position.max_drawdown_r) if position is not None else 0.0
+        if position is not None:
+            diagnostics_json.update(
+                {
+                    "executor_max_price": float(position.max_price),
+                    "executor_min_price": float(position.min_price),
+                }
+            )
+            max_gain_r, max_drawdown_r, active_r_diagnostics = self._normalize_active_r_scale(
+                side=str(position.side),
+                entry_price=float(position.entry_price),
+                initial_risk=float(position.initial_risk),
+                max_gain_r=max_gain_r,
+                max_drawdown_r=max_drawdown_r,
+                diagnostics_json=diagnostics_json,
+            )
+            diagnostics_json.update(active_r_diagnostics)
         row = self.signal_store.upsert_executor_decision(
             signal_key=signal_key,
             symbol=str(signal.symbol),
@@ -1176,8 +1318,8 @@ class AccumulationRunner:
             current_sl=float(position.current_sl) if position is not None else self._optional_float(signal.stop_loss),
             exit_price=float(position.exit_price) if position is not None and position.exit_price is not None else None,
             exit_reason=position.exit_reason if position is not None else None,
-            max_gain_r=float(position.max_gain_r) if position is not None else 0.0,
-            max_drawdown_r=float(position.max_drawdown_r) if position is not None else 0.0,
+            max_gain_r=max_gain_r,
+            max_drawdown_r=max_drawdown_r,
             bars_in_trade=int(position.bars_in_trade) if position is not None else 0,
             **diagnostics,
         )
@@ -1208,8 +1350,8 @@ class AccumulationRunner:
                     current_sl=float(position.current_sl) if position is not None else self._optional_float(signal.stop_loss),
                     exit_price=float(position.exit_price) if position is not None and position.exit_price is not None else None,
                     exit_reason=position.exit_reason if position is not None else None,
-                    max_gain_r=float(position.max_gain_r) if position is not None else 0.0,
-                    max_drawdown_r=float(position.max_drawdown_r) if position is not None else 0.0,
+                    max_gain_r=float(row["max_gain_r"] or 0.0),
+                    max_drawdown_r=float(row["max_drawdown_r"] or 0.0),
                     bars_in_trade=int(position.bars_in_trade) if position is not None else 0,
                     diagnostics_json=diagnostics_json,
                 )

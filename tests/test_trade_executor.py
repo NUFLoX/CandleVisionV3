@@ -119,6 +119,22 @@ def test_buy_setup_blocks_btc_dump_risk_market_regime_before_new_long_entry():
     assert decision.next_state == WATCH_ENTRY
 
 
+def test_active_buy_r_uses_price_distance_not_percent_scale():
+    executor = SmartTradeExecutor()
+    entry = 1.13365
+    initial_sl = 1.1141475
+    setup = make_buy_setup(symbol="ENAUSDT", entry_hint=entry, stop_loss=initial_sl)
+    position = executor.open_position(setup, make_snapshot(price=entry, support=None, resistance=1.20, ema20=None, vwap=None))
+
+    decision = executor.update_position(position, make_snapshot(price=1.1592, support=None, resistance=1.20, ema20=None, vwap=None))
+
+    assert decision.position is not None
+    assert math.isclose(position.initial_risk, entry - initial_sl, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(decision.position.max_gain_r, 1.310088450198692, rel_tol=0.0, abs_tol=1e-9)
+    assert decision.position.max_gain_r < 10.0
+    assert not math.isclose(decision.position.max_gain_r, 131.0, rel_tol=0.0, abs_tol=1e-9)
+
+
 def test_buy_setup_blocks_btc_bearish_market_regime_before_normal_new_long_entry():
     executor = SmartTradeExecutor()
     setup = make_buy_setup(btc_regime=BTC_BEARISH)

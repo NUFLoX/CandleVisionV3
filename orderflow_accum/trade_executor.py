@@ -517,20 +517,34 @@ class SmartTradeExecutor:
 
         return risk
 
+    @staticmethod
+    def price_distance_r_metrics(
+        *, side: str, entry_price: float, initial_risk: float, max_price: float, min_price: float
+    ) -> tuple[float, float]:
+        if initial_risk <= 0:
+            raise ValueError("initial_risk must be positive")
+        if side == BUY:
+            gain_r = (max_price - entry_price) / initial_risk
+            drawdown_r = (entry_price - min_price) / initial_risk
+        elif side == SELL:
+            gain_r = (entry_price - min_price) / initial_risk
+            drawdown_r = (max_price - entry_price) / initial_risk
+        else:
+            raise ValueError(f"unsupported side: {side}")
+        return max(gain_r, 0.0), max(drawdown_r, 0.0)
+
     def _refresh_position_metrics(self, position: TradePosition, snapshot: OrderflowSnapshot) -> TradePosition:
         price = float(snapshot.price)
         max_price = max(position.max_price, price)
         min_price = min(position.min_price, price)
         bars_in_trade = position.bars_in_trade + 1
-
-        if position.side == BUY:
-            gain_r = (max_price - position.entry_price) / position.initial_risk
-            drawdown_r = (position.entry_price - min_price) / position.initial_risk
-        elif position.side == SELL:
-            gain_r = (position.entry_price - min_price) / position.initial_risk
-            drawdown_r = (max_price - position.entry_price) / position.initial_risk
-        else:
-            raise ValueError(f"unsupported side: {position.side}")
+        gain_r, drawdown_r = self.price_distance_r_metrics(
+            side=position.side,
+            entry_price=position.entry_price,
+            initial_risk=position.initial_risk,
+            max_price=max_price,
+            min_price=min_price,
+        )
 
         return replace(
             position,
