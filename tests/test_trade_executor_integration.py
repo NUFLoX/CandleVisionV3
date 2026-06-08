@@ -1451,6 +1451,87 @@ def test_active_executor_outcome_rejects_doge_style_polluted_price(tmp_path: Pat
     runner.signal_store.close()
 
 
+def test_active_executor_outcome_rejects_polluted_previous_price(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    key = "DOGEUSDT|linear|5|CONFIRMED_LONG|Buy"
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="DOGEUSDT",
+        side="Buy",
+        state="TRAILING_PROFIT",
+        action="HOLD",
+        reason="hold_position",
+        entry_price=0.085505,
+        current_sl=0.0869886075,
+        max_gain_r=0.0,
+        max_drawdown_r=0.0,
+        bars_in_trade=11,
+        price=0.085505,
+        diagnostics_json={
+            "executor_entry_price": 0.085505,
+            "executor_initial_sl": 0.07957057,
+            "initial_risk": 0.00593443,
+        },
+    )
+    runner.signal_store.conn.execute(
+        """
+        UPDATE executor_outcomes
+        SET price = ?, max_gain_r = ?, diagnostics_json = ?
+        WHERE signal_key = ?
+        """,
+        (
+            0.4,
+            52.99,
+            json.dumps(
+                {
+                    "executor_entry_price": 0.085505,
+                    "executor_initial_sl": 0.07957057,
+                    "initial_risk": 0.00593443,
+                    "suspicious_active_price": True,
+                    "active_price_rejected": True,
+                    "active_price_rejected_value": 0.4,
+                    "active_price_recovery_source": "previous_price",
+                }
+            ),
+            key,
+        ),
+    )
+    runner.signal_store.conn.commit()
+
+    row = runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="DOGEUSDT",
+        side="Buy",
+        state="TRAILING_PROFIT",
+        action="HOLD",
+        reason="hold_position",
+        entry_price=0.085505,
+        current_sl=0.0869886075,
+        max_gain_r=52.99,
+        max_drawdown_r=0.0,
+        bars_in_trade=12,
+        price=0.4,
+        diagnostics_json={
+            "executor_entry_price": 0.085505,
+            "executor_initial_sl": 0.07957057,
+            "initial_risk": 0.00593443,
+        },
+    )
+    diagnostics = json.loads(row["diagnostics_json"])
+
+    assert row["price"] == 0.085505
+    assert row["max_gain_r"] == 0.0
+    assert row["max_gain_r"] <= 25.0
+    assert diagnostics["suspicious_active_price"] is True
+    assert diagnostics["active_price_rejected"] is True
+    assert diagnostics["active_price_rejected_value"] == 0.4
+    assert diagnostics["previous_active_price_rejected"] is True
+    assert diagnostics["previous_active_price_rejected_value"] == 0.4
+    assert diagnostics["active_price_recovery_source"] == "entry_price"
+    assert diagnostics["suspicious_active_r_reset"] is True
+    runner.signal_store.close()
+
+
 def test_active_executor_outcome_rejected_price_uses_previous_valid_price_and_r(tmp_path: Path) -> None:
     runner = make_runner(tmp_path)
     key = "DOGEUSDT|linear|5|CONFIRMED_LONG|Buy"
@@ -1488,7 +1569,7 @@ def test_active_executor_outcome_rejected_price_uses_previous_valid_price_and_r(
     diagnostics = json.loads(row["diagnostics_json"])
 
     assert row["price"] == 0.086
-    assert row["max_gain_r"] == 0.0
+    assert 0.08 < row["max_gain_r"] < 0.09
     assert row["max_gain_r"] <= 25.0
     assert diagnostics["active_price_recovery_source"] == "previous_price"
     runner.signal_store.close()

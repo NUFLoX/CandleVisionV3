@@ -79,6 +79,43 @@ def _active_outcome_current_r(
     return (candidate_price - entry) / risk
 
 
+def _active_outcome_price_is_suspicious(
+    *,
+    candidate_price: float | None,
+    entry_price: float | None,
+    diagnostics: dict[str, Any],
+    side: object,
+    current_market_price: float | None = None,
+) -> bool:
+    candidate = _optional_float_value(candidate_price)
+    entry = _optional_float_value(entry_price)
+    market = _optional_float_value(current_market_price)
+
+    if candidate is None or candidate <= 0:
+        return True
+
+    accepted_by_market = False
+    if market is not None and market > 0:
+        accepted_by_market = abs(candidate - market) / market <= 0.01
+
+    if entry is not None and entry > 0 and not accepted_by_market:
+        ratio = candidate / entry
+        if ratio > ACTIVE_OUTCOME_PRICE_ENTRY_MAX_RATIO or ratio < ACTIVE_OUTCOME_PRICE_ENTRY_MIN_RATIO:
+            return True
+
+    if not accepted_by_market:
+        current_r = _active_outcome_current_r(
+            side=side,
+            candidate_price=candidate,
+            entry_price=entry,
+            diagnostics=diagnostics,
+        )
+        if current_r is not None and abs(current_r) > ACTIVE_OUTCOME_R_SUSPICIOUS_THRESHOLD:
+            return True
+
+    return False
+
+
 def _validate_active_outcome_price(
     symbol: str,
     candidate_price: float | None,
@@ -88,7 +125,7 @@ def _validate_active_outcome_price(
     diagnostics: dict[str, Any] | None = None,
     *,
     side: object = None,
-) -> tuple[float, bool, str | None]:
+) -> tuple[float, bool, str | None, bool]:
     """Return a safe active executor_outcomes price and rejection metadata.
 
     The active dashboard/outcome row is a persistence surface only; rejecting here must not
@@ -99,35 +136,29 @@ def _validate_active_outcome_price(
     candidate = _optional_float_value(candidate_price)
     entry = _optional_float_value(entry_price)
     previous = _optional_float_value(previous_price)
-    market = _optional_float_value(current_market_price)
 
-    accepted_by_market = False
-    if candidate is not None and candidate > 0 and market is not None and market > 0:
-        accepted_by_market = abs(candidate - market) / market <= 0.01
-
-    rejected = candidate is None or candidate <= 0
-    if not rejected and entry is not None and entry > 0 and not accepted_by_market:
-        ratio = candidate / entry
-        if ratio > ACTIVE_OUTCOME_PRICE_ENTRY_MAX_RATIO or ratio < ACTIVE_OUTCOME_PRICE_ENTRY_MIN_RATIO:
-            rejected = True
-
-    if not rejected and not accepted_by_market and candidate is not None:
-        current_r = _active_outcome_current_r(
-            side=side,
-            candidate_price=candidate,
-            entry_price=entry,
-            diagnostics=diagnostics,
-        )
-        if current_r is not None and abs(current_r) > ACTIVE_OUTCOME_R_SUSPICIOUS_THRESHOLD:
-            rejected = True
-
+    rejected = _active_outcome_price_is_suspicious(
+        candidate_price=candidate,
+        entry_price=entry,
+        current_market_price=current_market_price,
+        diagnostics=diagnostics,
+        side=side,
+    )
     if not rejected and candidate is not None:
-        return candidate, False, None
-    if previous is not None and previous > 0:
-        return previous, True, "previous_price"
+        return candidate, False, None, False
+
+    previous_rejected = previous is not None and _active_outcome_price_is_suspicious(
+        candidate_price=previous,
+        entry_price=entry,
+        current_market_price=None,
+        diagnostics=diagnostics,
+        side=side,
+    )
+    if previous is not None and previous > 0 and not previous_rejected:
+        return previous, True, "previous_price", False
     if entry is not None and entry > 0:
-        return entry, True, "entry_price"
-    return 0.0, True, "entry_price"
+        return entry, True, "entry_price", previous_rejected
+    return 0.0, True, "entry_price", previous_rejected
 
 
 def _phase_from_kind(kind: str) -> str:
@@ -610,7 +641,7 @@ class SignalStore:
                 if existing is not None and "price" in existing.keys()
                 else None
             )
-            safe_price, rejected_price, recovery_source = _validate_active_outcome_price(
+            safe_price, rejected_price, recovery_source, previous_rejected = _validate_active_outcome_price(
                 symbol=symbol,
                 candidate_price=stored_price,
                 entry_price=entry_price,
@@ -628,6 +659,13 @@ class SignalStore:
                         "active_price_recovery_source": recovery_source or "entry_price",
                     }
                 )
+                if previous_rejected:
+                    diagnostics_payload.update(
+                        {
+                            "previous_active_price_rejected": True,
+                            "previous_active_price_rejected_value": previous_price,
+                        }
+                    )
                 stored_price = safe_price
                 missing_candidate_price = original_candidate_price is None or original_candidate_price <= 0
                 original_max_gain_r = stored_max_gain_r
@@ -645,11 +683,10 @@ class SignalStore:
                             "active_r_scale_original_max_drawdown_r": original_max_drawdown_r,
                         }
                     )
+                if previous_rejected and recovery_source == "entry_price":
+                    diagnostics_payload["suspicious_active_r_reset"] = True
                 if missing_candidate_price and not suspicious_candidate_r:
                     pass
-                elif recovery_source == "previous_price" and existing is not None:
-                    stored_max_gain_r = float(existing["max_gain_r"] or 0.0)
-                    stored_max_drawdown_r = float(existing["max_drawdown_r"] or 0.0)
                 else:
                     safe_current_r = _active_outcome_current_r(
                         side=side,
@@ -661,11 +698,17 @@ class SignalStore:
                         stored_max_gain_r = 0.0
                         stored_max_drawdown_r = 0.0
                     elif safe_current_r >= 0:
-                        stored_max_gain_r = max(float(safe_current_r), 0.0)
+                        stored_max_gain_r = min(
+                            max(float(safe_current_r), 0.0),
+                            ACTIVE_OUTCOME_R_SUSPICIOUS_THRESHOLD,
+                        )
                         stored_max_drawdown_r = 0.0
                     else:
                         stored_max_gain_r = 0.0
-                        stored_max_drawdown_r = abs(float(safe_current_r))
+                        stored_max_drawdown_r = min(
+                            abs(float(safe_current_r)),
+                            ACTIVE_OUTCOME_R_SUSPICIOUS_THRESHOLD,
+                        )
             else:
                 diagnostics_payload.setdefault("suspicious_active_price", False)
                 diagnostics_payload.setdefault("active_price_rejected", False)
