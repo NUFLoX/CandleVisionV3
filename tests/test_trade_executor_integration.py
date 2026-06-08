@@ -52,7 +52,11 @@ _stub_module("orderflow_accum.chart_render", render_signal_chart=lambda *args, *
 from orderflow_accum.models import Signal
 from orderflow_accum.runner import AccumulationRunner
 from orderflow_accum.signal_store import SignalStore
-from orderflow_accum.trade_executor import SmartTradeExecutor
+from orderflow_accum.trade_executor import (
+    MANAGEMENT_POLICY_LEGACY,
+    MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R,
+    SmartTradeExecutor,
+)
 from orderflow_accum.trade_learning import TradeLearningEngine
 
 
@@ -106,6 +110,68 @@ def make_runner(tmp_path: Path, *, enabled: bool = True, mode: str = "paper") ->
     runner.trade_executor_enabled = enabled and mode == "paper"
     runner.trade_executor = SmartTradeExecutor() if runner.trade_executor_enabled else None
     return runner
+
+
+
+def _executor_builder_runner(mode: str, settings: object | None = None) -> AccumulationRunner:
+    runner = AccumulationRunner.__new__(AccumulationRunner)
+    runner.settings = settings or DummySettings()
+    runner.trade_executor_mode = mode
+    return runner
+
+
+def test_build_trade_executor_testnet_uses_configured_management_policy(monkeypatch) -> None:
+    monkeypatch.setenv("EXECUTOR_MANAGEMENT_POLICY", MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R)
+    monkeypatch.setenv("EXECUTOR_PROTECT_AFTER_1R", "true")
+    monkeypatch.setenv("EXECUTOR_MIN_PROTECTED_R_AFTER_1R", "0.5")
+
+    executor = _executor_builder_runner("testnet")._build_trade_executor()
+
+    assert executor.trade_executor_mode == "testnet"
+    assert executor.management_policy == MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R
+    assert executor.protect_after_1r is True
+    assert executor.min_protected_r_after_1r == 0.5
+
+
+def test_build_trade_executor_paper_uses_configured_management_policy(monkeypatch) -> None:
+    monkeypatch.setenv("EXECUTOR_MANAGEMENT_POLICY", MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R)
+
+    executor = _executor_builder_runner("paper")._build_trade_executor()
+
+    assert executor.trade_executor_mode == "paper"
+    assert executor.management_policy == MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R
+
+
+def test_build_trade_executor_defaults_to_legacy_management_policy(monkeypatch) -> None:
+    monkeypatch.delenv("EXECUTOR_MANAGEMENT_POLICY", raising=False)
+    monkeypatch.delenv("EXECUTOR_PROTECT_AFTER_1R", raising=False)
+    monkeypatch.delenv("EXECUTOR_MIN_PROTECTED_R_AFTER_1R", raising=False)
+
+    paper_executor = _executor_builder_runner("paper")._build_trade_executor()
+    testnet_executor = _executor_builder_runner("testnet")._build_trade_executor()
+
+    assert paper_executor.management_policy == MANAGEMENT_POLICY_LEGACY
+    assert testnet_executor.management_policy == MANAGEMENT_POLICY_LEGACY
+    assert paper_executor.protect_after_1r is False
+    assert testnet_executor.protect_after_1r is False
+    assert paper_executor.min_protected_r_after_1r == 0.25
+    assert testnet_executor.min_protected_r_after_1r == 0.25
+
+
+def test_build_trade_executor_settings_management_policy_overrides_env(monkeypatch) -> None:
+    monkeypatch.setenv("EXECUTOR_MANAGEMENT_POLICY", MANAGEMENT_POLICY_LEGACY)
+    settings = type(
+        "ConfiguredSettings",
+        (),
+        {
+            "market_categories": ["linear"],
+            "executor_management_policy": MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R,
+        },
+    )()
+
+    executor = _executor_builder_runner("testnet", settings=settings)._build_trade_executor()
+
+    assert executor.management_policy == MANAGEMENT_POLICY_TRAILING_40PCT_GIVEBACK_AFTER_1R
 
 
 def row_count(store: SignalStore) -> int:
@@ -787,6 +853,7 @@ def test_testnet_mode_places_order_and_records_diagnostics(tmp_path: Path) -> No
     assert fake.entry_calls == 1
     assert row["action"] == "ENTER_LONG"
     assert diagnostics["trade_executor_mode"] == "testnet"
+    assert diagnostics["executor_management_policy"] == MANAGEMENT_POLICY_LEGACY
     assert diagnostics["testnet_order_attempted"] is True
     assert diagnostics["testnet_order_status"] == "placed"
     assert diagnostics["testnet_order_id"] == "tn-1"

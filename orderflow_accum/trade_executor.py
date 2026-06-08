@@ -206,6 +206,7 @@ class SmartTradeExecutor:
             testnet_entry_gate_relaxed = testnet_entry_gate_relaxed or (sum(confirmations.values()) >= 2 and not self._strict_absorption_long_confirmations_passed(snapshot))
         return {
             "trade_executor_mode": self.trade_executor_mode,
+            "executor_management_policy": self.management_policy,
             "testnet_entry_gate_relaxed": bool(testnet_entry_gate_relaxed),
             "testnet_risk_off_exception": bool(risk_off_exception),
             "testnet_relaxation_reason": "strong_testnet_entry_during_risk_off" if risk_off_exception else None,
