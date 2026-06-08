@@ -1414,3 +1414,139 @@ def test_hybrid_shadow_does_not_place_bybit_testnet_order_when_actual_entry_bloc
     assert fake.entry_calls == 0
     assert _hybrid_row(runner, signal, "momentum_0_5r_shadow")["status"] == "OBSERVING"
     runner.signal_store.close()
+
+
+def test_active_executor_outcome_rejects_doge_style_polluted_price(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    key = "DOGEUSDT|linear|5|CONFIRMED_LONG|Buy"
+
+    row = runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="DOGEUSDT",
+        side="Buy",
+        state="TRAILING_PROFIT",
+        action="HOLD",
+        reason="hold_position",
+        entry_price=0.085505,
+        current_sl=0.0869886075,
+        max_gain_r=52.99,
+        max_drawdown_r=0.0,
+        bars_in_trade=12,
+        price=0.4,
+        diagnostics_json={
+            "executor_entry_price": 0.085505,
+            "executor_initial_sl": 0.07957057,
+            "initial_risk": 0.00593443,
+        },
+    )
+    diagnostics = json.loads(row["diagnostics_json"])
+
+    assert row["price"] == 0.085505
+    assert row["max_gain_r"] <= 25.0
+    assert row["max_gain_r"] == 0.0
+    assert diagnostics["suspicious_active_price"] is True
+    assert diagnostics["active_price_rejected"] is True
+    assert diagnostics["active_price_rejected_value"] == 0.4
+    assert diagnostics["active_price_recovery_source"] == "entry_price"
+    runner.signal_store.close()
+
+
+def test_active_executor_outcome_rejected_price_uses_previous_valid_price_and_r(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    key = "DOGEUSDT|linear|5|CONFIRMED_LONG|Buy"
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="DOGEUSDT",
+        side="Buy",
+        state="ENTERED",
+        action="ENTER_LONG",
+        reason="entry_allowed_long",
+        entry_price=0.085505,
+        current_sl=0.07957057,
+        max_gain_r=0.0,
+        max_drawdown_r=0.0,
+        bars_in_trade=0,
+        price=0.086,
+        diagnostics_json={"executor_initial_sl": 0.07957057},
+    )
+
+    row = runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="DOGEUSDT",
+        side="Buy",
+        state="TRAILING_PROFIT",
+        action="HOLD",
+        reason="hold_position",
+        entry_price=0.085505,
+        current_sl=0.0869886075,
+        max_gain_r=52.99,
+        max_drawdown_r=0.0,
+        bars_in_trade=12,
+        price=0.4,
+        diagnostics_json={"executor_initial_sl": 0.07957057},
+    )
+    diagnostics = json.loads(row["diagnostics_json"])
+
+    assert row["price"] == 0.086
+    assert row["max_gain_r"] == 0.0
+    assert row["max_gain_r"] <= 25.0
+    assert diagnostics["active_price_recovery_source"] == "previous_price"
+    runner.signal_store.close()
+
+
+def test_active_executor_outcome_accepts_valid_price_near_entry(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    key = "DOGEUSDT|linear|5|CONFIRMED_LONG|Buy"
+
+    row = runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="DOGEUSDT",
+        side="Buy",
+        state="TRAILING_PROFIT",
+        action="HOLD",
+        reason="hold_position",
+        entry_price=0.085505,
+        current_sl=0.07957057,
+        max_gain_r=0.42,
+        max_drawdown_r=0.0,
+        bars_in_trade=3,
+        price=0.088,
+        diagnostics_json={"executor_initial_sl": 0.07957057},
+    )
+    diagnostics = json.loads(row["diagnostics_json"])
+
+    assert row["price"] == 0.088
+    assert row["max_gain_r"] == 0.42
+    assert diagnostics["suspicious_active_price"] is False
+    assert diagnostics["active_price_rejected"] is False
+    runner.signal_store.close()
+
+
+def test_closed_executor_outcome_rows_are_not_active_price_validated(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    key = "DOGEUSDT|linear|5|CONFIRMED_LONG|Buy"
+
+    row = runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol="DOGEUSDT",
+        side="Buy",
+        state="EXITED",
+        action="EXIT",
+        reason="exit_stop_loss_hit",
+        entry_price=0.085505,
+        current_sl=0.0869886075,
+        exit_price=0.4,
+        exit_reason="exit_stop_loss_hit",
+        max_gain_r=52.99,
+        max_drawdown_r=0.0,
+        bars_in_trade=12,
+        price=0.4,
+        diagnostics_json={"executor_initial_sl": 0.07957057},
+    )
+    diagnostics = json.loads(row["diagnostics_json"])
+
+    assert row["state"] == "EXITED"
+    assert row["price"] == 0.4
+    assert row["max_gain_r"] == 52.99
+    assert "active_price_rejected" not in diagnostics
+    runner.signal_store.close()

@@ -13,6 +13,122 @@ def _utc_now() -> str:
 
 CLOSED_STATUSES = {"TP1", "TP2", "SL", "AMBIGUOUS", "EXPIRED"}
 
+ACTIVE_EXECUTOR_OUTCOME_STATES = {"ENTERED", "PROTECT_BREAKEVEN", "TRAILING_PROFIT"}
+ACTIVE_EXECUTOR_OUTCOME_ACTIONS = {"HOLD"}
+CLOSED_EXECUTOR_OUTCOME_STATES = {"EXITED", "CLOSED"}
+ACTIVE_OUTCOME_PRICE_ENTRY_MAX_RATIO = 1.75
+ACTIVE_OUTCOME_PRICE_ENTRY_MIN_RATIO = 0.45
+ACTIVE_OUTCOME_R_SUSPICIOUS_THRESHOLD = 25.0
+
+
+def _is_active_executor_outcome_state(state: object, action: object) -> bool:
+    normalized_state = str(state or "").strip().upper()
+    normalized_action = str(action or "").strip().upper()
+    if normalized_state in CLOSED_EXECUTOR_OUTCOME_STATES:
+        return False
+    return normalized_state in ACTIVE_EXECUTOR_OUTCOME_STATES or normalized_action in ACTIVE_EXECUTOR_OUTCOME_ACTIONS
+
+
+def _optional_float_value(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _diagnostics_dict(value: str | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if value in (None, ""):
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _active_outcome_initial_risk(entry_price: float | None, diagnostics: dict[str, Any]) -> float | None:
+    entry = _optional_float_value(entry_price)
+    if entry is None:
+        return None
+    diagnostic_risk = _optional_float_value(diagnostics.get("initial_risk"))
+    if diagnostic_risk is not None and diagnostic_risk > 0:
+        return diagnostic_risk
+    for key in ("executor_initial_sl", "initial_sl"):
+        stop = _optional_float_value(diagnostics.get(key))
+        if stop is None:
+            continue
+        risk = abs(entry - stop)
+        if risk > 0:
+            return risk
+    return None
+
+
+def _active_outcome_current_r(
+    *, side: object, candidate_price: float, entry_price: float | None, diagnostics: dict[str, Any]
+) -> float | None:
+    entry = _optional_float_value(entry_price)
+    risk = _active_outcome_initial_risk(entry, diagnostics)
+    if entry is None or risk is None or risk <= 0:
+        return None
+    if str(side or "") == "Sell":
+        return (entry - candidate_price) / risk
+    return (candidate_price - entry) / risk
+
+
+def _validate_active_outcome_price(
+    symbol: str,
+    candidate_price: float | None,
+    entry_price: float | None,
+    previous_price: float | None = None,
+    current_market_price: float | None = None,
+    diagnostics: dict[str, Any] | None = None,
+    *,
+    side: object = None,
+) -> tuple[float, bool, str | None]:
+    """Return a safe active executor_outcomes price and rejection metadata.
+
+    The active dashboard/outcome row is a persistence surface only; rejecting here must not
+    alter lifecycle event pricing, executor position management, exits, or closed ledgers.
+    """
+    del symbol  # symbol is accepted for diagnostics/logging call sites; validation is value-based.
+    diagnostics = diagnostics if diagnostics is not None else {}
+    candidate = _optional_float_value(candidate_price)
+    entry = _optional_float_value(entry_price)
+    previous = _optional_float_value(previous_price)
+    market = _optional_float_value(current_market_price)
+
+    accepted_by_market = False
+    if candidate is not None and candidate > 0 and market is not None and market > 0:
+        accepted_by_market = abs(candidate - market) / market <= 0.01
+
+    rejected = candidate is None or candidate <= 0
+    if not rejected and entry is not None and entry > 0 and not accepted_by_market:
+        ratio = candidate / entry
+        if ratio > ACTIVE_OUTCOME_PRICE_ENTRY_MAX_RATIO or ratio < ACTIVE_OUTCOME_PRICE_ENTRY_MIN_RATIO:
+            rejected = True
+
+    if not rejected and not accepted_by_market and candidate is not None:
+        current_r = _active_outcome_current_r(
+            side=side,
+            candidate_price=candidate,
+            entry_price=entry,
+            diagnostics=diagnostics,
+        )
+        if current_r is not None and abs(current_r) > ACTIVE_OUTCOME_R_SUSPICIOUS_THRESHOLD:
+            rejected = True
+
+    if not rejected and candidate is not None:
+        return candidate, False, None
+    if previous is not None and previous > 0:
+        return previous, True, "previous_price"
+    if entry is not None and entry > 0:
+        return entry, True, "entry_price"
+    return 0.0, True, "entry_price"
+
 
 def _phase_from_kind(kind: str) -> str:
     k = (kind or "").upper()
@@ -480,9 +596,87 @@ class SignalStore:
         self.ensure_executor_schema()
         now = _utc_now()
         cur = self.conn.cursor()
-        cur.execute("SELECT created_at FROM executor_outcomes WHERE signal_key = ?", (signal_key,))
+        cur.execute("SELECT * FROM executor_outcomes WHERE signal_key = ?", (signal_key,))
         existing = cur.fetchone()
         created_at = str(existing["created_at"]) if existing is not None else now
+        diagnostics_payload = _diagnostics_dict(diagnostics_json)
+        stored_price = self._optional_float(price)
+        original_candidate_price = stored_price
+        stored_max_gain_r = float(max_gain_r or 0.0)
+        stored_max_drawdown_r = float(max_drawdown_r or 0.0)
+        if _is_active_executor_outcome_state(state, action):
+            previous_price = (
+                self._optional_float(existing["price"])
+                if existing is not None and "price" in existing.keys()
+                else None
+            )
+            safe_price, rejected_price, recovery_source = _validate_active_outcome_price(
+                symbol=symbol,
+                candidate_price=stored_price,
+                entry_price=entry_price,
+                previous_price=previous_price,
+                current_market_price=None,
+                diagnostics=diagnostics_payload,
+                side=side,
+            )
+            if rejected_price:
+                diagnostics_payload.update(
+                    {
+                        "suspicious_active_price": True,
+                        "active_price_rejected": True,
+                        "active_price_rejected_value": stored_price,
+                        "active_price_recovery_source": recovery_source or "entry_price",
+                    }
+                )
+                stored_price = safe_price
+                missing_candidate_price = original_candidate_price is None or original_candidate_price <= 0
+                original_max_gain_r = stored_max_gain_r
+                original_max_drawdown_r = stored_max_drawdown_r
+                suspicious_candidate_r = (
+                    stored_max_gain_r > ACTIVE_OUTCOME_R_SUSPICIOUS_THRESHOLD
+                    or abs(stored_max_drawdown_r) > ACTIVE_OUTCOME_R_SUSPICIOUS_THRESHOLD
+                )
+                if suspicious_candidate_r:
+                    diagnostics_payload.update(
+                        {
+                            "suspicious_active_r_scale": True,
+                            "active_r_recovered_from": "previous_price" if recovery_source == "previous_price" else "reset",
+                            "active_r_scale_original_max_gain_r": original_max_gain_r,
+                            "active_r_scale_original_max_drawdown_r": original_max_drawdown_r,
+                        }
+                    )
+                if missing_candidate_price and not suspicious_candidate_r:
+                    pass
+                elif recovery_source == "previous_price" and existing is not None:
+                    stored_max_gain_r = float(existing["max_gain_r"] or 0.0)
+                    stored_max_drawdown_r = float(existing["max_drawdown_r"] or 0.0)
+                else:
+                    safe_current_r = _active_outcome_current_r(
+                        side=side,
+                        candidate_price=float(safe_price),
+                        entry_price=entry_price,
+                        diagnostics=diagnostics_payload,
+                    )
+                    if safe_current_r is None:
+                        stored_max_gain_r = 0.0
+                        stored_max_drawdown_r = 0.0
+                    elif safe_current_r >= 0:
+                        stored_max_gain_r = max(float(safe_current_r), 0.0)
+                        stored_max_drawdown_r = 0.0
+                    else:
+                        stored_max_gain_r = 0.0
+                        stored_max_drawdown_r = abs(float(safe_current_r))
+            else:
+                diagnostics_payload.setdefault("suspicious_active_price", False)
+                diagnostics_payload.setdefault("active_price_rejected", False)
+        elif isinstance(diagnostics_json, str):
+            diagnostics_payload = diagnostics_json
+
+        diagnostics_value = (
+            diagnostics_payload
+            if isinstance(diagnostics_payload, str)
+            else self._json_dumps_safe(diagnostics_payload or {})
+        )
         cur.execute(
             """
             INSERT INTO executor_outcomes (
@@ -559,10 +753,10 @@ class SignalStore:
                 current_sl,
                 exit_price,
                 exit_reason,
-                float(max_gain_r or 0.0),
-                float(max_drawdown_r or 0.0),
+                stored_max_gain_r,
+                stored_max_drawdown_r,
                 int(bars_in_trade or 0),
-                self._optional_float(price),
+                stored_price,
                 self._optional_float(spread_bps),
                 self._optional_float(buy_flow),
                 self._optional_float(sell_flow),
@@ -576,7 +770,7 @@ class SignalStore:
                 self._optional_float(resistance),
                 self._optional_float(ema20),
                 self._optional_float(vwap),
-                self._json_dumps_safe(diagnostics_json or {}) if not isinstance(diagnostics_json, str) else diagnostics_json,
+                diagnostics_value,
                 created_at,
                 now,
             ),
