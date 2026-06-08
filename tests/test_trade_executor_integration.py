@@ -376,6 +376,60 @@ def test_long_stop_loss_exit_uses_current_sl_for_ledger_price_and_r(tmp_path: Pa
     runner.signal_store.close()
 
 
+def test_stop_loss_exit_creates_trade_diagnosis(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(
+        kind="CONFIRMED_LONG",
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_BULLISH",
+            "market_regime": "RISK_ON",
+            "executor_snapshot": make_snapshot(),
+        },
+    )
+    key = signal_key(signal)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=95.0, buy_flow=140.0, sell_flow=90.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    diagnosis = runner.signal_store.get_stop_loss_diagnosis(trades[0]["trade_key"])
+    assert diagnosis is not None
+    assert diagnosis["diagnosis_type"] == "STOP_LOSS"
+    assert diagnosis["trade_key"] == trades[0]["trade_key"]
+    assert diagnosis["signal_key"] == key
+    assert diagnosis["entry_price"] == 100.0
+    assert diagnosis["initial_sl"] == 99.0
+    assert diagnosis["exit_price"] == 99.0
+    assert round(float(diagnosis["r_result"]), 6) == -1.0
+    assert diagnosis["signal_kind"] == "CONFIRMED_LONG"
+    assert diagnosis["btc_regime"] == "BTC_BULLISH"
+    assert diagnosis["market_regime"] == "RISK_ON"
+    assert diagnosis["post_stop_observation_pending"] is True
+    assert diagnosis["post_stop_check_after_bars"] == [3, 6, 12, 24]
+    assert diagnosis["features"]["observed_exit_price"] == 95.0
+    runner.signal_store.close()
+
+
+def test_non_stop_exit_does_not_create_stop_loss_diagnosis(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.1, buy_flow=80.0, sell_flow=130.0, volume_impulse=1.0)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    trades = runner.signal_store.list_executor_trades()
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "exit_sell_flow_dominance"
+    assert runner.signal_store.get_stop_loss_diagnosis(trades[0]["trade_key"]) is None
+    assert runner.signal_store.stop_loss_diagnosis_summary()["stop_loss_count"] == 0
+    runner.signal_store.close()
+
+
 def test_long_stop_loss_after_breakeven_uses_current_sl_and_not_minus_one_r(tmp_path: Path) -> None:
     runner = make_runner(tmp_path)
     signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})

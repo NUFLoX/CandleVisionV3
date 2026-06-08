@@ -810,6 +810,26 @@ class SignalStore:
             )
             """
         )
+        for col, typ in (
+            ("trade_key", "TEXT"),
+            ("diagnosis_type", "TEXT"),
+            ("entry_price", "REAL"),
+            ("initial_sl", "REAL"),
+            ("exit_price", "REAL"),
+            ("exit_time", "TEXT"),
+            ("max_gain_r", "REAL"),
+            ("max_drawdown_r", "REAL"),
+            ("btc_regime", "TEXT"),
+            ("market_regime", "TEXT"),
+            ("signal_kind", "TEXT"),
+            ("features_json", "TEXT"),
+            ("post_stop_observation_pending", "INTEGER DEFAULT 0"),
+            ("post_stop_check_after_bars", "TEXT"),
+        ):
+            try:
+                cur.execute(f"ALTER TABLE trade_diagnoses ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_trade_diagnoses_symbol_timeframe
@@ -828,6 +848,9 @@ class SignalStore:
             ON trade_diagnoses(created_at)
             """
         )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_diagnoses_trade_key ON trade_diagnoses(trade_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_diagnoses_type ON trade_diagnoses(diagnosis_type)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_diagnoses_exit_time ON trade_diagnoses(exit_time)")
         self.conn.commit()
 
     def upsert_trade_diagnosis(self, diagnosis: dict[str, Any]) -> None:
@@ -902,6 +925,205 @@ class SignalStore:
         )
         self.conn.commit()
 
+    def upsert_stop_loss_diagnosis(self, diagnosis: dict[str, Any]) -> None:
+        self.ensure_trade_diagnosis_schema()
+        now = _utc_now()
+        trade_key = str(diagnosis.get("trade_key") or "").strip()
+        signal_key = str(diagnosis.get("signal_key") or "").strip()
+        symbol = str(diagnosis.get("symbol") or "").strip()
+        if not signal_key or not symbol:
+            raise ValueError("stop-loss diagnosis requires signal_key and symbol")
+
+        existing = None
+        if trade_key:
+            existing = self.conn.execute(
+                "SELECT created_at FROM trade_diagnoses WHERE trade_key = ? AND diagnosis_type = ?",
+                (trade_key, "STOP_LOSS"),
+            ).fetchone()
+        if existing is None:
+            existing = self.conn.execute(
+                "SELECT created_at FROM trade_diagnoses WHERE signal_key = ?",
+                (signal_key,),
+            ).fetchone()
+        created_at = str(existing["created_at"]) if existing is not None else str(diagnosis.get("created_at") or now)
+        updated_at = str(diagnosis.get("updated_at") or now)
+        features = dict(diagnosis.get("features") or {})
+        features.setdefault("post_stop_observation_pending", True)
+        features.setdefault("post_stop_check_after_bars", [3, 6, 12, 24])
+
+        self.conn.execute(
+            """
+            INSERT INTO trade_diagnoses (
+                signal_key,
+                symbol,
+                timeframe,
+                side,
+                outcome,
+                diagnosis,
+                success_factors_json,
+                failure_factors_json,
+                recommendation,
+                r_result,
+                max_gain_pct,
+                max_drawdown_pct,
+                time_to_tp1_minutes,
+                time_to_tp2_minutes,
+                time_to_sl_minutes,
+                trade_key,
+                diagnosis_type,
+                entry_price,
+                initial_sl,
+                exit_price,
+                exit_time,
+                max_gain_r,
+                max_drawdown_r,
+                btc_regime,
+                market_regime,
+                signal_kind,
+                features_json,
+                post_stop_observation_pending,
+                post_stop_check_after_bars,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_key) DO UPDATE SET
+                symbol=excluded.symbol,
+                timeframe=excluded.timeframe,
+                side=excluded.side,
+                outcome=excluded.outcome,
+                diagnosis=excluded.diagnosis,
+                success_factors_json=excluded.success_factors_json,
+                failure_factors_json=excluded.failure_factors_json,
+                recommendation=excluded.recommendation,
+                r_result=excluded.r_result,
+                max_gain_pct=excluded.max_gain_pct,
+                max_drawdown_pct=excluded.max_drawdown_pct,
+                time_to_tp1_minutes=excluded.time_to_tp1_minutes,
+                time_to_tp2_minutes=excluded.time_to_tp2_minutes,
+                time_to_sl_minutes=excluded.time_to_sl_minutes,
+                trade_key=excluded.trade_key,
+                diagnosis_type=excluded.diagnosis_type,
+                entry_price=excluded.entry_price,
+                initial_sl=excluded.initial_sl,
+                exit_price=excluded.exit_price,
+                exit_time=excluded.exit_time,
+                max_gain_r=excluded.max_gain_r,
+                max_drawdown_r=excluded.max_drawdown_r,
+                btc_regime=excluded.btc_regime,
+                market_regime=excluded.market_regime,
+                signal_kind=excluded.signal_kind,
+                features_json=excluded.features_json,
+                post_stop_observation_pending=excluded.post_stop_observation_pending,
+                post_stop_check_after_bars=excluded.post_stop_check_after_bars,
+                updated_at=excluded.updated_at
+            """,
+            (
+                signal_key,
+                symbol,
+                self._optional_text(diagnosis.get("timeframe")),
+                self._optional_text(diagnosis.get("side")),
+                "SL",
+                str(diagnosis.get("diagnosis") or "Executor stop-loss exit captured for post-stop recovery diagnostics."),
+                self._json_dumps_safe(diagnosis.get("success_factors") or {}),
+                self._json_dumps_safe(diagnosis.get("failure_factors") or features),
+                self._optional_text(
+                    diagnosis.get("recommendation")
+                    or "Review post-stop recovery before changing any stop-loss execution behavior."
+                ),
+                self._optional_float(diagnosis.get("r_result")),
+                None,
+                None,
+                None,
+                None,
+                None,
+                self._optional_text(trade_key),
+                "STOP_LOSS",
+                self._optional_float(diagnosis.get("entry_price")),
+                self._optional_float(diagnosis.get("initial_sl")),
+                self._optional_float(diagnosis.get("exit_price")),
+                self._optional_text(diagnosis.get("exit_time")),
+                self._optional_float(diagnosis.get("max_gain_r")),
+                self._optional_float(diagnosis.get("max_drawdown_r")),
+                self._optional_text(diagnosis.get("btc_regime")),
+                self._optional_text(diagnosis.get("market_regime")),
+                self._optional_text(diagnosis.get("signal_kind")),
+                self._json_dumps_safe(features),
+                1 if diagnosis.get("post_stop_observation_pending", True) else 0,
+                self._json_dumps_safe(diagnosis.get("post_stop_check_after_bars") or [3, 6, 12, 24]),
+                created_at,
+                updated_at,
+            ),
+        )
+        self.conn.commit()
+
+    def get_stop_loss_diagnosis(self, trade_key: str) -> dict[str, Any] | None:
+        self.ensure_trade_diagnosis_schema()
+        row = self.conn.execute(
+            "SELECT * FROM trade_diagnoses WHERE trade_key = ? AND diagnosis_type = ?",
+            (trade_key, "STOP_LOSS"),
+        ).fetchone()
+        return self._trade_diagnosis_row_to_dict(row) if row is not None else None
+
+    def stop_loss_diagnosis_summary(self) -> dict[str, Any]:
+        self.ensure_trade_diagnosis_schema()
+        rows = self.conn.execute(
+            """
+            SELECT signal_kind, btc_regime, max_gain_r, max_drawdown_r
+            FROM trade_diagnoses
+            WHERE diagnosis_type = 'STOP_LOSS'
+            """
+        ).fetchall()
+        groups_kind: dict[str, list[sqlite3.Row]] = {}
+        groups_btc: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            groups_kind.setdefault(str(row["signal_kind"] or "UNKNOWN"), []).append(row)
+            groups_btc.setdefault(str(row["btc_regime"] or "UNKNOWN"), []).append(row)
+
+        def avg(values: list[float]) -> float:
+            return round(sum(values) / len(values), 4) if values else 0.0
+
+        def group_payload(groups: dict[str, list[sqlite3.Row]], key_name: str) -> list[dict[str, Any]]:
+            output = []
+            for key, group in groups.items():
+                output.append(
+                    {
+                        key_name: key,
+                        "stop_loss_count": len(group),
+                        "avg_max_gain_before_sl": avg([float(item["max_gain_r"] or 0.0) for item in group]),
+                        "avg_drawdown_before_sl": avg([float(item["max_drawdown_r"] or 0.0) for item in group]),
+                    }
+                )
+            return sorted(output, key=lambda item: (-int(item["stop_loss_count"]), str(item[key_name])))
+
+        return {
+            "stop_loss_count": len(rows),
+            "avg_max_gain_before_sl": avg([float(row["max_gain_r"] or 0.0) for row in rows]),
+            "avg_drawdown_before_sl": avg([float(row["max_drawdown_r"] or 0.0) for row in rows]),
+            "by_signal_kind": group_payload(groups_kind, "signal_kind"),
+            "by_btc_regime": group_payload(groups_btc, "btc_regime"),
+        }
+
+    def _trade_diagnosis_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        for json_col, output_col in (
+            ("success_factors_json", "success_factors"),
+            ("failure_factors_json", "failure_factors"),
+            ("features_json", "features"),
+        ):
+            raw = item.pop(json_col, None)
+            try:
+                item[output_col] = json.loads(raw or "{}")
+            except json.JSONDecodeError:
+                item[output_col] = {}
+        raw_bars = item.get("post_stop_check_after_bars")
+        try:
+            item["post_stop_check_after_bars"] = json.loads(raw_bars or "[]")
+        except (TypeError, json.JSONDecodeError):
+            item["post_stop_check_after_bars"] = []
+        item["post_stop_observation_pending"] = bool(item.get("post_stop_observation_pending"))
+        return item
+
     def get_trade_diagnosis(self, signal_key: str) -> dict[str, Any] | None:
         self.ensure_trade_diagnosis_schema()
         row = self.conn.execute(
@@ -911,17 +1133,7 @@ class SignalStore:
         if row is None:
             return None
 
-        item = dict(row)
-        for json_col, output_col in (
-            ("success_factors_json", "success_factors"),
-            ("failure_factors_json", "failure_factors"),
-        ):
-            raw = item.pop(json_col, None)
-            try:
-                item[output_col] = json.loads(raw or "{}")
-            except json.JSONDecodeError:
-                item[output_col] = {}
-        return item
+        return self._trade_diagnosis_row_to_dict(row)
 
     def has_trade_lifecycle_event(self, signal_key: str, event_type: str) -> bool:
         self.ensure_trade_learning_schema()

@@ -1783,12 +1783,16 @@ class AccumulationRunner:
             diagnostics_payload["exit_shadow_actual_r"] = r_result
             diagnostics_payload["exit_shadow_delta_r"] = (shadow_exit_r - r_result) if shadow_exit_r is not None and r_result is not None else None
 
+            trade_key = self._stable_executor_trade_key(signal_key, entry_time, exit_time, exit_price, exit_reason)
+            timeframe = str(diagnostics_payload.get("executor_timeframe") or signal.meta.get("tf") or "1")
+            max_gain_r = self._optional_float(row["max_gain_r"])
+            max_drawdown_r = self._optional_float(row["max_drawdown_r"])
             self.signal_store.upsert_executor_trade(
                 {
-                    "trade_key": self._stable_executor_trade_key(signal_key, entry_time, exit_time, exit_price, exit_reason),
+                    "trade_key": trade_key,
                     "signal_key": signal_key,
                     "symbol": str(signal.symbol),
-                    "timeframe": str(diagnostics_payload.get("executor_timeframe") or signal.meta.get("tf") or "1"),
+                    "timeframe": timeframe,
                     "side": side,
                     "state": str(row["state"]),
                     "entry_action": entry_action,
@@ -1802,8 +1806,8 @@ class AccumulationRunner:
                     "exit_time": exit_time,
                     "exit_reason": exit_reason,
                     "r_result": r_result,
-                    "max_gain_r": self._optional_float(row["max_gain_r"]),
-                    "max_drawdown_r": self._optional_float(row["max_drawdown_r"]),
+                    "max_gain_r": max_gain_r,
+                    "max_drawdown_r": max_drawdown_r,
                     "bars_in_trade": int(row["bars_in_trade"] or 0),
                     "duration_minutes": self._duration_minutes(entry_time, exit_time),
                     "moved_to_breakeven": moved_to_breakeven,
@@ -1813,6 +1817,38 @@ class AccumulationRunner:
                     "updated_at": exit_time,
                 }
             )
+            if str(exit_reason) == "exit_stop_loss_hit":
+                self.signal_store.upsert_stop_loss_diagnosis(
+                    {
+                        "trade_key": trade_key,
+                        "signal_key": signal_key,
+                        "symbol": str(signal.symbol),
+                        "timeframe": timeframe,
+                        "side": side,
+                        "entry_price": entry_price,
+                        "initial_sl": initial_sl,
+                        "exit_price": exit_price,
+                        "exit_time": exit_time,
+                        "r_result": r_result,
+                        "max_gain_r": max_gain_r,
+                        "max_drawdown_r": max_drawdown_r,
+                        "btc_regime": diagnostics_payload.get("btc_regime") or getattr(signal, "meta", {}).get("btc_regime"),
+                        "market_regime": diagnostics_payload.get("market_regime") or getattr(signal, "meta", {}).get("market_regime"),
+                        "signal_kind": diagnostics_payload.get("signal_kind") or getattr(signal, "kind", None),
+                        "features": {
+                            **diagnostics_payload,
+                            "entry_time": entry_time,
+                            "bars_in_trade": int(row["bars_in_trade"] or 0),
+                            "duration_minutes": self._duration_minutes(entry_time, exit_time),
+                            "post_stop_observation_pending": True,
+                            "post_stop_check_after_bars": [3, 6, 12, 24],
+                        },
+                        "post_stop_observation_pending": True,
+                        "post_stop_check_after_bars": [3, 6, 12, 24],
+                        "created_at": exit_time,
+                        "updated_at": exit_time,
+                    }
+                )
         except Exception:
             self.logger.exception("Failed to write executor_trades row for %s", signal_key)
 
