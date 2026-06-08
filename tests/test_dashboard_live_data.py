@@ -7,8 +7,8 @@ import unittest
 from dataclasses import dataclass, field
 
 from dashboard.ingest_client import signal_to_dashboard_payload
-from dashboard.live_data import _fetch_global_pressure, _fetch_one_coin_metric
-from dashboard.schemas import Signal, SignalStrength, SignalType
+from dashboard.live_data import _build_market_state, _fetch_global_pressure, _fetch_one_coin_metric
+from dashboard.schemas import CoinMetrics, MarketState, PressureStrip, Signal, SignalStrength, SignalType
 from dashboard.store import DashboardStore
 
 
@@ -33,6 +33,64 @@ class DashboardLiveDataTests(unittest.TestCase):
         self.assertEqual(by_key["usdt_d"].value, 4.1)
         self.assertEqual(by_key["total3"].value, 34.0)
         self.assertEqual(by_key["btc_cap"].direction, "up")
+
+    def test_altcoin_mode_recovers_when_btc_stable_total3_weak_market_cap_positive(self) -> None:
+        state = _build_market_state(
+            {"BTCUSDT": _coin_metric(score=6.2)},
+            _pressure_strips(total3=34.0, market_cap_change=2.5, usdt=9.2),
+        )
+
+        self.assertEqual(state.btc_filter, "STABLE")
+        self.assertEqual(state.total3_strength, "weak")
+        self.assertEqual(state.altcoin_mode, "SELECTIVE")
+        self.assertTrue(state.can_emit_alt_signals)
+
+    def test_altcoin_mode_stays_risk_off_when_btc_danger(self) -> None:
+        state = _build_market_state(
+            {"BTCUSDT": _coin_metric(score=3.0)},
+            _pressure_strips(total3=50.0, market_cap_change=2.5, usdt=4.0),
+        )
+
+        self.assertEqual(state.btc_filter, "DANGER")
+        self.assertEqual(state.altcoin_mode, "RISK-OFF")
+        self.assertFalse(state.can_emit_alt_signals)
+
+    def test_altcoin_mode_risk_on_when_btc_healthy_total3_strong(self) -> None:
+        state = _build_market_state(
+            {"BTCUSDT": _coin_metric(score=6.2)},
+            _pressure_strips(total3=52.0, market_cap_change=1.1, usdt=4.0),
+        )
+
+        self.assertEqual(state.btc_filter, "STABLE")
+        self.assertEqual(state.total3_strength, "strong")
+        self.assertEqual(state.altcoin_mode, "RISK-ON")
+        self.assertTrue(state.can_emit_alt_signals)
+
+    def test_snapshot_normalizes_ingested_risk_off_when_btc_is_not_dangerous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "dashboard_state.json")
+            previous = os.environ.get("DASHBOARD_STATE_PATH")
+            os.environ["DASHBOARD_STATE_PATH"] = state_path
+            try:
+                store = DashboardStore()
+                store.pressure_strips = _pressure_strips(total3=34.0, market_cap_change=2.5, usdt=9.2)
+                store.market_state = MarketState(
+                    btc_filter="STABLE",
+                    altcoin_mode="RISK-OFF",
+                    market_regime="RANGE",
+                    total3_strength="weak",
+                    can_emit_alt_signals=False,
+                )
+
+                snapshot = asyncio.run(store.snapshot())
+
+                self.assertEqual(snapshot.market_state.altcoin_mode, "SELECTIVE")
+                self.assertTrue(snapshot.market_state.can_emit_alt_signals)
+            finally:
+                if previous is None:
+                    os.environ.pop("DASHBOARD_STATE_PATH", None)
+                else:
+                    os.environ["DASHBOARD_STATE_PATH"] = previous
 
     def test_bybit_coin_metric_parser_uses_mock_client(self) -> None:
         metric = asyncio.run(_fetch_one_coin_metric(FakeBybit(), "BTCUSDT"))
@@ -84,6 +142,31 @@ class DashboardLiveDataTests(unittest.TestCase):
                     os.environ.pop("DASHBOARD_STATE_PATH", None)
                 else:
                     os.environ["DASHBOARD_STATE_PATH"] = previous
+
+
+def _coin_metric(score: float, volume_24h_usd: float = 6_000_000_000.0) -> CoinMetrics:
+    return CoinMetrics(symbol="BTCUSDT", accumulation_score=score, volume_24h_usd=volume_24h_usd)
+
+
+def _pressure_strips(total3: float, market_cap_change: float, usdt: float) -> list[PressureStrip]:
+    return [
+        PressureStrip(
+            key="btc_cap",
+            label="Crypto Market Cap 24h",
+            value=50 + market_cap_change * 3,
+            change_pct=market_cap_change,
+            direction="up" if market_cap_change > 0 else "down" if market_cap_change < 0 else "flat",
+        ),
+        PressureStrip(key="btc_d", label="BTC Dominance", value=50.0),
+        PressureStrip(key="usdt_d", label="USDT Dominance", value=usdt),
+        PressureStrip(
+            key="total3",
+            label="TOTAL3 Proxy",
+            value=total3,
+            change_pct=market_cap_change,
+            direction="up" if market_cap_change > 0 else "down" if market_cap_change < 0 else "flat",
+        ),
+    ]
 
 
 class FakeBybit:

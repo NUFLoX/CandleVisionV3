@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import TypeVar
 
+from .market_state_logic import normalize_altcoin_market_state
 from .persistence import dashboard_state_path, read_state, write_state
 from .schemas import (
     BotLog,
@@ -82,10 +83,11 @@ class DashboardStore:
 
     async def snapshot(self) -> DashboardSnapshot:
         async with self._lock:
+            pressure_strips = list(deepcopy(self.pressure_strips))
             return DashboardSnapshot(
                 status=deepcopy(self.status),
-                market_state=deepcopy(self.market_state),
-                pressure_strips=list(deepcopy(self.pressure_strips)),
+                market_state=normalize_altcoin_market_state(self.market_state, pressure_strips),
+                pressure_strips=pressure_strips,
                 signals=list(deepcopy(self.signals)),
                 logs=list(deepcopy(self.logs)),
                 watchlist=list(deepcopy(self.watchlist)),
@@ -160,6 +162,7 @@ class DashboardStore:
     async def update_market_state(self, market_state: MarketState) -> MarketState:
         async with self._lock:
             market_state.updated_at = _now()
+            market_state = normalize_altcoin_market_state(market_state, self.pressure_strips)
             self.market_state = market_state
             self._save_persisted_state_locked()
         return market_state
@@ -185,8 +188,8 @@ class DashboardStore:
             heartbeats = deepcopy(self.heartbeats)
         health_status = await build_health_status(live_data.status, heartbeats)
         async with self._lock:
-            self.market_state = live_data.market_state
             self.pressure_strips = live_data.pressure_strips
+            self.market_state = normalize_altcoin_market_state(live_data.market_state, self.pressure_strips)
             self.coin_metrics.update(live_data.coin_metrics)
             self.status = health_status
             for log in reversed(live_data.logs):
