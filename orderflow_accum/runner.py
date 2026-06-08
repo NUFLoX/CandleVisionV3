@@ -830,10 +830,23 @@ class AccumulationRunner:
         side = str(row["side"] or signal.side)
         entry_snapshot = self._executor_entry_snapshot_from_row(row)
         entry = float(entry_snapshot.get("executor_entry_price") or row["entry_price"] or signal.entry or 0.0)
-        stop = float(entry_snapshot.get("executor_initial_sl") or signal.stop_loss or row["current_sl"] or 0.0)
-        initial_risk = abs(entry - stop) or max(abs(entry) * 0.01, 1e-9)
-        max_gain_r = float(row["max_gain_r"] or 0.0)
-        max_drawdown_r = float(row["max_drawdown_r"] or 0.0)
+        stop, risk_diagnostics = self._resolve_active_initial_sl(signal_key=str(row["signal_key"]), row=row, signal=signal, entry_price=entry, side=side)
+        initial_risk = self._active_initial_risk(entry, stop)
+        invalid_initial_risk = self._invalid_active_initial_risk(entry, stop, side)
+        if invalid_initial_risk:
+            initial_risk = max(abs(entry) * 0.01, 1e-9)
+        max_gain_r = 0.0 if invalid_initial_risk else float(row["max_gain_r"] or 0.0)
+        max_drawdown_r = 0.0 if invalid_initial_risk else float(row["max_drawdown_r"] or 0.0)
+        self._persist_active_risk_diagnostics(
+            row=row,
+            entry_price=entry,
+            initial_sl=stop,
+            initial_risk=None if invalid_initial_risk else initial_risk,
+            invalid_initial_risk=invalid_initial_risk,
+            risk_diagnostics=risk_diagnostics,
+            max_gain_r=max_gain_r,
+            max_drawdown_r=max_drawdown_r,
+        )
         if side == "Sell":
             max_price = entry + max_drawdown_r * initial_risk
             min_price = entry - max_gain_r * initial_risk
@@ -855,6 +868,104 @@ class AccumulationRunner:
             exit_price=self._optional_float(row["exit_price"]),
             exit_reason=row["exit_reason"],
             initial_risk=initial_risk,
+        )
+
+    @staticmethod
+    def _active_initial_risk(entry_price: float | None, initial_sl: float | None) -> float | None:
+        if entry_price is None or initial_sl is None:
+            return None
+        return abs(float(entry_price) - float(initial_sl))
+
+    @classmethod
+    def _invalid_active_initial_risk(cls, entry_price, initial_sl, side) -> bool:
+        entry = cls._optional_float(entry_price)
+        stop = cls._optional_float(initial_sl)
+        if entry is None or stop is None:
+            return True
+        risk = abs(entry - stop)
+        min_risk = max(abs(entry) * 1e-9, 1e-12)
+        if risk <= min_risk:
+            return True
+        return cls._executor_initial_sl_invalid(side=side, entry_price=entry, initial_sl=stop)
+
+    def _resolve_active_initial_sl(self, *, signal_key: str, row, signal, entry_price: float, side: str) -> tuple[float, dict[str, object]]:
+        diagnostics = self._parse_executor_diagnostics(row["diagnostics_json"] if "diagnostics_json" in row.keys() else None)
+        latest_trade = self.signal_store.get_latest_executor_trade_for_signal(signal_key)
+        candidates = [
+            ("executor_trades.initial_sl", latest_trade.get("initial_sl") if latest_trade is not None else None),
+            ("diagnostics_json.executor_initial_sl", diagnostics.get("executor_initial_sl")),
+            ("diagnostics_json.initial_sl", diagnostics.get("initial_sl")),
+            ("position.executor_initial_sl", getattr(signal, "executor_initial_sl", None)),
+            ("current_sl", row["current_sl"]),
+        ]
+        for source, value in candidates:
+            parsed = self._optional_float(value)
+            if parsed is None:
+                continue
+            risk_diagnostics: dict[str, object] = {"risk_basis": "initial_sl", "risk_source": source}
+            if source == "current_sl":
+                risk_diagnostics["risk_basis_warning"] = "fallback_current_sl_missing_initial_sl"
+            return parsed, risk_diagnostics
+        fallback = self._optional_float(getattr(signal, "stop_loss", None)) or self._optional_float(row["current_sl"]) or entry_price
+        return float(fallback), {
+            "risk_basis": "initial_sl",
+            "risk_source": "fallback_signal_stop_loss",
+            "risk_basis_warning": "fallback_current_sl_missing_initial_sl" if self._optional_float(row["current_sl"]) is not None else "missing_initial_sl",
+        }
+
+    def _persist_active_risk_diagnostics(
+        self,
+        *,
+        row,
+        entry_price: float,
+        initial_sl: float,
+        initial_risk: float | None,
+        invalid_initial_risk: bool,
+        risk_diagnostics: dict[str, object],
+        max_gain_r: float,
+        max_drawdown_r: float,
+    ) -> None:
+        diagnostics = self._parse_executor_diagnostics(row["diagnostics_json"] if "diagnostics_json" in row.keys() else None)
+        diagnostics.update(risk_diagnostics)
+        diagnostics.update(
+            {
+                "executor_entry_price": entry_price,
+                "entry_price": entry_price,
+                "executor_initial_sl": initial_sl,
+                "initial_sl": initial_sl,
+                "initial_risk": initial_risk,
+                "invalid_initial_risk": bool(invalid_initial_risk),
+            }
+        )
+        self.signal_store.upsert_executor_decision(
+            signal_key=str(row["signal_key"]),
+            symbol=str(row["symbol"]),
+            side=str(row["side"]),
+            state=str(row["state"]),
+            action=str(row["action"]),
+            reason=str(row["reason"]),
+            entry_price=entry_price,
+            current_sl=self._optional_float(row["current_sl"]),
+            exit_price=self._optional_float(row["exit_price"]),
+            exit_reason=row["exit_reason"],
+            max_gain_r=max_gain_r,
+            max_drawdown_r=max_drawdown_r,
+            bars_in_trade=int(row["bars_in_trade"] or 0),
+            price=self._optional_float(row["price"]),
+            spread_bps=self._optional_float(row["spread_bps"]),
+            buy_flow=self._optional_float(row["buy_flow"]),
+            sell_flow=self._optional_float(row["sell_flow"]),
+            required_buy_flow=self._optional_float(row["required_buy_flow"]),
+            required_sell_flow=self._optional_float(row["required_sell_flow"]),
+            volume_impulse=self._optional_float(row["volume_impulse"]),
+            required_volume_impulse=self._optional_float(row["required_volume_impulse"]),
+            bid_wall_strength=self._optional_float(row["bid_wall_strength"]),
+            ask_wall_strength=self._optional_float(row["ask_wall_strength"]),
+            support=self._optional_float(row["support"]),
+            resistance=self._optional_float(row["resistance"]),
+            ema20=self._optional_float(row["ema20"]),
+            vwap=self._optional_float(row["vwap"]),
+            diagnostics_json=diagnostics,
         )
 
     def _paper_executor_diagnostics(self, signal, snapshot=None) -> dict[str, object]:
@@ -1010,6 +1121,9 @@ class AccumulationRunner:
                     "executor_entry_time": datetime.now(UTC).isoformat(),
                     "executor_entry_price": float(position.entry_price),
                     "executor_initial_sl": float(position.stop_loss),
+                    "initial_sl": float(position.stop_loss),
+                    "initial_risk": float(position.initial_risk),
+                    "risk_basis": "initial_sl",
                     "executor_side": str(position.side),
                     "executor_signal_key": signal_key,
                     "executor_timeframe": str(signal.meta.get("tf") or "1"),
@@ -1199,6 +1313,11 @@ class AccumulationRunner:
             "executor_entry_time",
             "executor_entry_price",
             "executor_initial_sl",
+            "initial_sl",
+            "initial_risk",
+            "risk_basis",
+            "risk_basis_warning",
+            "invalid_initial_risk",
             "executor_side",
             "executor_signal_key",
             "executor_timeframe",
@@ -1548,7 +1667,12 @@ class AccumulationRunner:
         side = str(row["side"] or (parts[4] if len(parts) > 4 else "Buy"))
         diagnostics = self._parse_executor_diagnostics(row["diagnostics_json"] if "diagnostics_json" in row.keys() else None)
         entry_price = self._optional_float(diagnostics.get("executor_entry_price")) or self._optional_float(row["entry_price"]) or 0.0
-        initial_sl = self._optional_float(diagnostics.get("executor_initial_sl")) or self._optional_float(row["current_sl"]) or 0.0
+        initial_sl = (
+            self._optional_float(diagnostics.get("executor_initial_sl"))
+            or self._optional_float(diagnostics.get("initial_sl"))
+            or self._optional_float(row["current_sl"])
+            or 0.0
+        )
         return SimpleNamespace(
             symbol=str(row["symbol"] or (parts[0] if parts else "")),
             side=side,
