@@ -556,6 +556,63 @@ def _empty_learning_effectiveness_payload() -> dict[str, object]:
     }
 
 
+def _empty_stop_loss_diagnostics_payload() -> dict[str, object]:
+    return {
+        "stop_loss_count": 0,
+        "avg_max_gain_before_sl": 0.0,
+        "avg_drawdown_before_sl": 0.0,
+        "by_signal_kind": [],
+        "by_btc_regime": [],
+    }
+
+
+def _read_stop_loss_diagnostics_summary(conn: sqlite3.Connection) -> dict[str, object]:
+    columns = _table_columns(conn, "trade_diagnoses")
+    if not columns or "diagnosis_type" not in columns:
+        return _empty_stop_loss_diagnostics_payload()
+    select_columns = [
+        _executor_select_expr(columns, "signal_kind", table_alias="td"),
+        _executor_select_expr(columns, "btc_regime", table_alias="td"),
+        _executor_select_expr(columns, "max_gain_r", table_alias="td"),
+        _executor_select_expr(columns, "max_drawdown_r", table_alias="td"),
+    ]
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_columns)}
+        FROM trade_diagnoses td
+        WHERE UPPER(COALESCE(td.diagnosis_type, '')) = 'STOP_LOSS'
+        """
+    ).fetchall()
+
+    def avg(values: list[float]) -> float:
+        return _round4(sum(values) / len(values)) if values else 0.0
+
+    def group_rows(key_name: str, output_name: str) -> list[dict[str, object]]:
+        grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
+        for row in rows:
+            grouped[str(row[key_name] or "UNKNOWN")].append(row)
+        output = []
+        for key, group in grouped.items():
+            output.append(
+                {
+                    output_name: key,
+                    "stop_loss_count": len(group),
+                    "avg_max_gain_before_sl": avg([_safe_float(item["max_gain_r"]) or 0.0 for item in group]),
+                    "avg_drawdown_before_sl": avg([_safe_float(item["max_drawdown_r"]) or 0.0 for item in group]),
+                }
+            )
+        return sorted(output, key=lambda item: (-int(item["stop_loss_count"]), str(item[output_name])))
+
+    return {
+        "stop_loss_count": len(rows),
+        "avg_max_gain_before_sl": avg([_safe_float(row["max_gain_r"]) or 0.0 for row in rows]),
+        "avg_drawdown_before_sl": avg([_safe_float(row["max_drawdown_r"]) or 0.0 for row in rows]),
+        "by_signal_kind": group_rows("signal_kind", "signal_kind"),
+        "by_btc_regime": group_rows("btc_regime", "btc_regime"),
+    }
+
+
+
 def _learning_order_key(row: dict[str, object]) -> str:
     return str(row.get("exit_time") or row.get("updated_at") or row.get("entry_time") or "")
 
@@ -1447,10 +1504,20 @@ def _read_learning_effectiveness() -> dict[str, object]:
     conn.row_factory = sqlite3.Row
     try:
         rows = _read_learning_closed_trades(conn)
+        stop_loss_diagnostics = _read_stop_loss_diagnostics_summary(conn)
     except sqlite3.Error:
         return payload
     finally:
         conn.close()
+
+    payload["stop_loss_diagnostics"] = stop_loss_diagnostics
+    payload["summary"].update(
+        {
+            "stop_loss_count": stop_loss_diagnostics["stop_loss_count"],
+            "avg_max_gain_before_sl": stop_loss_diagnostics["avg_max_gain_before_sl"],
+            "avg_drawdown_before_sl": stop_loss_diagnostics["avg_drawdown_before_sl"],
+        }
+    )
 
     if not rows:
         return payload
@@ -1487,6 +1554,14 @@ def _read_learning_effectiveness() -> dict[str, object]:
                 "by_btc_regime": regime_payload.get("by_btc_regime", []),
                 "by_market_regime": regime_payload.get("by_market_regime", []),
             },
+            "stop_loss_diagnostics": stop_loss_diagnostics,
+        }
+    )
+    payload["summary"].update(
+        {
+            "stop_loss_count": stop_loss_diagnostics["stop_loss_count"],
+            "avg_max_gain_before_sl": stop_loss_diagnostics["avg_max_gain_before_sl"],
+            "avg_drawdown_before_sl": stop_loss_diagnostics["avg_drawdown_before_sl"],
         }
     )
     return payload
