@@ -85,6 +85,12 @@ class AccumulationRunner:
             if self.trade_executor_mode == "testnet"
             else None
         )
+        self.logger.info(
+            "Bybit routing configured | market_data_testnet=%s | order_testnet=%s | trade_executor_mode=%s",
+            self.settings.bybit_market_data_testnet,
+            self.settings.bybit_testnet,
+            self.trade_executor_mode,
+        )
         self.hybrid_entry_shadow = HybridEntryShadowEngine(
             min_volume_impulse=self._env_float("HYBRID_ENTRY_SHADOW_MIN_VOLUME_IMPULSE", 1.2),
             max_spread_bps=self._env_float("HYBRID_ENTRY_SHADOW_MAX_SPREAD_BPS", 15.0),
@@ -219,7 +225,9 @@ class AccumulationRunner:
                 f"Realtime symbols: {len(realtime_symbols)}\n"
                 f"Macro symbols: {len(macro_symbols)}\n"
                 f"Mode: {'signals only' if self.settings.signals_only else 'trade ready'}\n"
-                f"Signal mode: {self.settings.signal_mode}"
+                f"Signal mode: {self.settings.signal_mode}\n"
+                f"market_data_testnet={self.settings.bybit_market_data_testnet}\n"
+                f"order_testnet={self.settings.bybit_testnet}"
             )
 
             tasks = [

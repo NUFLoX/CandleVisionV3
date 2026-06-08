@@ -24,6 +24,13 @@ def _load_dotenv(path: str = ".env") -> None:
 _load_dotenv()
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _csv_env(name: str, default: str = "") -> list[str]:
     raw = os.getenv(name, default).strip()
     if not raw:
@@ -33,7 +40,8 @@ def _csv_env(name: str, default: str = "") -> list[str]:
 
 @dataclass(slots=True)
 class Settings:
-    bybit_testnet: bool = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+    bybit_testnet: bool = field(default_factory=lambda: _bool_env("BYBIT_TESTNET", False))
+    bybit_market_data_testnet: bool = field(default_factory=lambda: _bool_env("BYBIT_MARKET_DATA_TESTNET", False))
     signals_only: bool = os.getenv("SIGNALS_ONLY", "true").lower() == "true"
     trade_executor_mode: str = field(
         default_factory=lambda: os.getenv("TRADE_EXECUTOR_MODE", "paper").strip().lower() or "paper"
@@ -175,8 +183,10 @@ class Settings:
 
     @property
     def rest_base_url(self) -> str:
-        return "https://api-testnet.bybit.com" if self.bybit_testnet else "https://api.bybit.com"
+        return "https://api-testnet.bybit.com" if self.bybit_market_data_testnet else "https://api.bybit.com"
 
     @property
     def ws_public_url(self) -> str:
-        return "wss://stream-testnet.bybit.com/v5/public/linear" if self.bybit_testnet else "wss://stream.bybit.com/v5/public/linear"
+        if self.bybit_market_data_testnet:
+            return "wss://stream-testnet.bybit.com/v5/public/linear"
+        return "wss://stream.bybit.com/v5/public/linear"
