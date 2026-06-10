@@ -944,6 +944,157 @@ def test_testnet_entry_block_keeps_watch_state(tmp_path: Path) -> None:
     runner.signal_store.close()
 
 
+def test_testnet_processes_strong_pre_impulse_without_confirmed_long(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(
+        kind="PRE_IMPULSE_ZONE",
+        score=8.0,
+        reasons=["PRE_IMPULSE_ZONE"],
+        meta={"tf": "5", "market": "linear", "btc_regime": "BTC_NEUTRAL", "executor_snapshot": make_snapshot()},
+    )
+
+    runner._process_paper_executor(signal, "linear", "PRE_IMPULSE")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert fake.entry_calls == 1
+    assert row["action"] == "ENTER_LONG"
+    assert diagnostics["testnet_observation_entry_candidate"] is True
+    assert diagnostics["testnet_observation_entry_reason"] == "strong_non_confirmed_buy_signal"
+    assert diagnostics["original_signal_status"] == "PRE_IMPULSE"
+    assert diagnostics["original_signal_kind"] == "PRE_IMPULSE_ZONE"
+    assert diagnostics["original_signal_score"] == 8.0
+    runner.signal_store.close()
+
+
+def test_testnet_processes_strong_breakout_pressure_without_confirmed_long(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(
+        kind="BREAKOUT_PRESSURE",
+        score=8.5,
+        reasons=["BREAKOUT_PRESSURE"],
+        meta={"tf": "5", "market": "linear", "btc_regime": "BTC_NEUTRAL", "executor_snapshot": make_snapshot()},
+    )
+
+    runner._process_paper_executor(signal, "linear", "BREAKOUT_PRESSURE")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert fake.entry_calls == 1
+    assert row["action"] == "ENTER_LONG"
+    assert diagnostics["testnet_observation_entry_candidate"] is True
+    assert diagnostics["original_signal_status"] == "BREAKOUT_PRESSURE"
+    assert diagnostics["original_signal_kind"] == "BREAKOUT_PRESSURE"
+    runner.signal_store.close()
+
+
+def test_paper_mode_still_ignores_non_confirmed_observation_signal(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    signal = make_signal(
+        kind="PRE_IMPULSE_ZONE",
+        score=9.0,
+        reasons=["PRE_IMPULSE_ZONE"],
+        meta={"tf": "5", "market": "linear", "btc_regime": "BTC_NEUTRAL", "executor_snapshot": make_snapshot()},
+    )
+
+    runner._process_paper_executor(signal, "linear", "PRE_IMPULSE")
+
+    assert row_count(runner.signal_store) == 0
+    runner.signal_store.close()
+
+
+def test_testnet_observation_weak_score_is_ignored(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(
+        kind="BASE_BUILDUP_LONG",
+        score=7.99,
+        reasons=["BASE_BUILDUP_LONG"],
+        meta={"tf": "5", "market": "linear", "btc_regime": "BTC_NEUTRAL", "executor_snapshot": make_snapshot()},
+    )
+
+    runner._process_paper_executor(signal, "linear", "WATCHING")
+
+    assert fake.entry_calls == 0
+    assert row_count(runner.signal_store) == 0
+    runner.signal_store.close()
+
+
+def test_testnet_observation_bearish_or_dump_btc_is_ignored(tmp_path: Path) -> None:
+    for btc_regime in ("BTC_BEARISH", "BTC_DUMP_RISK"):
+        fake = _FakeTestnetOrderExecutor()
+        regime_path = tmp_path / btc_regime
+        regime_path.mkdir()
+        runner = make_testnet_runner(regime_path, fake)
+        signal = make_signal(
+            kind="ACCUMULATION_LONG_READY",
+            score=9.0,
+            reasons=["ACCUMULATION_LONG_READY"],
+            meta={"tf": "5", "market": "linear", "btc_regime": btc_regime, "executor_snapshot": make_snapshot()},
+        )
+
+        runner._process_paper_executor(signal, "linear", "ACCUMULATION")
+
+        assert fake.entry_calls == 0
+        assert row_count(runner.signal_store) == 0
+        runner.signal_store.close()
+
+
+def test_testnet_observation_enter_long_uses_existing_order_path(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(
+        kind="ACCUMULATION_LONG_READY",
+        score=8.0,
+        reasons=["ACCUMULATION_LONG_READY"],
+        meta={"tf": "5", "market": "linear", "btc_regime": "BTC_NEUTRAL", "executor_snapshot": make_snapshot()},
+    )
+
+    runner._process_paper_executor(signal, "linear", "PENDING")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert fake.entry_calls == 1
+    assert row["action"] == "ENTER_LONG"
+    assert diagnostics["testnet_order_attempted"] is True
+    assert diagnostics["testnet_order_status"] == "placed"
+    assert diagnostics["testnet_observation_entry_candidate"] is True
+    runner.signal_store.close()
+
+
+def test_testnet_observation_watch_persists_diagnostics_without_order(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(
+        kind="PRE_IMPULSE_ZONE",
+        score=8.0,
+        reasons=["PRE_IMPULSE_ZONE"],
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_NEUTRAL",
+            "executor_snapshot": make_snapshot(buy_flow=90.0, sell_flow=100.0, volume_impulse=1.4),
+        },
+    )
+
+    runner._process_paper_executor(signal, "linear", "PRE_IMPULSE")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert fake.entry_calls == 0
+    assert row["action"] == "WATCH"
+    assert row["state"] == "TRADE_WATCH"
+    assert row["updated_at"]
+    assert diagnostics["testnet_order_status"] == "not_attempted"
+    assert diagnostics["testnet_observation_entry_candidate"] is True
+    assert diagnostics["testnet_observation_entry_reason"] == "strong_non_confirmed_buy_signal"
+    assert diagnostics["original_signal_status"] == "PRE_IMPULSE"
+    assert diagnostics["original_signal_kind"] == "PRE_IMPULSE_ZONE"
+    assert diagnostics["original_signal_score"] == 8.0
+    runner.signal_store.close()
+
 def test_testnet_exit_uses_reduce_only_executor_path(tmp_path: Path) -> None:
     fake = _FakeTestnetOrderExecutor()
     runner = make_testnet_runner(tmp_path, fake)
