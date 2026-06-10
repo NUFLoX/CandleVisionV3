@@ -55,6 +55,9 @@ from .ws_clients import MarketStream
 class AccumulationRunner:
     VOLUME_IMPULSE_REPORT_CAP = 50.0
     ACTIVE_R_SUSPICIOUS_THRESHOLD = 25.0
+    TERMINAL_EXECUTOR_OUTCOME_STATES = {"EXITED", "CLOSED"}
+    TERMINAL_EXECUTOR_OUTCOME_ACTIONS = {"STALE_RESET", "PHANTOM_RESET"}
+    ACTIVE_EXECUTOR_OUTCOME_STATES = {ENTERED, PROTECT_BREAKEVEN, TRAILING_PROFIT}
 
     def __init__(self, settings: Settings, ui: ConsoleUI | None = None, version: str = "ACCUM V1.4.2 DIAG"):
         self.settings = settings
@@ -1215,6 +1218,37 @@ class AccumulationRunner:
         values["diagnostics_json"] = diagnostics_json
         return values
 
+    @classmethod
+    def _is_terminal_executor_outcome(cls, row) -> bool:
+        if row is None:
+            return False
+        try:
+            state = str(row["state"] or "").strip().upper()
+        except (KeyError, IndexError):
+            state = ""
+        try:
+            action = str(row["action"] or "").strip().upper()
+        except (KeyError, IndexError):
+            action = ""
+        return state in cls.TERMINAL_EXECUTOR_OUTCOME_STATES or action in cls.TERMINAL_EXECUTOR_OUTCOME_ACTIONS
+
+    @staticmethod
+    def _executor_row_value(row, key: str):
+        if row is None:
+            return None
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return None
+
+    @classmethod
+    def _annotate_terminal_executor_attempt(cls, diagnostics: dict[str, object], previous_row) -> None:
+        previous_terminal = cls._is_terminal_executor_outcome(previous_row)
+        diagnostics["previous_terminal_outcome_reused"] = False
+        diagnostics["new_executor_attempt_after_terminal"] = bool(previous_terminal)
+        diagnostics["previous_terminal_state"] = cls._executor_row_value(previous_row, "state") if previous_terminal else None
+        diagnostics["previous_terminal_reason"] = cls._executor_row_value(previous_row, "reason") if previous_terminal else None
+        diagnostics["previous_terminal_updated_at"] = cls._executor_row_value(previous_row, "updated_at") if previous_terminal else None
 
     @staticmethod
     def _testnet_trade_key(signal_key: str) -> str:
@@ -1278,7 +1312,10 @@ class AccumulationRunner:
             diagnostics_json = self._parse_executor_diagnostics(diagnostics_json)
             diagnostics["diagnostics_json"] = diagnostics_json
         is_new_entry = position is not None and str(decision.action) in {ENTER_LONG, ENTER_SHORT}
-        self._preserve_executor_entry_diagnostics(diagnostics_json, previous_row, preserve_breakeven_time=not is_new_entry)
+        previous_terminal = self._is_terminal_executor_outcome(previous_row)
+        if not previous_terminal:
+            self._preserve_executor_entry_diagnostics(diagnostics_json, previous_row, preserve_breakeven_time=not is_new_entry)
+        self._annotate_terminal_executor_attempt(diagnostics_json, previous_row)
         if is_new_entry:
             diagnostics_json.pop("breakeven_time", None)
             diagnostics_json.update(
@@ -2017,13 +2054,15 @@ class AccumulationRunner:
         setup = self._paper_executor_setup(signal)
         self._observe_hybrid_entry_shadow(signal_key, setup, snapshot)
 
+        existing_is_terminal = self._is_terminal_executor_outcome(existing)
+
         if weak:
-            current_state = str(existing["state"]) if existing is not None else "TRADE_WATCH"
+            current_state = "TRADE_WATCH" if existing_is_terminal or existing is None else str(existing["state"])
             decision = TradeDecision(WATCH, "paper_executor_missing_snapshot_data", current_state, None)
             self._store_paper_executor_decision(signal_key, signal, decision, None, snapshot, setup=setup)
             return
 
-        if existing is not None and str(existing["state"]) in {ENTERED, PROTECT_BREAKEVEN, TRAILING_PROFIT}:
+        if existing is not None and not existing_is_terminal and str(existing["state"]) in self.ACTIVE_EXECUTOR_OUTCOME_STATES:
             position = self._position_from_executor_row(signal, existing)
             decision = self.trade_executor.update_position(position, snapshot)
             self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot, setup=setup)
