@@ -1631,3 +1631,213 @@ def test_closed_executor_outcome_rows_are_not_active_price_validated(tmp_path: P
     assert row["max_gain_r"] == 52.99
     assert "active_price_rejected" not in diagnostics
     runner.signal_store.close()
+
+
+def _force_executor_outcome_updated_at(runner: AccumulationRunner, signal_key_value: str, updated_at: str) -> None:
+    runner.signal_store.conn.execute(
+        "UPDATE executor_outcomes SET created_at = ?, updated_at = ? WHERE signal_key = ?",
+        (updated_at, updated_at, signal_key_value),
+    )
+    runner.signal_store.conn.commit()
+
+
+def test_fresh_signal_after_old_closed_outcome_creates_new_executor_attempt(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    old_updated_at = "2026-06-01T00:00:00+00:00"
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol=signal.symbol,
+        side=signal.side,
+        state="CLOSED",
+        action="WATCH",
+        reason="old_closed_outcome",
+        entry_price=signal.entry,
+        current_sl=signal.stop_loss,
+        diagnostics_json={"executor_entry_time": "2026-05-31T23:59:00+00:00"},
+    )
+    _force_executor_outcome_updated_at(runner, key, old_updated_at)
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert fake.entry_calls == 1
+    assert row["action"] == "ENTER_LONG"
+    assert row["state"] == "ENTERED"
+    assert row["reason"] == "entry_allowed_long"
+    assert row["updated_at"] != old_updated_at
+    assert diagnostics["previous_terminal_outcome_reused"] is False
+    assert diagnostics["new_executor_attempt_after_terminal"] is True
+    assert diagnostics["previous_terminal_state"] == "CLOSED"
+    assert diagnostics["previous_terminal_reason"] == "old_closed_outcome"
+    assert diagnostics["previous_terminal_updated_at"] == old_updated_at
+    runner.signal_store.close()
+
+
+def test_fresh_signal_after_old_exited_outcome_creates_new_executor_attempt(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+    old_updated_at = "2026-06-02T00:00:00+00:00"
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol=signal.symbol,
+        side=signal.side,
+        state="EXITED",
+        action="EXIT",
+        reason="take_profit",
+        entry_price=signal.entry,
+        current_sl=signal.stop_loss,
+        exit_price=signal.take_profit_1,
+        exit_reason="take_profit",
+        diagnostics_json={},
+    )
+    _force_executor_outcome_updated_at(runner, key, old_updated_at)
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row["action"] == "ENTER_LONG"
+    assert row["state"] == "ENTERED"
+    assert row["updated_at"] != old_updated_at
+    assert diagnostics["previous_terminal_outcome_reused"] is False
+    assert diagnostics["new_executor_attempt_after_terminal"] is True
+    assert diagnostics["previous_terminal_state"] == "EXITED"
+    assert diagnostics["previous_terminal_reason"] == "take_profit"
+    assert diagnostics["previous_terminal_updated_at"] == old_updated_at
+    runner.signal_store.close()
+
+
+def test_active_entered_executor_outcome_is_not_duplicated(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    key = signal_key(signal)
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+    first_id = runner.signal_store.get_executor_outcome(key)["id"]
+    signal.meta["executor_snapshot"] = make_snapshot(price=100.4, buy_flow=150.0, sell_flow=90.0, volume_impulse=1.5)
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row_count(runner.signal_store) == 1
+    assert row["id"] == first_id
+    assert row["state"] in {"ENTERED", "PROTECT_BREAKEVEN", "TRAILING_PROFIT"}
+    assert diagnostics["new_executor_attempt_after_terminal"] is False
+    runner.signal_store.close()
+
+
+def test_terminal_outcome_blocked_entry_becomes_trade_watch_with_fresh_timestamp(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    signal = make_signal(
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_DUMP_RISK",
+            "executor_snapshot": make_snapshot(buy_flow=80.0, sell_flow=120.0, volume_impulse=0.6),
+        }
+    )
+    key = signal_key(signal)
+    old_updated_at = "2026-06-03T00:00:00+00:00"
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol=signal.symbol,
+        side=signal.side,
+        state="TRADE_WATCH",
+        action="PHANTOM_RESET",
+        reason="old_phantom_reset",
+        entry_price=signal.entry,
+        current_sl=signal.stop_loss,
+        diagnostics_json={},
+    )
+    _force_executor_outcome_updated_at(runner, key, old_updated_at)
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert fake.entry_calls == 0
+    assert row["action"] == "WATCH"
+    assert row["state"] == "TRADE_WATCH"
+    assert row["updated_at"] != old_updated_at
+    assert diagnostics["previous_terminal_outcome_reused"] is False
+    assert diagnostics["new_executor_attempt_after_terminal"] is True
+    assert diagnostics["previous_terminal_state"] == "TRADE_WATCH"
+    assert diagnostics["previous_terminal_reason"] == "old_phantom_reset"
+    assert diagnostics["previous_terminal_updated_at"] == old_updated_at
+    runner.signal_store.close()
+
+
+def test_trade_watch_executor_outcome_updates_normally_without_terminal_reactivation(tmp_path: Path) -> None:
+    runner = make_runner(tmp_path)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot(buy_flow=70.0, volume_impulse=0.5)})
+    key = signal_key(signal)
+    old_updated_at = "2026-06-04T00:00:00+00:00"
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol=signal.symbol,
+        side=signal.side,
+        state="TRADE_WATCH",
+        action="WATCH",
+        reason="old_watch",
+        entry_price=signal.entry,
+        current_sl=signal.stop_loss,
+        diagnostics_json={"watch_marker": "preserve"},
+    )
+    _force_executor_outcome_updated_at(runner, key, old_updated_at)
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(key)
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row_count(runner.signal_store) == 1
+    assert row["state"] == "TRADE_WATCH"
+    assert row["action"] == "WATCH"
+    assert row["updated_at"] != old_updated_at
+    assert diagnostics["previous_terminal_outcome_reused"] is False
+    assert diagnostics["new_executor_attempt_after_terminal"] is False
+    runner.signal_store.close()
+
+
+def test_testnet_order_path_is_called_only_for_enter_long_after_terminal_outcome(tmp_path: Path) -> None:
+    fake = _FakeTestnetOrderExecutor()
+    runner = make_testnet_runner(tmp_path, fake)
+    blocked_signal = make_signal(
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_DUMP_RISK",
+            "executor_snapshot": make_snapshot(buy_flow=80.0, sell_flow=120.0, volume_impulse=0.6),
+        }
+    )
+    key = signal_key(blocked_signal)
+    runner.signal_store.upsert_executor_decision(
+        signal_key=key,
+        symbol=blocked_signal.symbol,
+        side=blocked_signal.side,
+        state="EXITED",
+        action="STALE_RESET",
+        reason="old_stale_reset",
+        entry_price=blocked_signal.entry,
+        current_sl=blocked_signal.stop_loss,
+        diagnostics_json={},
+    )
+
+    runner._process_paper_executor(blocked_signal, "linear", "CONFIRMED_LONG")
+
+    blocked_row = runner.signal_store.get_executor_outcome(key)
+    assert blocked_row["action"] == "WATCH"
+    assert fake.entry_calls == 0
+
+    allowed_signal = make_signal(symbol="BTCUSDT", meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+    runner._process_paper_executor(allowed_signal, "linear", "CONFIRMED_LONG")
+
+    allowed_row = runner.signal_store.get_executor_outcome(signal_key(allowed_signal))
+    assert allowed_row["action"] == "ENTER_LONG"
+    assert fake.entry_calls == 1
+    runner.signal_store.close()
