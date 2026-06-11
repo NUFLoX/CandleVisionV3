@@ -58,6 +58,22 @@ class AccumulationRunner:
     TERMINAL_EXECUTOR_OUTCOME_STATES = {"EXITED", "CLOSED"}
     TERMINAL_EXECUTOR_OUTCOME_ACTIONS = {"STALE_RESET", "PHANTOM_RESET"}
     ACTIVE_EXECUTOR_OUTCOME_STATES = {ENTERED, PROTECT_BREAKEVEN, TRAILING_PROFIT}
+    TESTNET_OBSERVATION_ENTRY_KINDS = {
+        "PRE_IMPULSE_ZONE",
+        "BREAKOUT_PRESSURE",
+        "ACCUMULATION_LONG_READY",
+        "ABSORPTION_ZONE",
+        "BASE_BUILDUP_LONG",
+    }
+    TESTNET_OBSERVATION_ENTRY_STATUSES = {
+        "PRE_IMPULSE",
+        "BREAKOUT_PRESSURE",
+        "PENDING",
+        "ACCUMULATION",
+        "WATCHING",
+        "CONFIRMED_LONG",
+    }
+    TESTNET_OBSERVATION_BLOCKED_BTC_REGIMES = {"BTC_BEARISH", "BTC_DUMP_RISK"}
 
     def __init__(self, settings: Settings, ui: ConsoleUI | None = None, version: str = "ACCUM V1.4.2 DIAG"):
         self.settings = settings
@@ -569,6 +585,52 @@ class AccumulationRunner:
                     "promotion_reasons": signal.meta.get("promotion_reasons", []),
                 },
             )
+
+    def _testnet_observation_entry_context(self, signal, confirmed_status: str | None) -> dict[str, object]:
+        status = str(confirmed_status or "").strip().upper()
+        kind = str(getattr(signal, "kind", "") or "").strip().upper()
+        side = str(getattr(signal, "side", "") or "").strip()
+        score = self._optional_float(getattr(signal, "score", None)) or 0.0
+        meta = getattr(signal, "meta", {}) if isinstance(getattr(signal, "meta", {}), dict) else {}
+        btc_regime = str(meta.get("btc_regime") or "BTC_NEUTRAL").strip().upper()
+        context: dict[str, object] = {
+            "testnet_observation_entry_candidate": False,
+            "testnet_observation_entry_reason": "not_testnet_observation_entry",
+            "original_signal_status": status or None,
+            "original_signal_kind": kind or None,
+            "original_signal_score": score,
+        }
+        if self._normalize_trade_executor_mode(getattr(self, "trade_executor_mode", "paper")) != "testnet":
+            context["testnet_observation_entry_reason"] = "not_testnet_mode"
+            return context
+        if status in {"CONFIRMED_LONG", "CONFIRMED_SHORT"}:
+            context["testnet_observation_entry_reason"] = "confirmed_signal_uses_standard_executor_path"
+            return context
+        if side != "Buy":
+            context["testnet_observation_entry_reason"] = "not_buy_signal"
+            return context
+        if kind not in self.TESTNET_OBSERVATION_ENTRY_KINDS:
+            context["testnet_observation_entry_reason"] = "signal_kind_not_allowed"
+            return context
+        if status not in self.TESTNET_OBSERVATION_ENTRY_STATUSES:
+            context["testnet_observation_entry_reason"] = "signal_status_not_allowed"
+            return context
+        required_score = 9.0 if kind == "ABSORPTION_ZONE" else 8.0
+        if score < required_score:
+            context["testnet_observation_entry_reason"] = "score_below_testnet_observation_threshold"
+            return context
+        if btc_regime in self.TESTNET_OBSERVATION_BLOCKED_BTC_REGIMES:
+            context["testnet_observation_entry_reason"] = "btc_regime_blocks_testnet_observation_entry"
+            return context
+        context["testnet_observation_entry_candidate"] = True
+        context["testnet_observation_entry_reason"] = "strong_non_confirmed_buy_signal"
+        return context
+
+    def _should_process_paper_executor_status(self, signal, confirmed_status: str | None) -> tuple[bool, dict[str, object]]:
+        if confirmed_status in {"CONFIRMED_LONG", "CONFIRMED_SHORT"}:
+            return True, self._testnet_observation_entry_context(signal, confirmed_status)
+        context = self._testnet_observation_entry_context(signal, confirmed_status)
+        return bool(context.get("testnet_observation_entry_candidate")), context
 
     def _paper_executor_setup(self, signal) -> TradeSetup:
         return TradeSetup(
@@ -1304,13 +1366,26 @@ class AccumulationRunner:
         )
         return result
 
-    def _store_paper_executor_decision(self, signal_key: str, signal, decision, position=None, snapshot=None, setup=None, testnet_result=None):
+    def _store_paper_executor_decision(
+        self,
+        signal_key: str,
+        signal,
+        decision,
+        position=None,
+        snapshot=None,
+        setup=None,
+        testnet_result=None,
+        observation_context=None,
+    ):
         previous_row = self.signal_store.get_executor_outcome(signal_key)
         diagnostics = self._paper_executor_diagnostics(signal, snapshot)
         diagnostics_json = diagnostics.get("diagnostics_json")
         if not isinstance(diagnostics_json, dict):
             diagnostics_json = self._parse_executor_diagnostics(diagnostics_json)
             diagnostics["diagnostics_json"] = diagnostics_json
+        if observation_context is None:
+            observation_context = self._testnet_observation_entry_context(signal, None)
+        diagnostics_json.update(dict(observation_context))
         is_new_entry = position is not None and str(decision.action) in {ENTER_LONG, ENTER_SHORT}
         previous_terminal = self._is_terminal_executor_outcome(previous_row)
         if not previous_terminal:
@@ -2045,7 +2120,8 @@ class AccumulationRunner:
     def _process_paper_executor(self, signal, market: str, confirmed_status: str | None, state=None) -> None:
         if not self.trade_executor_enabled or self.trade_executor is None:
             return
-        if confirmed_status not in {"CONFIRMED_LONG", "CONFIRMED_SHORT"}:
+        should_process, observation_context = self._should_process_paper_executor_status(signal, confirmed_status)
+        if not should_process:
             return
 
         signal_key = self._signal_key(signal, market)
@@ -2059,13 +2135,13 @@ class AccumulationRunner:
         if weak:
             current_state = "TRADE_WATCH" if existing_is_terminal or existing is None else str(existing["state"])
             decision = TradeDecision(WATCH, "paper_executor_missing_snapshot_data", current_state, None)
-            self._store_paper_executor_decision(signal_key, signal, decision, None, snapshot, setup=setup)
+            self._store_paper_executor_decision(signal_key, signal, decision, None, snapshot, setup=setup, observation_context=observation_context)
             return
 
         if existing is not None and not existing_is_terminal and str(existing["state"]) in self.ACTIVE_EXECUTOR_OUTCOME_STATES:
             position = self._position_from_executor_row(signal, existing)
             decision = self.trade_executor.update_position(position, snapshot)
-            self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot, setup=setup)
+            self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot, setup=setup, observation_context=observation_context)
             return
 
         entry_decision = self.trade_executor.evaluate_entry(setup, snapshot)
@@ -2075,22 +2151,36 @@ class AccumulationRunner:
                 if not testnet_result.get("ok"):
                     watch_decision = TradeDecision(WATCH, str(testnet_result.get("reason") or "entry_blocked_testnet"), "TRADE_WATCH", None)
                     self._store_paper_executor_decision(
-                        signal_key, signal, watch_decision, None, snapshot, setup=setup, testnet_result=testnet_result
+                        signal_key,
+                        signal,
+                        watch_decision,
+                        None,
+                        snapshot,
+                        setup=setup,
+                        testnet_result=testnet_result,
+                        observation_context=observation_context,
                     )
                     return
                 position = self.trade_executor.open_position(setup, snapshot)
                 entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
                 self._store_paper_executor_decision(
-                    signal_key, signal, entry_decision, position, snapshot, setup=setup, testnet_result=testnet_result
+                    signal_key,
+                    signal,
+                    entry_decision,
+                    position,
+                    snapshot,
+                    setup=setup,
+                    testnet_result=testnet_result,
+                    observation_context=observation_context,
                 )
                 return
             position = self.trade_executor.open_position(setup, snapshot)
             entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
-            self._store_paper_executor_decision(signal_key, signal, entry_decision, position, snapshot, setup=setup)
+            self._store_paper_executor_decision(signal_key, signal, entry_decision, position, snapshot, setup=setup, observation_context=observation_context)
             return
 
         watch_decision = TradeDecision(WATCH, entry_decision.reason, "TRADE_WATCH", None)
-        self._store_paper_executor_decision(signal_key, signal, watch_decision, None, snapshot, setup=setup)
+        self._store_paper_executor_decision(signal_key, signal, watch_decision, None, snapshot, setup=setup, observation_context=observation_context)
 
     async def _emit_signal(self, rest: BybitRestClient, signal, state=None) -> None:
         market = str(
