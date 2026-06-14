@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 
@@ -182,6 +183,73 @@ def signal_key(signal: Signal) -> str:
     return f"{signal.symbol}|linear|{signal.meta['tf']}|{signal.kind}|{signal.side}"
 
 
+def set_learning_gate_env(monkeypatch, **overrides) -> None:
+    values = {
+        "EXECUTOR_LEARNING_GATE": "true",
+        "EXECUTOR_LEARNING_LOOKBACK_HOURS": "72",
+        "EXECUTOR_LEARNING_MIN_SYMBOL_TRADES": "8",
+        "EXECUTOR_LEARNING_MIN_SETUP_TRADES": "5",
+        "EXECUTOR_LEARNING_MIN_PROFIT_FACTOR": "1.05",
+        "EXECUTOR_LEARNING_MIN_AVG_ADJUSTED_R": "0.005",
+        "EXECUTOR_LEARNING_COOLDOWN_MINUTES": "360",
+        "EXECUTOR_LEARNING_RECENT_LOSS_STREAK": "4",
+        "EXECUTOR_LEARNING_RECENT_CHURN_LOOKBACK_MINUTES": "120",
+        "EXECUTOR_LEARNING_RECENT_CHURN_MIN_EXITS": "3",
+        "EXECUTOR_TAKER_FEE_ONE_SIDE": "0.00055",
+        "EXECUTOR_SLIPPAGE_ONE_SIDE": "0.00020",
+    }
+    values.update({key: str(value) for key, value in overrides.items()})
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+
+def add_closed_executor_trade(
+    store: SignalStore,
+    idx: int,
+    *,
+    symbol: str = "ETHUSDT",
+    signal_kind: str = "CONFIRMED_LONG",
+    r_result: float = 0.05,
+    entry_price: float = 100.0,
+    initial_sl: float = 99.0,
+    exit_reason: str = "exit_timeout",
+    minutes_ago: int = 60,
+) -> None:
+    exit_time = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    entry_time = exit_time - timedelta(minutes=30)
+    risk = abs(entry_price - initial_sl)
+    exit_price = entry_price + (risk * r_result)
+    store.upsert_executor_trade(
+        {
+            "trade_key": f"{symbol}|{signal_kind}|{idx}",
+            "signal_key": f"{symbol}|linear|5|{signal_kind}|Buy|{idx}",
+            "symbol": symbol,
+            "timeframe": "5",
+            "side": "Buy",
+            "state": "EXITED",
+            "entry_action": "ENTER_LONG",
+            "exit_action": "EXIT",
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "initial_sl": initial_sl,
+            "final_sl": initial_sl,
+            "current_sl": initial_sl,
+            "entry_time": entry_time.isoformat(),
+            "exit_time": exit_time.isoformat(),
+            "exit_reason": exit_reason,
+            "r_result": r_result,
+            "max_gain_r": max(r_result, 0.0),
+            "max_drawdown_r": abs(min(r_result, 0.0)),
+            "bars_in_trade": 6,
+            "duration_minutes": 30.0,
+            "moved_to_breakeven": False,
+            "diagnostics_json": {"signal_kind": signal_kind},
+            "created_at": entry_time.isoformat(),
+            "updated_at": exit_time.isoformat(),
+        }
+    )
+
+
 def test_run_trade_executor_disabled_creates_no_executor_rows(tmp_path: Path) -> None:
     runner = make_runner(tmp_path, enabled=False)
     signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
@@ -226,6 +294,156 @@ def test_valid_long_snapshot_enters_paper_state(tmp_path: Path) -> None:
     assert diagnostics["executor_side"] == "Buy"
     assert diagnostics["executor_signal_key"] == key
     assert diagnostics["executor_timeframe"] == "5"
+    runner.signal_store.close()
+
+
+def test_learning_gate_blocks_poor_symbol_adjusted_performance(tmp_path: Path, monkeypatch) -> None:
+    set_learning_gate_env(monkeypatch)
+    runner = make_runner(tmp_path)
+    for idx in range(8):
+        add_closed_executor_trade(runner.signal_store, idx, r_result=0.05, minutes_ago=180 + idx)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    assert row["action"] == "WATCH"
+    assert row["reason"] == "entry_blocked_learning_symbol_underperformance"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["learning_gate_enabled"] is True
+    assert diagnostics["entry_blocked_by_learning"] is True
+    assert diagnostics["learning_scope"] == "symbol"
+    assert diagnostics["learning_trade_count"] == 8
+    assert diagnostics["learning_avg_adjusted_r"] < 0.005
+    assert math.isclose(diagnostics["estimated_roundtrip_cost_pct"], 0.0015)
+    assert math.isclose(diagnostics["estimated_fee_cost_r"], 0.15)
+    runner.signal_store.close()
+
+
+def test_learning_gate_allows_good_symbol_adjusted_performance(tmp_path: Path, monkeypatch) -> None:
+    set_learning_gate_env(monkeypatch)
+    runner = make_runner(tmp_path)
+    for idx in range(8):
+        add_closed_executor_trade(runner.signal_store, idx, r_result=0.40, minutes_ago=180 + idx)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    assert row["action"] == "ENTER_LONG"
+    assert row["reason"] == "entry_allowed_long"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["entry_blocked_by_learning"] is False
+    assert diagnostics["learning_trade_count"] == 8
+    assert diagnostics["learning_avg_adjusted_r"] > 0.005
+    assert diagnostics["learning_profit_factor"] >= 1.05
+    runner.signal_store.close()
+
+
+def test_learning_gate_insufficient_symbol_trade_count_does_not_block(tmp_path: Path, monkeypatch) -> None:
+    set_learning_gate_env(
+        monkeypatch,
+        EXECUTOR_LEARNING_MIN_SETUP_TRADES=99,
+        EXECUTOR_LEARNING_RECENT_LOSS_STREAK=99,
+        EXECUTOR_LEARNING_RECENT_CHURN_MIN_EXITS=99,
+    )
+    runner = make_runner(tmp_path)
+    for idx in range(7):
+        add_closed_executor_trade(runner.signal_store, idx, r_result=0.05, minutes_ago=180 + idx)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    assert row["action"] == "ENTER_LONG"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["entry_blocked_by_learning"] is False
+    assert diagnostics["learning_trade_count"] == 7
+    runner.signal_store.close()
+
+
+def test_learning_gate_blocks_poor_symbol_setup_adjusted_performance(tmp_path: Path, monkeypatch) -> None:
+    set_learning_gate_env(monkeypatch, EXECUTOR_LEARNING_MIN_SYMBOL_TRADES=99)
+    runner = make_runner(tmp_path)
+    for idx in range(5):
+        add_closed_executor_trade(runner.signal_store, idx, signal_kind="CONFIRMED_LONG", r_result=0.05, minutes_ago=180 + idx)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    assert row["action"] == "WATCH"
+    assert row["reason"] == "entry_blocked_learning_setup_underperformance"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["learning_scope"] == "setup"
+    assert diagnostics["learning_signal_kind"] == "CONFIRMED_LONG"
+    assert diagnostics["learning_trade_count"] == 5
+    runner.signal_store.close()
+
+
+def test_learning_gate_blocks_recent_churn(tmp_path: Path, monkeypatch) -> None:
+    set_learning_gate_env(monkeypatch, EXECUTOR_LEARNING_MIN_SYMBOL_TRADES=99, EXECUTOR_LEARNING_MIN_SETUP_TRADES=99)
+    runner = make_runner(tmp_path)
+    for idx, reason in enumerate(
+        ["exit_sell_flow_dominance", "exit_below_ema20_with_selling", "exit_stop_loss_hit"]
+    ):
+        add_closed_executor_trade(runner.signal_store, idx, r_result=0.40, exit_reason=reason, minutes_ago=20 + idx)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    assert row["action"] == "WATCH"
+    assert row["reason"] == "entry_blocked_learning_recent_churn"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["learning_scope"] == "recent_churn"
+    assert diagnostics["learning_recent_churn_count"] == 3
+    runner.signal_store.close()
+
+
+def test_learning_gate_blocks_recent_loss_streak(tmp_path: Path, monkeypatch) -> None:
+    set_learning_gate_env(
+        monkeypatch,
+        EXECUTOR_LEARNING_MIN_SYMBOL_TRADES=99,
+        EXECUTOR_LEARNING_MIN_SETUP_TRADES=99,
+        EXECUTOR_LEARNING_RECENT_CHURN_MIN_EXITS=99,
+    )
+    runner = make_runner(tmp_path)
+    for idx in range(4):
+        add_closed_executor_trade(runner.signal_store, idx, r_result=0.05, exit_reason="exit_timeout", minutes_ago=20 + idx)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    assert row["action"] == "WATCH"
+    assert row["reason"] == "entry_blocked_learning_loss_streak"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["learning_scope"] == "loss_streak"
+    assert diagnostics["learning_recent_loss_streak"] == 4
+    runner.signal_store.close()
+
+
+def test_learning_gate_disabled_restores_entry_behavior(tmp_path: Path, monkeypatch) -> None:
+    set_learning_gate_env(monkeypatch, EXECUTOR_LEARNING_GATE="false")
+    runner = make_runner(tmp_path)
+    for idx in range(8):
+        add_closed_executor_trade(runner.signal_store, idx, r_result=0.05, minutes_ago=180 + idx)
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    assert row is not None
+    assert row["action"] == "ENTER_LONG"
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert "learning_gate_enabled" not in diagnostics
     runner.signal_store.close()
 
 

@@ -30,6 +30,7 @@ from .executor_exit_shadow import (
     evaluate_exit_shadow_policy,
     utc_now_iso,
 )
+from .executor_learning_gate import ExecutorLearningGate, ExecutorLearningGateConfig
 from .telegram_notify import TelegramNotifier
 from .trade_learning import TradeLearningEngine
 from .trade_executor import (
@@ -117,6 +118,7 @@ class AccumulationRunner:
         )
         self.executor_exit_shadow_enabled = os.getenv("EXECUTOR_EXIT_SHADOW_ENABLED", "false").strip().lower() == "true"
         self.executor_exit_shadow_policy = os.getenv("EXECUTOR_EXIT_SHADOW_POLICY", DEFAULT_EXIT_SHADOW_POLICY).strip() or DEFAULT_EXIT_SHADOW_POLICY
+        self.executor_learning_gate = ExecutorLearningGate(ExecutorLearningGateConfig.from_env())
         self.trade_learning = TradeLearningEngine(self.signal_store, logger=self.logger)
         self.dashboard = DashboardIngestClient()
         self.promoter = ConfirmedPromoter()
@@ -177,6 +179,30 @@ class AccumulationRunner:
             management_policy=self._resolve_executor_management_policy(),
             protect_after_1r=self._env_bool("EXECUTOR_PROTECT_AFTER_1R", False),
             min_protected_r_after_1r=self._env_float("EXECUTOR_MIN_PROTECTED_R_AFTER_1R", 0.25),
+        )
+
+    def _executor_learning_gate(self) -> ExecutorLearningGate:
+        gate = getattr(self, "executor_learning_gate", None)
+        if gate is None:
+            gate = ExecutorLearningGate(ExecutorLearningGateConfig.from_env())
+            self.executor_learning_gate = gate
+        return gate
+
+    def _evaluate_executor_learning_gate(self, setup: TradeSetup) -> tuple[TradeDecision | None, dict[str, object]]:
+        gate = self._executor_learning_gate()
+        if not gate.config.enabled:
+            return None, {}
+        try:
+            trades = self.signal_store.list_recent_closed_executor_trades(gate.config.lookback_hours)
+            learning_decision = gate.evaluate(setup, trades)
+        except Exception:
+            self.logger.exception("Executor learning gate failed for %s", setup.symbol)
+            return None, {}
+        if not learning_decision.blocked:
+            return None, learning_decision.diagnostics
+        return (
+            TradeDecision(WATCH, str(learning_decision.reason), "TRADE_WATCH", None),
+            learning_decision.diagnostics,
         )
 
     def _filter_symbols(self, symbols: list[ScanTarget]) -> list[ScanTarget]:
@@ -2146,6 +2172,20 @@ class AccumulationRunner:
 
         entry_decision = self.trade_executor.evaluate_entry(setup, snapshot)
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
+            learning_watch_decision, learning_context = self._evaluate_executor_learning_gate(setup)
+            entry_observation_context = dict(observation_context or {})
+            entry_observation_context.update(learning_context)
+            if learning_watch_decision is not None:
+                self._store_paper_executor_decision(
+                    signal_key,
+                    signal,
+                    learning_watch_decision,
+                    None,
+                    snapshot,
+                    setup=setup,
+                    observation_context=entry_observation_context,
+                )
+                return
             if self.trade_executor_mode == "testnet":
                 testnet_result = self._execute_testnet_entry(signal_key, signal, snapshot)
                 if not testnet_result.get("ok"):
@@ -2158,7 +2198,7 @@ class AccumulationRunner:
                         snapshot,
                         setup=setup,
                         testnet_result=testnet_result,
-                        observation_context=observation_context,
+                        observation_context=entry_observation_context,
                     )
                     return
                 position = self.trade_executor.open_position(setup, snapshot)
@@ -2171,12 +2211,20 @@ class AccumulationRunner:
                     snapshot,
                     setup=setup,
                     testnet_result=testnet_result,
-                    observation_context=observation_context,
+                    observation_context=entry_observation_context,
                 )
                 return
             position = self.trade_executor.open_position(setup, snapshot)
             entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
-            self._store_paper_executor_decision(signal_key, signal, entry_decision, position, snapshot, setup=setup, observation_context=observation_context)
+            self._store_paper_executor_decision(
+                signal_key,
+                signal,
+                entry_decision,
+                position,
+                snapshot,
+                setup=setup,
+                observation_context=entry_observation_context,
+            )
             return
 
         watch_decision = TradeDecision(WATCH, entry_decision.reason, "TRADE_WATCH", None)
