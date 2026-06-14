@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1035,6 +1035,25 @@ class SignalStore:
                 "SELECT * FROM executor_trades ORDER BY exit_time DESC, id DESC LIMIT ?",
                 (safe_limit,),
             ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_recent_closed_executor_trades(self, lookback_hours: float, limit: int = 5000) -> list[dict[str, Any]]:
+        self.ensure_executor_trade_schema()
+        safe_limit = max(1, int(limit or 5000))
+        safe_hours = max(float(lookback_hours or 0.0), 0.0)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=safe_hours)
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM executor_trades
+            WHERE UPPER(COALESCE(state, '')) = 'EXITED'
+              AND exit_time IS NOT NULL
+              AND exit_time >= ?
+            ORDER BY exit_time DESC, id DESC
+            LIMIT ?
+            """,
+            (cutoff.isoformat(), safe_limit),
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def ensure_trade_learning_schema(self) -> None:
