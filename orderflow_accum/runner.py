@@ -75,6 +75,12 @@ class AccumulationRunner:
         "CONFIRMED_LONG",
     }
     TESTNET_OBSERVATION_BLOCKED_BTC_REGIMES = {"BTC_BEARISH", "BTC_DUMP_RISK"}
+    MISSED_SIGNAL_MEMORY_KINDS = {"BREAKOUT_PRESSURE", "PRE_IMPULSE_ZONE", "ABSORPTION_ZONE"}
+    LATE_CHASE_EXHAUSTION_REASON = "entry_blocked_late_impulse_exhaustion"
+    LATE_CHASE_DISTANCE_REASON = "entry_blocked_late_chase_distance"
+    LATE_CHASE_MISSED_MOVE_REASON = "entry_blocked_late_chase_missed_move"
+    DISTRIBUTION_AFTER_IMPULSE_REASON = "entry_blocked_distribution_after_impulse"
+    DISTRIBUTION_RISK_AFTER_IMPULSE_REASON = "entry_blocked_distribution_risk_after_impulse"
 
     def __init__(self, settings: Settings, ui: ConsoleUI | None = None, version: str = "ACCUM V1.4.2 DIAG"):
         self.settings = settings
@@ -166,6 +172,16 @@ class AccumulationRunner:
         except ValueError:
             return default
 
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        value = os.getenv(name)
+        if value is None or not value.strip():
+            return default
+        try:
+            return int(float(value))
+        except ValueError:
+            return default
+
     def _resolve_executor_management_policy(self) -> str:
         configured_policy = getattr(self.settings, "executor_management_policy", None)
         if configured_policy is None or not str(configured_policy).strip():
@@ -204,6 +220,467 @@ class AccumulationRunner:
             TradeDecision(WATCH, str(learning_decision.reason), "TRADE_WATCH", None),
             learning_decision.diagnostics,
         )
+
+    def _signal_forward_tracking_enabled(self) -> bool:
+        return self._env_bool("SIGNAL_FORWARD_TRACKING_ENABLED", True)
+
+    def _signal_forward_lookback_hours(self) -> float:
+        return max(self._env_float("SIGNAL_FORWARD_TRACKING_HOURS", 72.0), 0.0)
+
+    def _signal_forward_targets_pct(self) -> list[float]:
+        raw = os.getenv("SIGNAL_FORWARD_TARGETS_PCT", "3,5,10,15")
+        targets: list[float] = []
+        for item in str(raw or "").split(","):
+            try:
+                value = float(item.strip())
+            except ValueError:
+                continue
+            if value > 0:
+                targets.append(value)
+        return targets or [3.0, 5.0, 10.0, 15.0]
+
+    def _early_breakout_entry_enabled(self) -> bool:
+        return self._env_bool("EXECUTOR_EARLY_BREAKOUT_ENTRY", True)
+
+    def _late_chase_gate_enabled(self) -> bool:
+        return self._env_bool("EXECUTOR_LATE_CHASE_GATE", True)
+
+    def _late_chase_lookback_hours(self) -> float:
+        minutes = max(self._env_float("EXECUTOR_LATE_CHASE_LOOKBACK_MINUTES", 240.0), 0.0)
+        return minutes / 60.0
+
+    @classmethod
+    def _is_missed_signal_memory_kind(cls, kind: object) -> bool:
+        return str(kind or "").strip().upper() in cls.MISSED_SIGNAL_MEMORY_KINDS
+
+    def _forward_signal_trackable(self, signal) -> bool:
+        if not self._signal_forward_tracking_enabled():
+            return False
+        if str(getattr(signal, "side", "") or "") != "Buy":
+            return False
+        score = self._optional_float(getattr(signal, "score", None)) or 0.0
+        if score < 8.0:
+            return False
+        return True
+
+    @staticmethod
+    def _first_present_mapping_value(mapping: dict[str, object], keys: tuple[str, ...]):
+        for key in keys:
+            if key in mapping and mapping.get(key) not in (None, ""):
+                return mapping.get(key)
+        return None
+
+    def _meta_float(self, meta: dict[str, object], snapshot: OrderflowSnapshot | None, keys: tuple[str, ...]) -> float | None:
+        override = meta.get("executor_snapshot")
+        if isinstance(override, dict):
+            parsed = self._optional_float(self._first_present_mapping_value(override, keys))
+            if parsed is not None:
+                return parsed
+        parsed = self._optional_float(self._first_present_mapping_value(meta, keys))
+        if parsed is not None:
+            return parsed
+        if snapshot is not None:
+            for key in keys:
+                parsed = self._optional_float(getattr(snapshot, key, None))
+                if parsed is not None:
+                    return parsed
+        return None
+
+    def _forward_signal_price(self, signal) -> float | None:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        return self._optional_float(
+            self._first_present_mapping_value(meta, ("original_signal_price", "signal_price", "scanner_entry"))
+        ) or self._optional_float(getattr(signal, "entry", None))
+
+    def _forward_range_high(self, signal, snapshot: OrderflowSnapshot | None) -> float | None:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        return self._meta_float(meta, snapshot, ("range_high", "corridor_high", "resistance", "resistance_1"))
+
+    def _forward_range_low(self, signal, snapshot: OrderflowSnapshot | None) -> float | None:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        return (
+            self._meta_float(meta, snapshot, ("range_low", "corridor_low", "support"))
+            or self._optional_float(getattr(signal, "stop_loss", None))
+        )
+
+    def _forward_invalidation_price(self, signal, snapshot: OrderflowSnapshot | None) -> float | None:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        return (
+            self._meta_float(meta, snapshot, ("invalidation_price", "invalid_price", "invalidation"))
+            or self._forward_range_low(signal, snapshot)
+            or self._optional_float(getattr(signal, "stop_loss", None))
+        )
+
+    def _record_signal_forward_outcome(
+        self,
+        signal_key: str,
+        signal,
+        *,
+        status: str | None,
+        snapshot: OrderflowSnapshot | None,
+        executor_block_reason: str | None,
+    ) -> dict[str, object] | None:
+        if not self._forward_signal_trackable(signal):
+            return None
+        current_price = self._optional_float(getattr(snapshot, "price", None)) if snapshot is not None else None
+        signal_price = self._forward_signal_price(signal)
+        if current_price is None or current_price <= 0 or signal_price is None or signal_price <= 0:
+            return None
+        try:
+            return self.signal_store.upsert_signal_forward_outcome(
+                signal_key=signal_key,
+                symbol=str(signal.symbol),
+                timeframe=str(getattr(signal, "meta", {}).get("tf") or "1"),
+                kind=str(getattr(signal, "kind", "") or ""),
+                status=status,
+                side=str(getattr(signal, "side", "") or ""),
+                signal_price=signal_price,
+                current_price=current_price,
+                range_high=self._forward_range_high(signal, snapshot),
+                range_low=self._forward_range_low(signal, snapshot),
+                invalidation_price=self._forward_invalidation_price(signal, snapshot),
+                executor_block_reason=executor_block_reason,
+            )
+        except Exception:
+            self.logger.exception("Signal forward outcome tracking failed for %s", signal_key)
+            return None
+
+    def _recent_forward_outcomes_for_setup(
+        self,
+        setup: TradeSetup,
+        *,
+        include_kind: bool = False,
+        lookback_hours: float | None = None,
+    ) -> list[dict[str, object]]:
+        if not self._signal_forward_tracking_enabled():
+            return []
+        try:
+            return self.signal_store.list_recent_signal_forward_outcomes(
+                symbol=setup.symbol,
+                kind=setup.signal_kind if include_kind else None,
+                timeframe=setup.timeframe,
+                lookback_hours=self._signal_forward_lookback_hours() if lookback_hours is None else lookback_hours,
+            )
+        except Exception:
+            self.logger.exception("Missed signal memory lookup failed for %s", setup.symbol)
+            return []
+
+    def _similar_forward_outcomes(self, setup: TradeSetup) -> list[dict[str, object]]:
+        rows = self._recent_forward_outcomes_for_setup(setup, include_kind=False)
+        setup_kind = str(setup.signal_kind or "").strip().upper()
+        similar: list[dict[str, object]] = []
+        for row in rows:
+            row_kind = str(row.get("kind") or "").strip().upper()
+            if row_kind == setup_kind or row_kind in self.MISSED_SIGNAL_MEMORY_KINDS:
+                similar.append(row)
+        return similar
+
+    def _missed_signal_memory_diagnostics(self, setup: TradeSetup) -> dict[str, object]:
+        if not self._signal_forward_tracking_enabled():
+            return {}
+        similar = self._similar_forward_outcomes(setup)
+        gains = [
+            float(gain)
+            for row in similar
+            if (gain := self._optional_float(row.get("max_forward_gain_pct"))) is not None
+        ]
+        positive_threshold = max(5.0, min(self._signal_forward_targets_pct() or [5.0]))
+        positive = [
+            row
+            for row in similar
+            if (self._optional_float(row.get("max_forward_gain_pct")) or 0.0) >= positive_threshold
+            and not bool(row.get("hit_invalidation"))
+        ]
+        reasons: dict[str, int] = {}
+        for row in similar:
+            reason = str(row.get("executor_block_reason") or "").strip()
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
+        common_reasons = [
+            reason for reason, _count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:3]
+        ]
+        return {
+            "missed_signal_memory_enabled": True,
+            "missed_signal_similar_count": len(similar),
+            "missed_signal_positive_count": len(positive),
+            "missed_signal_avg_forward_gain_pct": (sum(gains) / len(gains)) if gains else None,
+            "missed_signal_best_forward_gain_pct": max(gains) if gains else None,
+            "missed_signal_common_block_reasons": common_reasons,
+        }
+
+    def _best_forward_outcome_for_entry(self, signal_key: str, setup: TradeSetup) -> dict[str, object] | None:
+        exact = None
+        try:
+            row = self.signal_store.get_signal_forward_outcome(signal_key)
+            exact = dict(row) if row is not None else None
+        except Exception:
+            exact = None
+        if exact is not None:
+            return exact
+        rows = self._recent_forward_outcomes_for_setup(setup, include_kind=False, lookback_hours=self._late_chase_lookback_hours())
+        setup_kind = str(setup.signal_kind or "").strip().upper()
+        candidates = [
+            row
+            for row in rows
+            if str(row.get("kind") or "").strip().upper() == setup_kind
+            or str(row.get("kind") or "").strip().upper() in self.MISSED_SIGNAL_MEMORY_KINDS
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda row: self._optional_float(row.get("max_forward_gain_pct")) or 0.0)
+
+    @staticmethod
+    def _bps_above(price: float | None, reference: float | None) -> float | None:
+        if price is None or reference is None or reference <= 0:
+            return None
+        return ((price - reference) / reference) * 10000.0
+
+    def _open_executor_position(self, setup: TradeSetup, snapshot: OrderflowSnapshot, *, force: bool = False) -> TradePosition:
+        if not force:
+            return self.trade_executor.open_position(setup, snapshot)
+        entry_price = float(snapshot.price)
+        initial_sl = self.trade_executor._initial_stop_loss(setup, snapshot)
+        initial_risk = self.trade_executor._calculate_initial_risk(setup.side, entry_price, initial_sl)
+        return TradePosition(
+            symbol=setup.symbol,
+            side=setup.side,
+            state=ENTERED,
+            entry_price=entry_price,
+            stop_loss=initial_sl,
+            current_sl=initial_sl,
+            max_price=entry_price,
+            min_price=entry_price,
+            max_gain_r=0.0,
+            max_drawdown_r=0.0,
+            bars_in_trade=0,
+            exit_price=None,
+            exit_reason=None,
+            initial_risk=initial_risk,
+        )
+
+    def _evaluate_early_breakout_entry(
+        self,
+        signal_key: str,
+        signal,
+        setup: TradeSetup,
+        snapshot: OrderflowSnapshot,
+    ) -> tuple[TradeDecision | None, dict[str, object]]:
+        if not self._early_breakout_entry_enabled():
+            return None, {}
+        kind = str(setup.signal_kind or "").strip().upper()
+        if setup.side != "Buy" or kind not in self.MISSED_SIGNAL_MEMORY_KINDS:
+            return None, {}
+        range_high = self._forward_range_high(signal, snapshot)
+        max_retest_bps = max(self._env_float("EXECUTOR_EARLY_BREAKOUT_MAX_RETEST_BPS", 35.0), 0.0)
+        min_hold_bars = max(self._env_int("EXECUTOR_EARLY_BREAKOUT_MIN_HOLD_BARS", 1), 0)
+        require_volume_not_dead = self._env_bool("EXECUTOR_EARLY_BREAKOUT_REQUIRE_VOLUME_NOT_DEAD", True)
+        distance_from_range_high = self._bps_above(snapshot.price, range_high)
+        breakout = range_high is not None and snapshot.price > range_high
+        retest_hold = (
+            range_high is not None
+            and distance_from_range_high is not None
+            and abs(distance_from_range_high) <= max_retest_bps
+            and int(snapshot.bars_since_entry or 0) >= min_hold_bars
+            and snapshot.price >= range_high * (1.0 - max_retest_bps / 10000.0)
+        )
+        volume_not_dead = snapshot.volume_impulse >= 0.75
+        sell_pressure_absorbed = snapshot.buy_flow >= snapshot.sell_flow * 0.95 and snapshot.sell_flow <= snapshot.buy_flow * 1.15
+        spread_ok = snapshot.spread_bps <= float(getattr(self.trade_executor, "max_spread_bps", 15.0))
+        ask_wall_ok = snapshot.ask_wall_strength <= float(getattr(self.trade_executor, "ask_wall_entry_limit", 0.65))
+        btc_ok = setup.btc_regime not in self.TESTNET_OBSERVATION_BLOCKED_BTC_REGIMES
+        score_ok = setup.score >= float(getattr(self.trade_executor, "min_long_score", 8.0))
+        allowed = (
+            range_high is not None
+            and score_ok
+            and btc_ok
+            and spread_ok
+            and ask_wall_ok
+            and sell_pressure_absorbed
+            and (volume_not_dead or not require_volume_not_dead)
+            and (breakout or retest_hold)
+        )
+        diagnostics = {
+            "early_breakout_entry_enabled": True,
+            "early_breakout_entry_allowed": bool(allowed),
+            "early_breakout_signal_key": signal_key,
+            "early_breakout_signal_kind": kind,
+            "early_breakout_reason": "entry_allowed_early_breakout_retest" if allowed else None,
+            "original_range_high": range_high,
+            "early_breakout_break_above_range": bool(breakout),
+            "early_breakout_retest_hold": bool(retest_hold),
+            "early_breakout_distance_from_range_high_bps": distance_from_range_high,
+            "early_breakout_volume_not_dead": bool(volume_not_dead),
+            "early_breakout_sell_pressure_absorbed": bool(sell_pressure_absorbed),
+            "early_breakout_spread_ok": bool(spread_ok),
+            "early_breakout_btc_ok": bool(btc_ok),
+        }
+        if not allowed:
+            return None, diagnostics
+        return TradeDecision(ENTER_LONG, "entry_allowed_early_breakout_retest", ENTERED, None), diagnostics
+
+    def _meta_bool(self, meta: dict[str, object], keys: tuple[str, ...]) -> bool:
+        override = meta.get("executor_snapshot")
+        sources = [meta]
+        if isinstance(override, dict):
+            sources.insert(0, override)
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "on"}:
+                    return True
+        return False
+
+    def _distribution_after_impulse_diagnostics(
+        self,
+        signal,
+        snapshot: OrderflowSnapshot,
+        *,
+        original_range_high: float | None,
+        missed_forward_gain_pct: float | None,
+    ) -> dict[str, object]:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        previous_buy = self._meta_float(meta, snapshot, ("previous_buy_flow", "buy_flow_prev", "buy_flow_peak"))
+        previous_sell = self._meta_float(meta, snapshot, ("previous_sell_flow", "sell_flow_prev"))
+        buy_flow_decelerating = self._meta_bool(meta, ("buy_flow_decelerating", "buy_flow_declining"))
+        if not buy_flow_decelerating and previous_buy is not None and previous_buy > 0:
+            buy_flow_decelerating = snapshot.buy_flow < previous_buy * 0.95
+        sell_flow_increasing = self._meta_bool(meta, ("sell_flow_increasing", "sell_flow_rising"))
+        if not sell_flow_increasing and previous_sell is not None and previous_sell > 0:
+            sell_flow_increasing = snapshot.sell_flow > previous_sell * 1.05
+        if not sell_flow_increasing:
+            sell_flow_increasing = snapshot.sell_flow >= snapshot.buy_flow * 0.9
+
+        high_volume_low_displacement = self._meta_bool(
+            meta,
+            ("high_volume_low_displacement_after_impulse", "high_volume_low_displacement"),
+        )
+        upper_wick_ratio = self._meta_float(meta, snapshot, ("upper_wick_ratio", "recent_upper_wick_ratio"))
+        upper_wick_ratio_high = self._meta_bool(meta, ("upper_wick_ratio_high",)) or (
+            upper_wick_ratio is not None and upper_wick_ratio >= 0.55
+        )
+        failed_hold = self._meta_bool(meta, ("failed_hold_above_range_high", "failed_breakout_hold"))
+        if not failed_hold and original_range_high is not None:
+            failed_hold = snapshot.price < original_range_high and (missed_forward_gain_pct or 0.0) >= 3.0
+        retests = self._meta_float(meta, snapshot, ("resistance_retests_after_impulse", "repeated_resistance_retests", "resistance_retests"))
+        repeated_retests = self._meta_bool(meta, ("repeated_resistance_retests",)) or (
+            retests is not None and retests >= 2
+        )
+        sell_flow_dominance = self._meta_bool(meta, ("sell_flow_dominance_after_breakout",)) or (
+            snapshot.sell_flow >= snapshot.buy_flow * 1.05
+        )
+        risk_votes = sum(
+            int(flag)
+            for flag in (
+                high_volume_low_displacement,
+                sell_flow_dominance,
+                upper_wick_ratio_high,
+                failed_hold,
+                repeated_retests and buy_flow_decelerating,
+            )
+        )
+        return {
+            "buy_flow_decelerating": bool(buy_flow_decelerating),
+            "sell_flow_increasing": bool(sell_flow_increasing),
+            "high_volume_low_displacement_after_impulse": bool(high_volume_low_displacement),
+            "upper_wick_ratio_high": bool(upper_wick_ratio_high),
+            "failed_hold_above_range_high": bool(failed_hold),
+            "repeated_resistance_retests_after_impulse": bool(repeated_retests),
+            "sell_flow_dominance_after_breakout": bool(sell_flow_dominance),
+            "distribution_risk_after_impulse_votes": risk_votes,
+        }
+
+    def _late_chase_context(
+        self,
+        signal_key: str,
+        signal,
+        setup: TradeSetup,
+        snapshot: OrderflowSnapshot,
+    ) -> tuple[dict[str, object], bool]:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        forward_row = self._best_forward_outcome_for_entry(signal_key, setup)
+        applicable = bool(forward_row) or self._is_missed_signal_memory_kind(setup.signal_kind) or any(
+            key in meta for key in ("original_signal_price", "signal_price", "range_high", "corridor_high")
+        )
+        if not applicable:
+            return {}, False
+        original_signal_price = (
+            self._optional_float(forward_row.get("signal_price")) if forward_row is not None else None
+        ) or self._forward_signal_price(signal)
+        original_range_high = (
+            self._optional_float(forward_row.get("range_high")) if forward_row is not None else None
+        ) or self._forward_range_high(signal, snapshot)
+        missed_forward_gain_pct = (
+            self._optional_float(forward_row.get("max_forward_gain_pct")) if forward_row is not None else None
+        )
+        distance_from_signal = self._bps_above(snapshot.price, original_signal_price)
+        distance_from_range_high = self._bps_above(snapshot.price, original_range_high)
+        diagnostics = {
+            "late_chase_gate_enabled": True,
+            "original_signal_price": original_signal_price,
+            "original_range_high": original_range_high,
+            "distance_from_signal_bps": distance_from_signal,
+            "distance_from_range_high_bps": distance_from_range_high,
+            "missed_forward_gain_pct": missed_forward_gain_pct,
+            "entry_blocked_late_chase": False,
+            "late_chase_reason": None,
+        }
+        diagnostics.update(
+            self._distribution_after_impulse_diagnostics(
+                signal,
+                snapshot,
+                original_range_high=original_range_high,
+                missed_forward_gain_pct=missed_forward_gain_pct,
+            )
+        )
+        return diagnostics, True
+
+    def _evaluate_late_chase_gate(
+        self,
+        signal_key: str,
+        signal,
+        setup: TradeSetup,
+        snapshot: OrderflowSnapshot,
+    ) -> tuple[TradeDecision | None, dict[str, object]]:
+        if not self._late_chase_gate_enabled() or setup.side != "Buy":
+            return None, {}
+        diagnostics, applicable = self._late_chase_context(signal_key, signal, setup, snapshot)
+        if not applicable:
+            return None, {}
+        max_signal_bps = max(self._env_float("EXECUTOR_MAX_ENTRY_DISTANCE_FROM_SIGNAL_BPS", 120.0), 0.0)
+        max_range_bps = max(self._env_float("EXECUTOR_MAX_ENTRY_DISTANCE_FROM_RANGE_HIGH_BPS", 60.0), 0.0)
+        max_missed_move = max(self._env_float("EXECUTOR_MAX_MISSED_MOVE_BEFORE_ENTRY_PCT", 5.0), 0.0)
+        distance_from_signal = self._optional_float(diagnostics.get("distance_from_signal_bps"))
+        distance_from_range = self._optional_float(diagnostics.get("distance_from_range_high_bps"))
+        missed_gain = self._optional_float(diagnostics.get("missed_forward_gain_pct"))
+
+        reason = None
+        if (
+            (distance_from_signal is not None and distance_from_signal > max_signal_bps)
+            or (distance_from_range is not None and distance_from_range > max_range_bps)
+        ):
+            reason = self.LATE_CHASE_DISTANCE_REASON
+        elif missed_gain is not None and missed_gain >= max_missed_move:
+            reason = self.LATE_CHASE_MISSED_MOVE_REASON
+        elif (
+            (missed_gain or 0.0) >= 3.0
+            and diagnostics.get("buy_flow_decelerating")
+            and diagnostics.get("sell_flow_increasing")
+        ):
+            reason = self.LATE_CHASE_EXHAUSTION_REASON
+        elif diagnostics.get("high_volume_low_displacement_after_impulse") and diagnostics.get("sell_flow_increasing"):
+            reason = self.DISTRIBUTION_AFTER_IMPULSE_REASON
+        elif int(diagnostics.get("distribution_risk_after_impulse_votes") or 0) >= 2:
+            reason = self.DISTRIBUTION_RISK_AFTER_IMPULSE_REASON
+
+        if reason is None:
+            return None, diagnostics
+        diagnostics["entry_blocked_late_chase"] = True
+        diagnostics["late_chase_reason"] = reason
+        return TradeDecision(WATCH, reason, "TRADE_WATCH", None), diagnostics
 
     def _filter_symbols(self, symbols: list[ScanTarget]) -> list[ScanTarget]:
         out: list[ScanTarget] = []
@@ -1503,6 +1980,17 @@ class AccumulationRunner:
             float(row["max_gain_r"] or 0.0),
             float(row["max_drawdown_r"] or 0.0),
         )
+        if str(row["action"]) == WATCH and snapshot is not None:
+            status = None
+            if isinstance(observation_context, dict):
+                status = observation_context.get("original_signal_status")
+            self._record_signal_forward_outcome(
+                signal_key,
+                signal,
+                status=str(status or ""),
+                snapshot=snapshot,
+                executor_block_reason=str(row["reason"] or ""),
+            )
         if str(row["action"]) == EXIT:
             mode = self._normalize_trade_executor_mode(getattr(self, "trade_executor_mode", "paper"))
             if mode == "testnet":
@@ -2147,13 +2635,35 @@ class AccumulationRunner:
         if not self.trade_executor_enabled or self.trade_executor is None:
             return
         should_process, observation_context = self._should_process_paper_executor_status(signal, confirmed_status)
-        if not should_process:
-            return
-
         signal_key = self._signal_key(signal, market)
         existing = self.signal_store.get_executor_outcome(signal_key)
         snapshot, weak = self._paper_executor_snapshot(signal, state)
         setup = self._paper_executor_setup(signal)
+        observation_context = dict(observation_context or {})
+        observation_context.update(self._missed_signal_memory_diagnostics(setup))
+        forced_early_entry = False
+        forced_early_decision = None
+        if not should_process and not weak:
+            forced_early_decision, early_context = self._evaluate_early_breakout_entry(
+                signal_key,
+                signal,
+                setup,
+                snapshot,
+            )
+            observation_context.update(early_context)
+            if forced_early_decision is not None:
+                should_process = True
+                forced_early_entry = True
+        if not should_process:
+            self._record_signal_forward_outcome(
+                signal_key,
+                signal,
+                status=confirmed_status,
+                snapshot=None if weak else snapshot,
+                executor_block_reason="executor_not_processed_signal_status",
+            )
+            return
+
         self._observe_hybrid_entry_shadow(signal_key, setup, snapshot)
 
         existing_is_terminal = self._is_terminal_executor_outcome(existing)
@@ -2170,8 +2680,32 @@ class AccumulationRunner:
             self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot, setup=setup, observation_context=observation_context)
             return
 
-        entry_decision = self.trade_executor.evaluate_entry(setup, snapshot)
+        entry_decision = forced_early_decision or self.trade_executor.evaluate_entry(setup, snapshot)
+        if entry_decision.action not in {ENTER_LONG, ENTER_SHORT}:
+            early_decision, early_context = self._evaluate_early_breakout_entry(signal_key, signal, setup, snapshot)
+            observation_context.update(early_context)
+            if early_decision is not None:
+                entry_decision = early_decision
+                forced_early_entry = True
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
+            late_chase_watch_decision, late_chase_context = self._evaluate_late_chase_gate(
+                signal_key,
+                signal,
+                setup,
+                snapshot,
+            )
+            observation_context.update(late_chase_context)
+            if late_chase_watch_decision is not None:
+                self._store_paper_executor_decision(
+                    signal_key,
+                    signal,
+                    late_chase_watch_decision,
+                    None,
+                    snapshot,
+                    setup=setup,
+                    observation_context=observation_context,
+                )
+                return
             learning_watch_decision, learning_context = self._evaluate_executor_learning_gate(setup)
             entry_observation_context = dict(observation_context or {})
             entry_observation_context.update(learning_context)
@@ -2201,7 +2735,7 @@ class AccumulationRunner:
                         observation_context=entry_observation_context,
                     )
                     return
-                position = self.trade_executor.open_position(setup, snapshot)
+                position = self._open_executor_position(setup, snapshot, force=forced_early_entry)
                 entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
                 self._store_paper_executor_decision(
                     signal_key,
@@ -2214,7 +2748,7 @@ class AccumulationRunner:
                     observation_context=entry_observation_context,
                 )
                 return
-            position = self.trade_executor.open_position(setup, snapshot)
+            position = self._open_executor_position(setup, snapshot, force=forced_early_entry)
             entry_decision = TradeDecision(entry_decision.action, entry_decision.reason, ENTERED, position)
             self._store_paper_executor_decision(
                 signal_key,

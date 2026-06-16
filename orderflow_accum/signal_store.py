@@ -324,12 +324,341 @@ class SignalStore:
         self.ensure_trade_diagnosis_schema()
         self.ensure_testnet_order_schema()
         self.ensure_hybrid_entry_shadow_schema()
+        self.ensure_signal_forward_outcome_schema()
 
         if user_version < self.SCHEMA_VERSION:
             cur.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
 
         self.conn.commit()
 
+
+    def ensure_signal_forward_outcome_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_forward_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_key TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                timeframe TEXT,
+                kind TEXT,
+                status TEXT,
+                side TEXT,
+                signal_price REAL,
+                range_high REAL,
+                range_low REAL,
+                invalidation_price REAL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                executor_block_reason TEXT,
+                max_forward_gain_pct REAL NOT NULL DEFAULT 0,
+                max_forward_drawdown_pct REAL NOT NULL DEFAULT 0,
+                max_forward_gain_r REAL,
+                hit_3pct INTEGER NOT NULL DEFAULT 0,
+                hit_5pct INTEGER NOT NULL DEFAULT 0,
+                hit_10pct INTEGER NOT NULL DEFAULT 0,
+                hit_15pct INTEGER NOT NULL DEFAULT 0,
+                hit_invalidation INTEGER NOT NULL DEFAULT 0,
+                time_to_3pct_minutes REAL,
+                time_to_5pct_minutes REAL,
+                time_to_10pct_minutes REAL,
+                time_to_15pct_minutes REAL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        for col, typ in (
+            ("timeframe", "TEXT"),
+            ("kind", "TEXT"),
+            ("status", "TEXT"),
+            ("side", "TEXT"),
+            ("signal_price", "REAL"),
+            ("range_high", "REAL"),
+            ("range_low", "REAL"),
+            ("invalidation_price", "REAL"),
+            ("last_seen", "TEXT"),
+            ("executor_block_reason", "TEXT"),
+            ("max_forward_gain_pct", "REAL NOT NULL DEFAULT 0"),
+            ("max_forward_drawdown_pct", "REAL NOT NULL DEFAULT 0"),
+            ("max_forward_gain_r", "REAL"),
+            ("hit_3pct", "INTEGER NOT NULL DEFAULT 0"),
+            ("hit_5pct", "INTEGER NOT NULL DEFAULT 0"),
+            ("hit_10pct", "INTEGER NOT NULL DEFAULT 0"),
+            ("hit_15pct", "INTEGER NOT NULL DEFAULT 0"),
+            ("hit_invalidation", "INTEGER NOT NULL DEFAULT 0"),
+            ("time_to_3pct_minutes", "REAL"),
+            ("time_to_5pct_minutes", "REAL"),
+            ("time_to_10pct_minutes", "REAL"),
+            ("time_to_15pct_minutes", "REAL"),
+            ("updated_at", "TEXT"),
+        ):
+            try:
+                cur.execute(f"ALTER TABLE signal_forward_outcomes ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_signal_forward_outcomes_symbol_kind
+            ON signal_forward_outcomes(symbol, kind, timeframe, updated_at)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_signal_forward_outcomes_updated_at
+            ON signal_forward_outcomes(updated_at)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_signal_forward_outcomes_gain
+            ON signal_forward_outcomes(symbol, max_forward_gain_pct)
+            """
+        )
+        self.conn.commit()
+
+    @staticmethod
+    def _parse_utc_time(value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _minutes_between(cls, start: Any, end: Any) -> float | None:
+        start_dt = cls._parse_utc_time(start)
+        end_dt = cls._parse_utc_time(end)
+        if start_dt is None or end_dt is None:
+            return None
+        return max((end_dt - start_dt).total_seconds() / 60.0, 0.0)
+
+    @staticmethod
+    def _forward_direction_pct(side: str, signal_price: float, current_price: float) -> float:
+        if side == "Sell":
+            return ((signal_price - current_price) / signal_price) * 100.0
+        return ((current_price - signal_price) / signal_price) * 100.0
+
+    @staticmethod
+    def _forward_invalidation_hit(side: str, current_price: float, invalidation_price: float | None) -> bool:
+        if invalidation_price is None:
+            return False
+        if side == "Sell":
+            return current_price >= invalidation_price
+        return current_price <= invalidation_price
+
+    @staticmethod
+    def _forward_gain_r(signal_price: float | None, invalidation_price: float | None, gain_pct: float) -> float | None:
+        if signal_price is None or signal_price <= 0 or invalidation_price is None:
+            return None
+        risk = abs(signal_price - invalidation_price)
+        if risk <= 0:
+            return None
+        return (signal_price * (gain_pct / 100.0)) / risk
+
+    def upsert_signal_forward_outcome(
+        self,
+        *,
+        signal_key: str,
+        symbol: str,
+        timeframe: str | None,
+        kind: str | None,
+        status: str | None,
+        side: str,
+        signal_price: float,
+        current_price: float,
+        range_high: float | None = None,
+        range_low: float | None = None,
+        invalidation_price: float | None = None,
+        executor_block_reason: str | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_signal_forward_outcome_schema()
+        if not signal_key or not symbol:
+            raise ValueError("signal forward outcome requires signal_key and symbol")
+        safe_signal_price = self._optional_float(signal_price)
+        safe_current_price = self._optional_float(current_price)
+        if safe_signal_price is None or safe_signal_price <= 0:
+            raise ValueError("signal forward outcome requires positive signal_price")
+        if safe_current_price is None or safe_current_price <= 0:
+            raise ValueError("signal forward outcome requires positive current_price")
+
+        now = _utc_now()
+        existing = self.get_signal_forward_outcome(signal_key)
+        created = str(existing["first_seen"]) if existing is not None else now
+        stored_signal_price = (
+            self._optional_float(existing["signal_price"])
+            if existing is not None and self._optional_float(existing["signal_price"]) is not None
+            else safe_signal_price
+        )
+        stored_range_high = (
+            self._optional_float(existing["range_high"])
+            if existing is not None and self._optional_float(existing["range_high"]) is not None
+            else self._optional_float(range_high)
+        )
+        stored_range_low = (
+            self._optional_float(existing["range_low"])
+            if existing is not None and self._optional_float(existing["range_low"]) is not None
+            else self._optional_float(range_low)
+        )
+        stored_invalidation = (
+            self._optional_float(existing["invalidation_price"])
+            if existing is not None and self._optional_float(existing["invalidation_price"]) is not None
+            else self._optional_float(invalidation_price)
+        )
+        normalized_side = str(side or "").strip() or "Buy"
+        direction_pct = self._forward_direction_pct(normalized_side, stored_signal_price, safe_current_price)
+        previous_gain = (
+            self._optional_float(existing["max_forward_gain_pct"]) if existing is not None else None
+        ) or 0.0
+        previous_drawdown = (
+            self._optional_float(existing["max_forward_drawdown_pct"]) if existing is not None else None
+        ) or 0.0
+        max_gain = max(previous_gain, direction_pct, 0.0)
+        max_drawdown = max(
+            previous_drawdown,
+            -direction_pct,
+            0.0,
+        )
+        gain_r = self._forward_gain_r(stored_signal_price, stored_invalidation, max_gain)
+        hit_invalidation = int(
+            bool(existing["hit_invalidation"]) if existing is not None else False
+        ) or int(self._forward_invalidation_hit(normalized_side, safe_current_price, stored_invalidation))
+
+        hit_fields: dict[str, int | float | None] = {}
+        for target in (3, 5, 10, 15):
+            hit_key = f"hit_{target}pct"
+            time_key = f"time_to_{target}pct_minutes"
+            previous_hit = int(existing[hit_key] or 0) if existing is not None else 0
+            previous_time = self._optional_float(existing[time_key]) if existing is not None else None
+            target_hit = previous_hit or int(max_gain >= float(target))
+            hit_fields[hit_key] = target_hit
+            hit_fields[time_key] = previous_time
+            if target_hit and previous_time is None:
+                hit_fields[time_key] = self._minutes_between(created, now)
+
+        stored_reason = executor_block_reason
+        if not stored_reason and existing is not None:
+            stored_reason = existing["executor_block_reason"]
+
+        self.conn.execute(
+            """
+            INSERT INTO signal_forward_outcomes (
+                signal_key, symbol, timeframe, kind, status, side, signal_price, range_high, range_low,
+                invalidation_price, first_seen, last_seen, executor_block_reason, max_forward_gain_pct,
+                max_forward_drawdown_pct, max_forward_gain_r, hit_3pct, hit_5pct, hit_10pct, hit_15pct,
+                hit_invalidation, time_to_3pct_minutes, time_to_5pct_minutes, time_to_10pct_minutes,
+                time_to_15pct_minutes, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_key) DO UPDATE SET
+                symbol=excluded.symbol,
+                timeframe=excluded.timeframe,
+                kind=excluded.kind,
+                status=excluded.status,
+                side=excluded.side,
+                signal_price=excluded.signal_price,
+                range_high=excluded.range_high,
+                range_low=excluded.range_low,
+                invalidation_price=excluded.invalidation_price,
+                last_seen=excluded.last_seen,
+                executor_block_reason=excluded.executor_block_reason,
+                max_forward_gain_pct=excluded.max_forward_gain_pct,
+                max_forward_drawdown_pct=excluded.max_forward_drawdown_pct,
+                max_forward_gain_r=excluded.max_forward_gain_r,
+                hit_3pct=excluded.hit_3pct,
+                hit_5pct=excluded.hit_5pct,
+                hit_10pct=excluded.hit_10pct,
+                hit_15pct=excluded.hit_15pct,
+                hit_invalidation=excluded.hit_invalidation,
+                time_to_3pct_minutes=excluded.time_to_3pct_minutes,
+                time_to_5pct_minutes=excluded.time_to_5pct_minutes,
+                time_to_10pct_minutes=excluded.time_to_10pct_minutes,
+                time_to_15pct_minutes=excluded.time_to_15pct_minutes,
+                updated_at=excluded.updated_at
+            """,
+            (
+                signal_key,
+                symbol,
+                self._optional_text(timeframe),
+                self._optional_text(kind),
+                self._optional_text(status),
+                normalized_side,
+                stored_signal_price,
+                stored_range_high,
+                stored_range_low,
+                stored_invalidation,
+                created,
+                now,
+                self._optional_text(stored_reason),
+                max_gain,
+                max_drawdown,
+                gain_r,
+                hit_fields["hit_3pct"],
+                hit_fields["hit_5pct"],
+                hit_fields["hit_10pct"],
+                hit_fields["hit_15pct"],
+                hit_invalidation,
+                hit_fields["time_to_3pct_minutes"],
+                hit_fields["time_to_5pct_minutes"],
+                hit_fields["time_to_10pct_minutes"],
+                hit_fields["time_to_15pct_minutes"],
+                now,
+            ),
+        )
+        self.conn.commit()
+        row = self.get_signal_forward_outcome(signal_key)
+        if row is None:
+            raise RuntimeError(f"signal forward outcome was not stored: {signal_key}")
+        return dict(row)
+
+    def get_signal_forward_outcome(self, signal_key: str) -> sqlite3.Row | None:
+        self.ensure_signal_forward_outcome_schema()
+        return self.conn.execute(
+            "SELECT * FROM signal_forward_outcomes WHERE signal_key = ?",
+            (signal_key,),
+        ).fetchone()
+
+    def list_recent_signal_forward_outcomes(
+        self,
+        *,
+        symbol: str,
+        kind: str | None = None,
+        timeframe: str | None = None,
+        lookback_hours: float = 72.0,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        self.ensure_signal_forward_outcome_schema()
+        safe_limit = max(1, int(limit or 1000))
+        safe_hours = max(float(lookback_hours or 0.0), 0.0)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=safe_hours)
+        clauses = ["symbol = ?", "updated_at >= ?"]
+        params: list[Any] = [symbol, cutoff.isoformat()]
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if timeframe:
+            clauses.append("timeframe = ?")
+            params.append(timeframe)
+        params.append(safe_limit)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM signal_forward_outcomes
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
     def ensure_hybrid_entry_shadow_schema(self) -> None:
