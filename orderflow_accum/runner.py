@@ -5,6 +5,7 @@ import fnmatch
 import json
 import logging
 import os
+import sqlite3
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -1149,6 +1150,85 @@ class AccumulationRunner:
             market_regime=str(signal.meta.get("market_regime") or signal.meta.get("btc_regime") or "BTC_NEUTRAL"),
         )
 
+
+    def _symbol_position_lock_enabled(self) -> bool:
+        return self._env_bool("EXECUTOR_SYMBOL_POSITION_LOCK", True)
+
+    def _executor_symbol_position_lock(
+        self,
+        signal_key: str,
+        setup: TradeSetup,
+    ) -> tuple[TradeDecision | None, dict[str, object]]:
+        """Block new executor entries when the same symbol already has an active position.
+
+        This protects paper/testnet/live execution from duplicate positions across timeframes
+        and from opposite Buy/Sell positions on the same symbol. It does not affect scanner
+        or coin-search logic.
+        """
+        diagnostics: dict[str, object] = {
+            "symbol_position_lock_enabled": self._symbol_position_lock_enabled(),
+            "symbol_position_lock_blocked": False,
+        }
+        if not self._symbol_position_lock_enabled():
+            return None, diagnostics
+
+        symbol = str(setup.symbol or "").strip()
+        if not symbol:
+            return None, diagnostics
+
+        db_path = getattr(getattr(self, "signal_store", None), "db_path", "data/signals.db")
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT signal_key, symbol, side, state, action, entry_price, updated_at
+                FROM executor_outcomes
+                WHERE symbol = ?
+                  AND COALESCE(signal_key, '') <> ?
+                  AND UPPER(COALESCE(state, '')) NOT IN ('EXITED', 'CLOSED')
+                  AND (
+                        UPPER(COALESCE(state, '')) IN ('ENTERED', 'PROTECT_BREAKEVEN', 'TRAILING_PROFIT')
+                        OR UPPER(COALESCE(action, '')) = 'HOLD'
+                  )
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (symbol, signal_key),
+            ).fetchone()
+        except Exception as exc:
+            diagnostics["symbol_position_lock_error"] = str(exc)
+            return None, diagnostics
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        if row is None:
+            return None, diagnostics
+
+        existing_side = str(row["side"] or "")
+        reason = (
+            "entry_blocked_opposite_side_already_open"
+            if existing_side and existing_side != str(setup.side)
+            else "entry_blocked_symbol_already_open"
+        )
+        diagnostics.update(
+            {
+                "symbol_position_lock_blocked": True,
+                "existing_signal_key": row["signal_key"],
+                "existing_symbol": row["symbol"],
+                "existing_side": existing_side,
+                "existing_state": row["state"],
+                "existing_action": row["action"],
+                "existing_entry_price": row["entry_price"],
+                "existing_updated_at": row["updated_at"],
+                "blocked_new_side": str(setup.side),
+                "blocked_reason": reason,
+            }
+        )
+        return TradeDecision(WATCH, reason, "TRADE_WATCH", None), diagnostics
 
     def _entry_stop_loss_guard(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> tuple[TradeDecision | None, dict[str, object]]:
         """Block executor entries with invalid initial SL before opening/storing a trade.
@@ -2738,6 +2818,20 @@ class AccumulationRunner:
                 entry_decision = early_decision
                 forced_early_entry = True
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
+            symbol_lock_decision, symbol_lock_context = self._executor_symbol_position_lock(signal_key, setup)
+            observation_context.update(symbol_lock_context)
+            if symbol_lock_decision is not None:
+                self._store_paper_executor_decision(
+                    signal_key,
+                    signal,
+                    symbol_lock_decision,
+                    None,
+                    snapshot,
+                    setup=setup,
+                    observation_context=observation_context,
+                )
+                return
+
             late_chase_watch_decision, late_chase_context = self._evaluate_late_chase_gate(
                 signal_key,
                 signal,

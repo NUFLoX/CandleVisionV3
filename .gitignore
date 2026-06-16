@@ -47,3 +47,4 @@ manual_full_stats_*.txt
 
 # frontend dependencies
 dashboard/frontend/node_modules/
+reports/
