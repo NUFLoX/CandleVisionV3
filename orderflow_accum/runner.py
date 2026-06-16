@@ -1149,6 +1149,56 @@ class AccumulationRunner:
             market_regime=str(signal.meta.get("market_regime") or signal.meta.get("btc_regime") or "BTC_NEUTRAL"),
         )
 
+
+    def _entry_stop_loss_guard(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> tuple[TradeDecision | None, dict[str, object]]:
+        """Block executor entries with invalid initial SL before opening/storing a trade.
+
+        This does not affect scanner/search logic. It only prevents impossible executor risk:
+        - Buy must have initial SL below entry
+        - Sell must have initial SL above entry
+        """
+        diagnostics: dict[str, object] = {
+            "entry_stop_loss_guard_enabled": True,
+            "entry_stop_loss_guard_blocked": False,
+        }
+        if self.trade_executor is None:
+            return None, diagnostics
+
+        entry_price = self._optional_float(getattr(snapshot, "price", None))
+        if entry_price is None or entry_price <= 0:
+            diagnostics.update(
+                {
+                    "entry_stop_loss_guard_blocked": True,
+                    "invalid_entry_price": entry_price,
+                }
+            )
+            return TradeDecision(WATCH, "entry_blocked_invalid_entry_price", "TRADE_WATCH", None), diagnostics
+
+        try:
+            initial_sl = self.trade_executor._initial_stop_loss(setup, snapshot)
+        except Exception as exc:
+            diagnostics.update(
+                {
+                    "entry_stop_loss_guard_blocked": True,
+                    "invalid_stop_loss_error": str(exc),
+                }
+            )
+            return TradeDecision(WATCH, "entry_blocked_invalid_stop_loss", "TRADE_WATCH", None), diagnostics
+
+        diagnostics.update(
+            {
+                "entry_stop_loss_guard_entry_price": float(entry_price),
+                "entry_stop_loss_guard_initial_sl": float(initial_sl),
+                "entry_stop_loss_guard_side": str(setup.side),
+            }
+        )
+
+        if self._executor_initial_sl_invalid(side=setup.side, entry_price=entry_price, initial_sl=initial_sl):
+            diagnostics["entry_stop_loss_guard_blocked"] = True
+            return TradeDecision(WATCH, "entry_blocked_invalid_stop_loss", "TRADE_WATCH", None), diagnostics
+
+        return None, diagnostics
+
     _VOLUME_IMPULSE_META_FIELDS = (
         "volume_impulse",
         "volume_spike",
@@ -2720,6 +2770,20 @@ class AccumulationRunner:
                     observation_context=entry_observation_context,
                 )
                 return
+            stop_guard_decision, stop_guard_context = self._entry_stop_loss_guard(setup, snapshot)
+            entry_observation_context.update(stop_guard_context)
+            if stop_guard_decision is not None:
+                self._store_paper_executor_decision(
+                    signal_key,
+                    signal,
+                    stop_guard_decision,
+                    None,
+                    snapshot,
+                    setup=setup,
+                    observation_context=entry_observation_context,
+                )
+                return
+
             if self.trade_executor_mode == "testnet":
                 testnet_result = self._execute_testnet_entry(signal_key, signal, snapshot)
                 if not testnet_result.get("ok"):

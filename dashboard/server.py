@@ -2576,6 +2576,14 @@ def create_app() -> FastAPI:
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/react", include_in_schema=False)
+    async def react_index() -> FileResponse:
+        return FileResponse(STATIC_DIR / "dist" / "index.html")
+
+    @app.get("/react", include_in_schema=False)
+    async def react_index() -> FileResponse:
+        return FileResponse(STATIC_DIR / "dist" / "index.html")
+
     @app.get("/api/status")
     async def status():
         snapshot = await store.snapshot()
@@ -2915,7 +2923,12 @@ def create_app() -> FastAPI:
 
     @app.get("/api/snapshot")
     async def snapshot():
-        return await store.snapshot()
+        snap = await store.snapshot()
+        executor_fields = _executor_status_fields(snap.heartbeats)
+        snap.status.executor = str(executor_fields["executor"])
+        snap.status.open_trades = int(executor_fields["open_trades"])
+        snap.status.closed_trades_today = int(executor_fields["closed_trades_today"])
+        return snap
 
     @app.post("/api/ingest/log")
     async def ingest_log(log: BotLog, _: None = Depends(verify_ingest_auth)):
