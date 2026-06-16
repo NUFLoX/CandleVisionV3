@@ -26,3 +26,24 @@ data/*runtime*.json
 runtime/
 reports_profit_backtest/*.csv
 reports_profit_backtest/*.json
+
+# VPS local secrets/backups/runtime data
+.env
+.env.*
+*.bak
+*.bak_*
+*.backup*
+dashboard/**/*.bak*
+dashboard/static/vendor/
+data/
+manual_stats_*.txt
+manual_full_stats_*.txt
+
+# accidental shell fragments
+/PY
+/25
+/25.
+/1.75
+
+# frontend dependencies
+dashboard/frontend/node_modules/

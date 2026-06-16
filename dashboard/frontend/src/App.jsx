@@ -1,0 +1,894 @@
+import React, { useEffect, useMemo, useState } from 'react';
+
+const api = async (path, options = {}) => { const r = await fetch(path, options); const data = await r.json(); if (!r.ok) throw new Error(data.detail || 'API error'); return data; };
+      const fmtUsd = (value) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', notation: 'compact', maximumFractionDigits: 2 }).format(value || 0);
+      const fmtPotentialPct = (value) => value === null || value === undefined || value === '' ? '-' : `${Number(value || 0).toFixed(2)}%`;
+      const fmtPotentialShare = (value) => {
+        if (value === null || value === undefined || value === '') return '-';
+        const numeric = Number(value || 0);
+        return `${(Math.abs(numeric) <= 1 ? numeric * 100 : numeric).toFixed(1)}%`;
+      };
+      const fmtPotentialUsd = (value) => value === null || value === undefined || value === '' ? '-' : fmtUsd(value);
+
+      function Badge({ children, tone = 'slate' }) {
+        const tones = {
+          green: 'bg-emerald-500/15 text-emerald-300 border-emerald-400/20',
+          red: 'bg-red-500/15 text-red-300 border-red-400/20',
+          amber: 'bg-amber-500/15 text-amber-300 border-amber-400/20',
+          blue: 'bg-blue-500/15 text-blue-300 border-blue-400/20',
+          slate: 'bg-slate-500/15 text-slate-300 border-slate-400/20',
+        };
+        return <span className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${tones[tone]}`}>{children}</span>;
+      }
+
+      const pressureDisplayValue = (strip) => {
+        const valueKeys = new Set(['btc_d', 'usdt_d', 'total3']);
+        const value = valueKeys.has(strip.key) ? strip.value : strip.change_pct;
+        return `${value > 0 && !valueKeys.has(strip.key) ? '+' : ''}${Number(value || 0).toFixed(1)}%`;
+      };
+
+      function Card({ title, children, action }) {
+        return <section className="glass rounded-2xl p-5 shadow-2xl shadow-black/20">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <h2 className="text-lg font-bold tracking-tight">{title}</h2>
+            {action}
+          </div>
+          {children}
+        </section>;
+      }
+
+      function App() {
+        const [snapshot, setSnapshot] = useState(null);
+        const [filters, setFilters] = useState({ strength: '', signal_type: '', exchange: '', timeframe: '', signal_family: '', signal_focus_group: '', signal_source: '' });
+        const [coinQuery, setCoinQuery] = useState('BTC');
+        const [signalTab, setSignalTab] = useState('All');
+        const [sideFilter, setSideFilter] = useState('All');
+        const [coin, setCoin] = useState(null);
+        const [coinError, setCoinError] = useState('');
+        const [stats, setStats] = useState(null);
+        const [outcomes, setOutcomes] = useState([]);
+        const [statsError, setStatsError] = useState('');
+        const [activeSetups, setActiveSetups] = useState([]);
+        const [activeExecutorTrades, setActiveExecutorTrades] = useState({ rows: [], summary: {} });
+        const [executorLedger, setExecutorLedger] = useState({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] });
+        const emptyLearningEffectiveness = { summary: {}, windows: [], problem_patterns: [], by_kind: [], by_timeframe: [], by_exit_reason: [], recent_trades: [], regime_effectiveness: { by_btc_regime: [], by_market_regime: [] } };
+        const [learningEffectiveness, setLearningEffectiveness] = useState(emptyLearningEffectiveness);
+        const emptyRegimePerformance = { summary: {}, by_btc_regime: [], by_market_regime: [], blocked_entries: { total_blocked: 0, by_btc_regime: [], by_market_regime: [], by_symbol: [], by_timeframe: [], latest: [] } };
+        const [regimePerformance, setRegimePerformance] = useState(emptyRegimePerformance);
+        const emptyExitSimulator = { summary: {}, rules: [], by_kind: [], by_timeframe: [], trade_simulations: [] };
+        const [exitSimulator, setExitSimulator] = useState(emptyExitSimulator);
+        const emptyExitShadow = { summary: {}, open_shadow_trades: [], closed_shadow_results: [], shadow_events: [] };
+        const [exitShadow, setExitShadow] = useState(emptyExitShadow);
+        const emptySignalKindGroups = { groups: [], focus_groups: { HIGH_POTENTIAL: [], EXECUTION_STABLE: [], EXPERIMENTAL: [], OTHER: [] }, profit_potential: { available: false, by_kind: {}, key_kinds: [] } };
+        const [setupPerf, setSetupPerf] = useState({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] });
+        const [signalKindGroups, setSignalKindGroups] = useState(emptySignalKindGroups);
+
+        const load = async () => setSnapshot(await api('/api/snapshot'));
+        const loadStats = async () => {
+          const [summary, rows] = await Promise.all([api('/api/signal-stats'), api('/api/signal-outcomes?limit=500')]);
+          setStats(summary);
+          setOutcomes(rows);
+          setStatsError('');
+        };
+        const refreshLive = async () => setSnapshot(await api('/api/refresh', { method: 'POST' }));
+        const loadActiveSetups = async () => setActiveSetups(await api('/api/active-setups?limit=500'));
+        const loadActiveExecutorTrades = async () => setActiveExecutorTrades(await api('/api/executor-active-trades?limit=500'));
+        const loadExecutorLedger = async () => setExecutorLedger(await api('/api/executor-ledger?limit=50'));
+        const loadLearningEffectiveness = async () => setLearningEffectiveness(await api('/api/learning-effectiveness'));
+        const loadRegimePerformance = async () => setRegimePerformance(await api('/api/executor-regime-performance'));
+        const loadExitSimulator = async () => setExitSimulator(await api('/api/executor-exit-simulator'));
+        const loadExitShadow = async () => setExitShadow(await api('/api/executor-exit-shadow'));
+        const loadSetupPerformance = async () => setSetupPerf(await api('/api/setup-performance'));
+        const loadSignalKindGroups = async () => setSignalKindGroups(await api('/api/signal-kind-groups'));
+        const refreshExitAnalytics = async () => {
+          await Promise.all([
+            loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness)),
+            loadRegimePerformance().catch(() => setRegimePerformance(emptyRegimePerformance)),
+            loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator)),
+            loadExitShadow().catch(() => setExitShadow(emptyExitShadow)),
+          ]);
+        };
+        const refreshStats = async () => {
+          try {
+            const result = await api('/api/signal-outcomes/refresh', { method: 'POST' });
+            setStats(result.stats);
+            setOutcomes(await api('/api/signal-outcomes?limit=500'));
+            setStatsError('');
+          } catch (e) {
+            setStatsError(e.message);
+          }
+        };
+        useEffect(() => {
+          load();
+          loadStats().catch((e) => setStatsError(e.message));
+          loadActiveSetups().catch(() => setActiveSetups([]));
+          loadActiveExecutorTrades().catch(() => setActiveExecutorTrades({ rows: [], summary: {} }));
+          loadExecutorLedger().catch(() => setExecutorLedger({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] }));
+          loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness));
+          loadRegimePerformance().catch(() => setRegimePerformance(emptyRegimePerformance));
+          loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator));
+          loadExitShadow().catch(() => setExitShadow(emptyExitShadow));
+          loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] }));
+          loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups));
+          const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
+          const ws = new WebSocket(`${wsProtocol}://${location.host}/ws`);
+          ws.onmessage = () => load();
+          const timer = setInterval(load, 15000);
+          const statsTimer = setInterval(() => loadStats().catch((e) => setStatsError(e.message)), 30000);
+          const setupsTimer = setInterval(() => loadActiveSetups().catch(() => setActiveSetups([])), 30000);
+          const executorTradesTimer = setInterval(() => {
+            loadActiveExecutorTrades().catch(() => setActiveExecutorTrades({ rows: [], summary: {} }));
+            loadExecutorLedger().catch(() => setExecutorLedger({ summary: {}, open_trades: [], closed_trades: [], exit_reasons: [] }));
+            loadLearningEffectiveness().catch(() => setLearningEffectiveness(emptyLearningEffectiveness));
+            loadRegimePerformance().catch(() => setRegimePerformance(emptyRegimePerformance));
+            loadExitSimulator().catch(() => setExitSimulator(emptyExitSimulator));
+            loadExitShadow().catch(() => setExitShadow(emptyExitShadow));
+          }, 30000);
+          const perfTimer = setInterval(() => loadSetupPerformance().catch(() => setSetupPerf({ by_reason: [], by_score_bucket: [], by_timeframe: [], by_kind: [], by_source: [], by_family: [], by_focus_group: [] })), 30000);
+          const kindGroupsTimer = setInterval(() => loadSignalKindGroups().catch(() => setSignalKindGroups(emptySignalKindGroups)), 30000);
+          return () => { clearInterval(timer); clearInterval(statsTimer); clearInterval(setupsTimer); clearInterval(executorTradesTimer); clearInterval(perfTimer); clearInterval(kindGroupsTimer); ws.close(); };
+        }, []);
+
+        useEffect(() => {
+          const normalizedQuery = (coinQuery || 'BTC').trim().toUpperCase();
+          if (!normalizedQuery) return;
+          let active = true;
+          const timer = setTimeout(() => {
+            setCoinError('');
+            api(`/api/coin/${encodeURIComponent(normalizedQuery)}`)
+              .then((data) => { if (active) setCoin(data); })
+              .catch((e) => { if (active) { setCoin(null); setCoinError(e.message); } });
+          }, 350);
+          return () => { active = false; clearTimeout(timer); };
+        }, [coinQuery]);
+
+        const outcomesBySignal = useMemo(() => Object.fromEntries(outcomes.map((item) => [item.signal_id, item])), [outcomes]);
+
+        const filteredSignals = useMemo(() => {
+          const signals = snapshot?.signals || [];
+          return signals.filter((s) =>
+            (!filters.strength || s.strength === filters.strength) &&
+            (!filters.signal_type || s.signal_type === filters.signal_type) &&
+            (!filters.exchange || s.exchange === filters.exchange) &&
+            (!filters.timeframe || s.timeframe === filters.timeframe) &&
+            (!filters.signal_family || s.signal_family === filters.signal_family) &&
+            (!filters.signal_focus_group || s.signal_focus_group === filters.signal_focus_group) &&
+            (!filters.signal_source || s.signal_source === filters.signal_source) &&
+            (sideFilter === 'All' || (s.side || '').toLowerCase() === sideFilter.toLowerCase()) &&
+            (
+              signalTab === 'All' ||
+              (signalTab === 'Watchlist' && ((s.signal_type || '').toLowerCase() === 'watchlist' || (s.status || '').toUpperCase().includes('WATCH') || (s.kind || '').toUpperCase().includes('WATCH'))) ||
+              (signalTab === 'Confirmed' && ((s.signal_type || '').toLowerCase() === 'confirmed' || (s.status || '').toUpperCase().includes('CONFIRMED'))) ||
+              (signalTab === 'Buy' && (s.side || '').toLowerCase() === 'buy') ||
+              (signalTab === 'Sell' && (s.side || '').toLowerCase() === 'sell')
+            )
+          );
+        }, [snapshot, filters, signalTab, sideFilter]);
+
+        if (!snapshot) return <div className="flex min-h-screen items-center justify-center text-xl">Loading CandleVision...</div>;
+        const market = snapshot.market_state;
+        const status = snapshot.status;
+
+        return <main className="mx-auto max-w-7xl space-y-6 px-4 py-6 lg:px-8">
+          <header className="flex flex-col justify-between gap-4 lg:flex-row lg:items-end">
+            <div>
+              <p className="text-sm font-semibold uppercase tracking-[.35em] text-cyan-300">CandleVision V3</p>
+              <h1 className="mt-2 text-4xl font-black tracking-tight">Control Center</h1>
+              <p className="mt-2 max-w-3xl text-slate-400">Панель наблюдения без демо-заглушек: реальные публичные данные Bybit/CoinGecko, live-логи, фильтр рынка, сигналы из ingest API и глубокий поиск монеты.</p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Badge tone="green">Scanner: {status.scanner}</Badge>
+              <Badge tone="green">Executor: {status.executor}</Badge>
+              <Badge tone="blue">Last scan: {status.last_scan_seconds}s</Badge>
+              <button onClick={refreshLive} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh live</button>
+            </div>
+          </header>
+
+          <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <StateTile label="BTC Filter" value={market.btc_filter} tone={market.btc_filter === 'DANGER' || market.btc_filter === 'DUMP' ? 'red' : 'green'} />
+            <StateTile label="Altcoin Mode" value={market.altcoin_mode} tone={market.altcoin_mode === 'RISK-OFF' ? 'red' : 'green'} />
+            <StateTile label="Liquidity" value={market.liquidity} tone="blue" />
+            <StateTile label="Market Regime" value={market.market_regime} tone={market.market_regime === 'BEAR' ? 'red' : 'green'} />
+          </section>
+
+          <section className="grid gap-6 xl:grid-cols-[1.05fr_.95fr]">
+            <Card title="Консоль бота" action={<Badge tone="green">live</Badge>}>
+              <div className="h-80 space-y-3 overflow-auto rounded-xl bg-black/30 p-4 font-mono text-sm">
+                {snapshot.logs.length === 0 && <p className="text-slate-500">Логов пока нет.</p>}
+                {snapshot.logs.map((log, index) => <div key={index} className="flex gap-3 text-slate-300">
+                  <span className="text-cyan-300">[{new Date(log.timestamp).toLocaleTimeString()}]</span>
+                  <span className={log.severity === 'error' ? 'text-red-300' : log.severity === 'success' ? 'text-emerald-300' : ''}>{log.message}</span>
+                </div>)}
+              </div>
+            </Card>
+            <Card title="Market Pressure Strips">
+              <div className="space-y-4">
+                {snapshot.pressure_strips.length === 0 && <p className="text-sm text-slate-500">Live dominance ещё загружается.</p>}
+                {snapshot.pressure_strips.map((strip) => <div key={strip.key}>
+                  <div className="mb-1 flex items-center justify-between text-sm">
+                    <span className="font-semibold text-slate-200">{strip.label}</span>
+                    <span className={strip.change_pct >= 0 ? 'text-emerald-300' : 'text-red-300'}>{pressureDisplayValue(strip)}</span>
+                  </div>
+                  <div className="h-4 overflow-hidden rounded-full bg-slate-800">
+                    <div className={`${strip.key === 'usdt_d' && strip.change_pct > 0 ? 'danger-strip' : 'strip'} h-full rounded-full`} style={{ width: `${strip.value}%` }} />
+                  </div>
+                  <p className="mt-1 text-xs text-slate-500">{strip.interpretation}</p>
+                </div>)}
+              </div>
+            </Card>
+          </section>
+
+          <Card title={`Окно сигналов (${filteredSignals.length})`} action={<SignalFilters filters={filters} setFilters={setFilters} sideFilter={sideFilter} setSideFilter={setSideFilter} />}>
+            <SignalTabs signalTab={signalTab} setSignalTab={setSignalTab} />
+            <div className="mt-3 max-h-[720px] overflow-y-auto pr-1">
+            <div className="grid gap-4 lg:grid-cols-3">
+              {filteredSignals.length === 0 && <p className="text-sm text-slate-500">Реальных сигналов пока нет. Отправьте сигнал через /api/ingest/signal или дождитесь сканера.</p>}
+              {filteredSignals.map((signal) => <SignalCard key={signal.id} signal={signal} outcome={outcomesBySignal[signal.id]} />)}
+            </div>
+            </div>
+          </Card>
+
+
+          <SignalPerformancePanel stats={stats} outcomes={outcomes} error={statsError} onRefresh={refreshStats} />
+          <ActiveSetupsPanel setups={activeSetups} onRefresh={loadActiveSetups} />
+          <ActiveExecutorTradesPanel payload={activeExecutorTrades} onRefresh={loadActiveExecutorTrades} />
+          <ExecutorLedgerPanel payload={executorLedger} onRefresh={loadExecutorLedger} />
+          <LearningEffectivenessPanel payload={learningEffectiveness} onRefresh={refreshExitAnalytics} />
+          <ExecutorRegimePerformancePanel payload={regimePerformance} onRefresh={loadRegimePerformance} />
+          <ExecutorExitSimulatorPanel payload={exitSimulator} onRefresh={refreshExitAnalytics} />
+          <ExecutorExitShadowPanel payload={exitShadow} onRefresh={refreshExitAnalytics} />
+          <SetupPerformancePanel perf={setupPerf} onRefresh={loadSetupPerformance} />
+          <SignalIntelligencePanel data={signalKindGroups} onRefresh={loadSignalKindGroups} />
+
+          <section className="grid gap-6 xl:grid-cols-[.9fr_1.1fr]">
+            <Card title="Поиск монеты" action={<input className="w-32 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-cyan-400" value={coinQuery} onChange={(e) => setCoinQuery(e.target.value)} placeholder="BTC" />}>
+              {coinError && <p className="rounded-xl border border-red-400/20 bg-red-400/10 p-3 text-sm text-red-200">{coinError}</p>}
+              {coin && <CoinAnalytics coin={coin} />}
+            </Card>
+            <Card title="Bot Health / Trades / Watchlist">
+              <div className="grid gap-4 md:grid-cols-2">
+                <Health status={status} />
+                <div className="space-y-3">
+                  <h3 className="font-semibold">Watchlist 24–48h</h3>
+                  {snapshot.watchlist.length === 0 && <p className="text-sm text-slate-500">Watchlist пуст: демо-записи отключены, ждём ingest от бота.</p>}
+                  {snapshot.watchlist.map((item) => <div key={item.symbol} className="rounded-xl bg-slate-900/70 p-3 text-sm">
+                    <div className="flex justify-between"><b>{item.symbol}</b><span>{item.score}</span></div>
+                    <p className="text-slate-400">{item.reason}</p>
+                  </div>)}
+                </div>
+              </div>
+            </Card>
+          </section>
+        </main>;
+      }
+
+      function StateTile({ label, value, tone }) {
+        return <div className="glass rounded-2xl p-5"><p className="text-sm text-slate-400">{label}</p><div className="mt-2"><Badge tone={tone}>{value}</Badge></div></div>;
+      }
+
+      function SignalTabs({ signalTab, setSignalTab }) {
+        const tabs = ['All', 'Watchlist', 'Confirmed', 'Buy', 'Sell'];
+        return <div className="flex flex-wrap gap-2">{tabs.map((tab) => <button key={tab} onClick={() => setSignalTab(tab)} className={`rounded-full border px-3 py-1 text-xs font-semibold ${signalTab === tab ? 'border-cyan-400/40 bg-cyan-400/15 text-cyan-200' : 'border-slate-700 bg-slate-950 text-slate-300 hover:border-slate-500'}`}>{tab}</button>)}</div>;
+      }
+
+      function SignalFilters({ filters, setFilters, sideFilter, setSideFilter }) {
+        const configs = [
+          ['strength', ['Strong', 'Medium', 'Weak']],
+          ['signal_type', ['Watchlist', 'Confirmed', 'Aggressive']],
+          ['exchange', ['Binance', 'Bybit']],
+          ['timeframe', ['1m', '5m', '15m', '1h', '4h', '1d']],
+          ['signal_family', ['HIGH_POTENTIAL_ACCUMULATION', 'HIGH_POTENTIAL_ABSORPTION', 'HIGH_POTENTIAL_PRE_IMPULSE', 'EXECUTION_STABLE_BREAKOUT', 'EXPERIMENTAL_EARLY', 'EXPERIMENTAL_READY', 'EXPERIMENTAL_BASE_BUILDUP', 'OTHER']],
+          ['signal_focus_group', ['HIGH_POTENTIAL', 'EXECUTION_STABLE', 'EXPERIMENTAL', 'OTHER']],
+          ['signal_source', ['macro', 'orderflow', 'scanner']],
+        ];
+        return <div className="flex flex-wrap gap-2">{configs.map(([key, values]) => <select key={key} className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-xs" value={filters[key]} onChange={(e) => setFilters({ ...filters, [key]: e.target.value })}>
+          <option value="">{key}</option>{values.map((v) => <option key={v}>{v}</option>)}
+        </select>)}
+        <select className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-xs" value={sideFilter} onChange={(e) => setSideFilter(e.target.value)}>
+          <option value="All">side: All</option>
+          <option value="Buy">side: Buy</option>
+          <option value="Sell">side: Sell</option>
+        </select>
+        </div>;
+      }
+
+      function SignalCard({ signal, outcome }) {
+        const tone = signal.strength === 'Strong' ? 'green' : signal.strength === 'Medium' ? 'amber' : 'slate';
+        const outcomeTone = outcome?.outcome === 'tp' ? 'green' : outcome?.outcome === 'sl' ? 'red' : outcome?.outcome === 'ambiguous' ? 'amber' : 'slate';
+        return <article className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+          <div className="mb-3 flex items-start justify-between gap-3"><div><h3 className="text-xl font-black">{signal.symbol}</h3><p className="text-sm text-slate-500">{signal.exchange} · TF: {signal.timeframe}</p></div><div className="flex flex-col items-end gap-2"><Badge tone={tone}>{signal.score}</Badge>{outcome && <Badge tone={outcomeTone}>{outcome.outcome.toUpperCase()} · {outcome.r_multiple}R</Badge>}</div></div>
+          <div className="grid grid-cols-2 gap-2 text-sm text-slate-300">
+            <span>Type: <b>{signal.signal_type}</b></span><span>Status: <b>{signal.status}</b></span>
+            <span>Kind: <b>{signal.signal_kind || 'SIGNAL'}</b></span><span>Family: <b>{signal.signal_family || 'OTHER'}</b></span>
+            <span>Focus: <b>{signal.signal_focus_group || 'OTHER'}</b></span><span>Source: <b>{signal.signal_source || 'scanner'}</b></span>
+            <span>Entry: <b>{signal.entry}</b></span><span>SL: <b>{signal.stop_loss}</b></span>
+            <span>TP1: <b>{signal.take_profit_1}</b></span><span>Strength: <b>{signal.strength}</b></span>
+          </div>
+          <div className="mt-3 max-h-32 overflow-y-auto rounded-xl bg-slate-900 p-3 text-sm text-slate-400">{signal.reason}</div>
+        </article>;
+      }
+
+
+      function SignalPerformancePanel({ stats, outcomes, error, onRefresh }) {
+        const cards = [
+          ['Signals', stats?.total ?? 0],
+          ['Win rate', `${(((stats?.win_rate ?? 0) * 100).toFixed(1))}%`],
+          ['Expectancy', `${(stats?.expectancy_r ?? 0).toFixed(2)}R`],
+          ['Total R', `${(stats?.total_r ?? 0).toFixed(2)}R`],
+        ];
+        return <Card title="Legacy Signal Performance" action={<button onClick={onRefresh} className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-400/20">Refresh stats</button>}>
+          <p className="mb-4 text-xs text-slate-400">Legacy signal_stats.db outcome model — not SmartTradeExecutor paper ledger.</p>
+          {error && <p className="mb-4 rounded-xl border border-red-400/20 bg-red-400/10 p-3 text-sm text-red-200">{error}</p>}
+          <div className="grid gap-3 md:grid-cols-4">{cards.map(([label, value]) => <div key={label} className="rounded-xl bg-slate-950/70 p-4"><p className="text-xs uppercase tracking-widest text-slate-500">{label}</p><p className="mt-1 text-2xl font-black">{value}</p></div>)}</div>
+          <div className="mt-5 grid gap-4 lg:grid-cols-2">
+            <BreakdownTable title="By symbol" rows={stats?.by_symbol || []} labelKey="symbol" />
+            <BreakdownTable title="By timeframe" rows={stats?.by_timeframe || []} labelKey="timeframe" />
+            <BreakdownTable title="By signal type" rows={stats?.by_signal_type || []} labelKey="signal_type" />
+            <BreakdownTable title="By outcome" rows={stats?.by_outcome || []} labelKey="outcome" />
+          </div>
+          <div className="mt-5 overflow-auto rounded-xl border border-slate-800">
+            <table className="min-w-full text-left text-sm">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Signal</th><th className="px-3 py-2">Outcome</th><th className="px-3 py-2">R</th><th className="px-3 py-2">Bars</th></tr></thead>
+              <tbody>{outcomes.slice(0, 8).map((item) => <tr key={item.signal_id} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{item.symbol} · {item.timeframe}</td><td className="px-3 py-2">{item.outcome}</td><td className="px-3 py-2">{item.r_multiple}</td><td className="px-3 py-2">{item.bars_checked}</td></tr>)}</tbody>
+            </table>
+            {outcomes.length === 0 && <p className="p-4 text-sm text-slate-500">Нет рассчитанных исходов. Нажмите Refresh stats после появления сигналов.</p>}
+          </div>
+        </Card>;
+      }
+
+      function ActiveSetupsPanel({ setups, onRefresh }) {
+        return <Card title="Active Setups" action={<button onClick={onRefresh} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh setups</button>}>
+          <div className="max-h-[560px] overflow-auto rounded-xl border border-slate-800">
+            <table className="min-w-full text-left text-sm">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500">
+                <tr>
+                  <th className="px-3 py-2">Symbol</th>
+                  <th className="px-3 py-2">TF</th>
+                  <th className="px-3 py-2">Stage</th>
+                  <th className="px-3 py-2">Score</th>
+                  <th className="px-3 py-2">Repeats</th>
+                  <th className="px-3 py-2">First seen</th>
+                  <th className="px-3 py-2">Last seen</th>
+                  <th className="px-3 py-2">Entry/SL/TP1</th>
+                  <th className="px-3 py-2">MFE/MAE</th>
+                </tr>
+              </thead>
+              <tbody>
+                {setups.slice(0, 120).map((s) => <tr key={s.signal_key} className="border-t border-slate-800">
+                  <td className="px-3 py-2 font-semibold">{s.symbol}</td>
+                  <td className="px-3 py-2">{s.timeframe}</td>
+                  <td className="px-3 py-2">{s.status}</td>
+                  <td className="px-3 py-2">{Number(s.score_last || 0).toFixed(2)} / max {Number(s.score_max || 0).toFixed(2)}</td>
+                  <td className="px-3 py-2">{s.repeat_count}</td>
+                  <td className="px-3 py-2">{s.first_seen ? new Date(s.first_seen).toLocaleString() : "-"}</td>
+                  <td className="px-3 py-2">{s.last_seen ? new Date(s.last_seen).toLocaleString() : "-"}</td>
+                  <td className="px-3 py-2">{Number(s.entry || 0).toFixed(6)} / {Number(s.stop_loss || 0).toFixed(6)} / {Number(s.take_profit_1 || 0).toFixed(6)}</td>
+                  <td className="px-3 py-2">{Number(s.max_gain_pct || 0).toFixed(2)}% / {Number(s.max_drawdown_pct || 0).toFixed(2)}%</td>
+                </tr>)}
+              </tbody>
+            </table>
+            {setups.length === 0 && <p className="p-4 text-sm text-slate-500">Нет активных setup'ов в signals.db</p>}
+          </div>
+        </Card>;
+      }
+
+
+      function ActiveExecutorTradesPanel({ payload, onRefresh }) {
+        const rows = payload?.rows || [];
+        const summary = payload?.summary || {};
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const fmtDate = (value) => value ? new Date(value).toLocaleString() : '-';
+        return <Card title="Active Executor Trades" action={<button onClick={onRefresh} className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-400/20">Refresh executor</button>}>
+          <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <Badge tone="blue">Paper executor state — no live orders.</Badge>
+            <span>Total: <b className="text-slate-200">{summary.total_open_trades || 0}</b></span>
+            <span>Entered: <b className="text-slate-200">{summary.entered_count || 0}</b></span>
+            <span>Breakeven: <b className="text-slate-200">{summary.protect_breakeven_count || 0}</b></span>
+            <span>Avg Max R: <b className="text-slate-200">{fmtNum(summary.avg_max_gain_r, 2)}</b></span>
+            <span>Avg DD R: <b className="text-slate-200">{fmtNum(summary.avg_max_drawdown_r, 2)}</b></span>
+          </div>
+          <div className="max-h-[560px] overflow-auto rounded-xl border border-slate-800">
+            <table className="min-w-full text-left text-sm">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500">
+                <tr>
+                  <th className="px-3 py-2">Symbol</th>
+                  <th className="px-3 py-2">TF</th>
+                  <th className="px-3 py-2">State</th>
+                  <th className="px-3 py-2">Side</th>
+                  <th className="px-3 py-2">Entry</th>
+                  <th className="px-3 py-2">SL</th>
+                  <th className="px-3 py-2">Max R</th>
+                  <th className="px-3 py-2">DD R</th>
+                  <th className="px-3 py-2">Kind / Focus</th>
+                  <th className="px-3 py-2">Entry time</th>
+                  <th className="px-3 py-2">Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.slice(0, 120).map((trade) => <tr key={trade.signal_key || `${trade.symbol}-${trade.updated_at}`} className="border-t border-slate-800">
+                  <td className="px-3 py-2 font-semibold">{trade.symbol}</td>
+                  <td className="px-3 py-2">{trade.timeframe || '-'}</td>
+                  <td className="px-3 py-2">{trade.state || trade.action || '-'}</td>
+                  <td className="px-3 py-2">{trade.side || '-'}</td>
+                  <td className="px-3 py-2">{fmtNum(trade.entry_price, 6)}</td>
+                  <td className="px-3 py-2">{fmtNum(trade.current_sl ?? trade.executor_initial_sl, 6)}</td>
+                  <td className="px-3 py-2 text-emerald-300">{fmtNum(trade.max_gain_r, 2)}</td>
+                  <td className="px-3 py-2 text-red-300">{fmtNum(trade.max_drawdown_r, 2)}</td>
+                  <td className="px-3 py-2">
+                    <div>{trade.signal_kind || '-'}</div>
+                    <div className="text-xs text-slate-500">{trade.signal_focus_group || trade.signal_family || '-'}</div>
+                  </td>
+                  <td className="px-3 py-2">{fmtDate(trade.executor_entry_time || trade.created_at)}</td>
+                  <td className="px-3 py-2">{fmtDate(trade.updated_at)}</td>
+                </tr>)}
+              </tbody>
+            </table>
+            {rows.length === 0 && <p className="p-4 text-sm text-slate-500">No active executor trades.</p>}
+          </div>
+        </Card>;
+      }
+
+
+      function ExecutorLedgerPanel({ payload, onRefresh }) {
+        const summary = payload?.summary || {};
+        const openTrades = payload?.open_trades || [];
+        const closedTrades = payload?.closed_trades || [];
+        const exitReasons = payload?.exit_reasons || [];
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const fmtDate = (value) => value ? new Date(value).toLocaleString() : '-';
+        const metricCards = [
+          ['Open Trades', summary.total_open_trades ?? 0, 'text-cyan-200'],
+          ['Closed Trades', summary.total_closed_trades ?? 0, 'text-slate-100'],
+          ['Win Rate', summary.win_rate === null || summary.win_rate === undefined ? '-' : `${(Number(summary.win_rate || 0) * 100).toFixed(1)}%`, 'text-emerald-200'],
+          ['Net R', fmtNum(summary.net_r, 4), Number(summary.net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Avg R', fmtNum(summary.avg_r, 4), Number(summary.avg_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Profit Factor', summary.profit_factor === null || summary.profit_factor === undefined ? '-' : fmtNum(summary.profit_factor, 4), 'text-amber-200'],
+        ];
+        return <Card title="SmartTradeExecutor Ledger" action={<button onClick={onRefresh} className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-400/20">Refresh ledger</button>}>
+          <div className="space-y-5">
+            <p className="rounded-xl border border-blue-400/20 bg-blue-400/10 px-3 py-2 text-xs font-semibold text-blue-100">Paper executor ledger — no live orders.</p>
+            <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+              {metricCards.map(([label, value, tone]) => <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
+                <p className={`mt-2 text-2xl font-black ${tone}`}>{value}</p>
+              </div>)}
+            </div>
+
+            <LedgerTable title="Open Executor Trades" empty="No active executor trades.">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr>
+                <th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">State</th><th className="px-3 py-2">Side</th><th className="px-3 py-2">Entry</th><th className="px-3 py-2">SL</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">DD R</th><th className="px-3 py-2">Breakeven</th><th className="px-3 py-2">Kind / Focus</th><th className="px-3 py-2">Updated</th>
+              </tr></thead>
+              <tbody>{openTrades.map((trade) => <tr key={trade.signal_key || `${trade.symbol}-${trade.updated_at}`} className="border-t border-slate-800">
+                <td className="px-3 py-2 font-semibold">{trade.symbol}</td><td className="px-3 py-2">{trade.timeframe || '-'}</td><td className="px-3 py-2">{trade.state || trade.action || '-'}</td><td className="px-3 py-2">{trade.side || '-'}</td><td className="px-3 py-2">{fmtNum(trade.entry_price, 6)}</td><td className="px-3 py-2">{fmtNum(trade.current_sl ?? trade.executor_initial_sl, 6)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(trade.max_gain_r, 4)}</td><td className="px-3 py-2 text-red-300">{fmtNum(trade.max_drawdown_r, 4)}</td><td className="px-3 py-2">{fmtDate(trade.breakeven_active ? trade.breakeven_display_time : null)}</td><td className="px-3 py-2"><div>{trade.signal_kind || '-'}</div><div className="text-xs text-slate-500">{trade.signal_focus_group || trade.signal_family || '-'}</div></td><td className="px-3 py-2">{fmtDate(trade.updated_at)}</td>
+              </tr>)}</tbody>
+              {openTrades.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No active executor trades.</caption>}
+            </LedgerTable>
+
+            <LedgerTable title="Closed Executor Trades">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr>
+                <th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Side</th><th className="px-3 py-2">Entry</th><th className="px-3 py-2">Exit</th><th className="px-3 py-2">Result R</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">DD R</th><th className="px-3 py-2">Breakeven</th><th className="px-3 py-2">Exit Reason</th><th className="px-3 py-2">Duration</th><th className="px-3 py-2">Exit Time</th>
+              </tr></thead>
+              <tbody>{closedTrades.map((trade) => <tr key={trade.trade_key || `${trade.symbol}-${trade.exit_time}`} className="border-t border-slate-800">
+                <td className="px-3 py-2 font-semibold">{trade.symbol}</td><td className="px-3 py-2">{trade.timeframe || '-'}</td><td className="px-3 py-2">{trade.side || '-'}</td><td className="px-3 py-2">{fmtNum(trade.entry_price, 6)}</td><td className="px-3 py-2">{fmtNum(trade.exit_price, 6)}</td><td className={`px-3 py-2 font-semibold ${Number(trade.r_result || 0) > 0 ? 'text-emerald-300' : Number(trade.r_result || 0) < 0 ? 'text-red-300' : 'text-slate-300'}`}>{fmtNum(trade.r_result, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(trade.max_gain_r, 4)}</td><td className="px-3 py-2 text-red-300">{fmtNum(trade.max_drawdown_r, 4)}</td><td className="px-3 py-2">{trade.moved_to_breakeven ? 'Yes' : 'No'}</td><td className="px-3 py-2">{trade.exit_reason || '-'}</td><td className="px-3 py-2">{trade.duration_minutes === null || trade.duration_minutes === undefined ? '-' : `${fmtNum(trade.duration_minutes, 1)}m`}</td><td className="px-3 py-2">{fmtDate(trade.exit_time)}</td>
+              </tr>)}</tbody>
+              {closedTrades.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No closed executor trades yet.</caption>}
+            </LedgerTable>
+
+            <LedgerTable title="Exit Reasons">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Exit Reason</th><th className="px-3 py-2">Total</th><th className="px-3 py-2">Wins</th><th className="px-3 py-2">Losses</th><th className="px-3 py-2">Net R</th><th className="px-3 py-2">Avg R</th></tr></thead>
+              <tbody>{exitReasons.map((row) => <tr key={row.exit_reason} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.exit_reason || 'UNKNOWN'}</td><td className="px-3 py-2">{row.total}</td><td className="px-3 py-2 text-emerald-300">{row.wins}</td><td className="px-3 py-2 text-red-300">{row.losses}</td><td className="px-3 py-2">{fmtNum(row.net_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.avg_r, 4)}</td></tr>)}</tbody>
+              {exitReasons.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No exit reason data yet.</caption>}
+            </LedgerTable>
+          </div>
+        </Card>;
+      }
+
+      function LearningEffectivenessPanel({ payload, onRefresh }) {
+        const summary = payload?.summary || {};
+        const windows = payload?.windows || [];
+        const patterns = payload?.problem_patterns || [];
+        const byKind = payload?.by_kind || [];
+        const recentTrades = payload?.recent_trades || [];
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const fmtPct = (value) => value === null || value === undefined ? '-' : `${(Number(value || 0) * 100).toFixed(1)}%`;
+        const fmtDate = (value) => value ? new Date(value).toLocaleString() : '-';
+        const statusTone = (status) => status === 'strong_positive_edge' || status === 'positive_edge' ? 'text-emerald-200' : status === 'negative_edge' ? 'text-red-200' : status === 'improving_watch' ? 'text-amber-200' : 'text-slate-200';
+        const severityTone = (severity) => severity === 'critical' ? 'text-red-300' : severity === 'warning' ? 'text-amber-300' : 'text-blue-300';
+        const cards = [
+          ['Learning Status', summary.learning_status || 'insufficient_data', statusTone(summary.learning_status)],
+          ['Trades', summary.total_trades ?? 0, 'text-slate-100'],
+          ['Net R', fmtNum(summary.net_r, 4), Number(summary.net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Avg R', fmtNum(summary.avg_r, 4), Number(summary.avg_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Profit Factor', summary.profit_factor === null || summary.profit_factor === undefined ? '-' : fmtNum(summary.profit_factor, 4), 'text-amber-200'],
+          ['Avg Giveback R', fmtNum(summary.avg_giveback_r, 4), 'text-cyan-200'],
+          ['1R Giveback Failures', summary.reached_1r_closed_nonpositive_count ?? 0, Number(summary.reached_1r_closed_nonpositive_count || 0) > 0 ? 'text-red-200' : 'text-emerald-200'],
+        ];
+        return <Card title="Learning Effectiveness" action={<button onClick={onRefresh} className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-400/20">Refresh learning</button>}>
+          <div className="space-y-5">
+            <p className="rounded-xl border border-purple-400/20 bg-purple-400/10 px-3 py-2 text-xs font-semibold text-purple-100">Measures whether the paper executor is improving from recorded trades.</p>
+            <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-7">
+              {cards.map(([label, value, tone]) => <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
+                <p className={`mt-2 break-words text-xl font-black ${tone}`}>{value}</p>
+              </div>)}
+            </div>
+
+            <LedgerTable title="Progress Windows">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Window</th><th className="px-3 py-2">Trades</th><th className="px-3 py-2">Net R</th><th className="px-3 py-2">Avg R</th><th className="px-3 py-2">Win Rate</th><th className="px-3 py-2">PF</th><th className="px-3 py-2">Avg Giveback</th><th className="px-3 py-2">1R→≤0</th></tr></thead>
+              <tbody>{windows.map((row) => <tr key={row.name} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.name}</td><td className="px-3 py-2">{row.total_trades}</td><td className="px-3 py-2">{fmtNum(row.net_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.avg_r, 4)}</td><td className="px-3 py-2">{fmtPct(row.win_rate)}</td><td className="px-3 py-2">{fmtNum(row.profit_factor, 4)}</td><td className="px-3 py-2">{fmtNum(row.avg_giveback_r, 4)}</td><td className="px-3 py-2">{row.reached_1r_closed_nonpositive_count}</td></tr>)}</tbody>
+              {windows.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No closed executor trades yet.</caption>}
+            </LedgerTable>
+
+            <LedgerTable title="Problem Patterns">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Pattern</th><th className="px-3 py-2">Severity</th><th className="px-3 py-2">Count</th><th className="px-3 py-2">Description</th><th className="px-3 py-2">Suggested Next Step</th></tr></thead>
+              <tbody>{patterns.map((row) => <tr key={row.pattern} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.pattern}</td><td className={`px-3 py-2 font-semibold ${severityTone(row.severity)}`}>{row.severity}</td><td className="px-3 py-2">{row.count}</td><td className="px-3 py-2 text-slate-300">{row.description}</td><td className="px-3 py-2 text-slate-300">{row.suggested_next_step}</td></tr>)}</tbody>
+              {patterns.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No problem patterns detected yet.</caption>}
+            </LedgerTable>
+
+            <LedgerTable title="By Signal Kind">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Kind</th><th className="px-3 py-2">Trades</th><th className="px-3 py-2">Net R</th><th className="px-3 py-2">Avg R</th><th className="px-3 py-2">PF</th><th className="px-3 py-2">Avg Giveback</th><th className="px-3 py-2">1R→≤0</th></tr></thead>
+              <tbody>{byKind.map((row) => <tr key={row.kind} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.kind}</td><td className="px-3 py-2">{row.total_trades}</td><td className="px-3 py-2">{fmtNum(row.net_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.avg_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.profit_factor, 4)}</td><td className="px-3 py-2">{fmtNum(row.avg_giveback_r, 4)}</td><td className="px-3 py-2">{row.reached_1r_closed_nonpositive_count}</td></tr>)}</tbody>
+              {byKind.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No signal-kind executor grouping yet.</caption>}
+            </LedgerTable>
+
+            <LedgerTable title="Recent Executor Learning Trades">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Kind</th><th className="px-3 py-2">Result R</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Giveback R</th><th className="px-3 py-2">BE</th><th className="px-3 py-2">Exit Reason</th><th className="px-3 py-2">Exit Time</th></tr></thead>
+              <tbody>{recentTrades.map((trade) => <tr key={trade.trade_key || `${trade.symbol}-${trade.exit_time}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{trade.symbol}</td><td className="px-3 py-2">{trade.timeframe || '-'}</td><td className="px-3 py-2">{trade.signal_kind || '-'}</td><td className={`px-3 py-2 font-semibold ${Number(trade.r_result || 0) > 0 ? 'text-emerald-300' : Number(trade.r_result || 0) < 0 ? 'text-red-300' : 'text-slate-300'}`}>{fmtNum(trade.r_result, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(trade.max_gain_r, 4)}</td><td className="px-3 py-2 text-amber-300">{fmtNum(trade.giveback_r, 4)}</td><td className="px-3 py-2">{trade.moved_to_breakeven ? 'Yes' : 'No'}</td><td className="px-3 py-2">{trade.exit_reason || '-'}</td><td className="px-3 py-2">{fmtDate(trade.exit_time)}</td></tr>)}</tbody>
+              {recentTrades.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No recent executor learning trades.</caption>}
+            </LedgerTable>
+          </div>
+        </Card>;
+      }
+
+
+      function ExecutorExitSimulatorPanel({ payload, onRefresh }) {
+        const summary = payload?.summary || {};
+        const rules = payload?.rules || [];
+        const byKind = payload?.by_kind || [];
+        const trades = payload?.trade_simulations || [];
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const fmtPct = (value) => value === null || value === undefined ? '-' : `${(Number(value || 0) * 100).toFixed(1)}%`;
+        const recommendationTone = (value) => value === 'strong_candidate' ? 'text-emerald-300' : value === 'candidate' ? 'text-cyan-300' : value === 'needs_more_data' ? 'text-amber-300' : 'text-slate-300';
+        const cards = [
+          ['Current Net R', fmtNum(summary.current_net_r, 4), Number(summary.current_net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Best Sim Net R', fmtNum(summary.best_simulated_net_r, 4), Number(summary.best_simulated_net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Best Delta R', fmtNum(summary.best_delta_net_r, 4), Number(summary.best_delta_net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Best Rule', summary.best_rule_by_net_r || '-', 'text-cyan-200'],
+          ['Sample Size', summary.total_trades ?? 0, 'text-slate-100'],
+          ['Warning', summary.sample_warning?.warning ? 'Small sample' : 'OK', summary.sample_warning?.warning ? 'text-amber-200' : 'text-emerald-200'],
+        ];
+        return <Card title="Executor Exit What-If Simulator" action={<button onClick={onRefresh} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh simulator</button>}>
+          <div className="space-y-5">
+            <p className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-3 py-2 text-xs font-semibold text-cyan-100">Diagnostic simulation only — does not change live or paper trading.</p>
+            {summary.sample_warning?.warning && <p className="rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs font-semibold text-amber-100">{summary.sample_warning?.message || 'Sample is small; use this as diagnostics only.'}</p>}
+            <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+              {cards.map(([label, value, tone]) => <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
+                <p className={`mt-2 break-words text-xl font-black ${tone}`}>{value}</p>
+              </div>)}
+            </div>
+
+            <LedgerTable title="Simulated Exit Rules">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Rule</th><th className="px-3 py-2">Sim Net R</th><th className="px-3 py-2">Delta R</th><th className="px-3 py-2">Avg R</th><th className="px-3 py-2">Win Rate</th><th className="px-3 py-2">PF</th><th className="px-3 py-2">Prevented SL</th><th className="px-3 py-2">Improved</th><th className="px-3 py-2">Recommendation</th></tr></thead>
+              <tbody>{rules.map((row) => <tr key={row.rule_id} className="border-t border-slate-800"><td className="px-3 py-2"><div className="font-semibold">{row.label || row.rule_id}</div><div className="text-xs text-slate-500">{row.rule_id}</div></td><td className="px-3 py-2">{fmtNum(row.simulated_net_r, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(row.delta_net_r_vs_actual || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.delta_net_r_vs_actual, 4)}</td><td className="px-3 py-2">{fmtNum(row.simulated_avg_r, 4)}</td><td className="px-3 py-2">{fmtPct(row.simulated_win_rate)}</td><td className="px-3 py-2">{fmtNum(row.simulated_profit_factor, 4)}</td><td className="px-3 py-2">{row.prevented_full_losses ?? 0}</td><td className="px-3 py-2">{row.improved_trades ?? 0}</td><td className={`px-3 py-2 font-semibold ${recommendationTone(row.recommendation)}`}>{row.recommendation || '-'}</td></tr>)}</tbody>
+              {rules.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No simulator rules available.</caption>}
+            </LedgerTable>
+
+            <LedgerTable title="Best by Signal Kind">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Kind</th><th className="px-3 py-2">Trades</th><th className="px-3 py-2">Current Net R</th><th className="px-3 py-2">Best Rule</th><th className="px-3 py-2">Best Sim Net R</th><th className="px-3 py-2">Delta R</th><th className="px-3 py-2">Avg Giveback</th></tr></thead>
+              <tbody>{byKind.map((row) => <tr key={row.kind} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.kind}</td><td className="px-3 py-2">{row.total_trades}</td><td className="px-3 py-2">{fmtNum(row.current_net_r, 4)}</td><td className="px-3 py-2">{row.best_rule_id || '-'}</td><td className="px-3 py-2">{fmtNum(row.best_simulated_net_r, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(row.best_delta_net_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.best_delta_net_r, 4)}</td><td className="px-3 py-2 text-amber-300">{fmtNum(row.avg_giveback_r, 4)}</td></tr>)}</tbody>
+              {byKind.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No signal-kind what-if grouping yet.</caption>}
+            </LedgerTable>
+
+            <LedgerTable title="Recent Trade What-If">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Kind</th><th className="px-3 py-2">Actual R</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Giveback</th><th className="px-3 py-2">Best Rule</th><th className="px-3 py-2">Best Sim R</th><th className="px-3 py-2">Delta</th><th className="px-3 py-2">Exit Reason</th></tr></thead>
+              <tbody>{trades.map((trade) => <tr key={`${trade.symbol}-${trade.exit_time}-${trade.best_rule_id_for_trade}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{trade.symbol}</td><td className="px-3 py-2">{trade.timeframe || '-'}</td><td className="px-3 py-2">{trade.signal_kind || '-'}</td><td className={`px-3 py-2 font-semibold ${Number(trade.actual_r || 0) > 0 ? 'text-emerald-300' : Number(trade.actual_r || 0) < 0 ? 'text-red-300' : 'text-slate-300'}`}>{fmtNum(trade.actual_r, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(trade.max_gain_r, 4)}</td><td className="px-3 py-2 text-amber-300">{fmtNum(trade.actual_giveback_r, 4)}</td><td className="px-3 py-2">{trade.best_rule_id_for_trade || '-'}</td><td className="px-3 py-2">{fmtNum(trade.best_simulated_r_for_trade, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(trade.best_delta_r_for_trade || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(trade.best_delta_r_for_trade, 4)}</td><td className="px-3 py-2">{trade.exit_reason || '-'}</td></tr>)}</tbody>
+              {trades.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No recent executor trade simulations.</caption>}
+            </LedgerTable>
+          </div>
+        </Card>;
+      }
+
+
+      function ExecutorExitShadowPanel({ payload, onRefresh }) {
+        const summary = payload?.summary || {};
+        const openRows = payload?.open_shadow_trades || [];
+        const closedRows = payload?.closed_shadow_results || [];
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const cards = [
+          ['Shadow Enabled', summary.shadow_enabled ? 'ON' : 'OFF', summary.shadow_enabled ? 'text-emerald-200' : 'text-slate-300'],
+          ['Policy', summary.shadow_policy || '-', 'text-cyan-200'],
+          ['Open Shadow', summary.open_shadow_count ?? 0, 'text-slate-100'],
+          ['Triggered', summary.triggered_open_count ?? 0, Number(summary.triggered_open_count || 0) > 0 ? 'text-amber-200' : 'text-slate-100'],
+          ['Shadow Net R', fmtNum(summary.shadow_net_r, 4), Number(summary.shadow_net_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+          ['Delta R', fmtNum(summary.shadow_delta_r, 4), Number(summary.shadow_delta_r || 0) >= 0 ? 'text-emerald-200' : 'text-red-200'],
+        ];
+        return <Card title="Executor Exit Shadow Mode" action={<button onClick={onRefresh} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh shadow</button>}>
+          <div className="space-y-5">
+            <p className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-3 py-2 text-xs font-semibold text-cyan-100">Shadow mode only — tracks what the candidate exit policy would do without changing trades.</p>
+            {!summary.shadow_enabled && <p className="rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs font-semibold text-amber-100">Shadow mode is disabled. Set EXECUTOR_EXIT_SHADOW_ENABLED=true to collect live shadow diagnostics.</p>}
+            <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+              {cards.map(([label, value, tone]) => <div key={label} className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
+                <p className={`mt-2 break-words text-xl font-black ${tone}`}>{value}</p>
+              </div>)}
+            </div>
+            <LedgerTable title="Open Shadow Trades">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">State</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Current R</th><th className="px-3 py-2">Shadow Floor</th><th className="px-3 py-2">Triggered</th><th className="px-3 py-2">Updated</th></tr></thead>
+              <tbody>{openRows.map((row, idx) => <tr key={`${row.symbol}-${row.updated_at}-${idx}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.symbol}</td><td className="px-3 py-2">{row.timeframe || '-'}</td><td className="px-3 py-2">{row.state || '-'}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(row.max_gain_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.exit_shadow_current_r, 4)}</td><td className="px-3 py-2 text-amber-300">{fmtNum(row.exit_shadow_floor_r, 4)}</td><td className={`px-3 py-2 font-semibold ${row.exit_shadow_triggered ? 'text-amber-300' : 'text-slate-400'}`}>{row.exit_shadow_triggered ? 'Yes' : 'No'}</td><td className="px-3 py-2">{row.updated_at || '-'}</td></tr>)}</tbody>
+              {openRows.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No open shadow diagnostics yet.</caption>}
+            </LedgerTable>
+            <LedgerTable title="Closed Shadow Results">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Actual R</th><th className="px-3 py-2">Shadow R</th><th className="px-3 py-2">Delta R</th><th className="px-3 py-2">Max R</th><th className="px-3 py-2">Exit Reason</th><th className="px-3 py-2">Exit Time</th></tr></thead>
+              <tbody>{closedRows.map((row, idx) => <tr key={`${row.symbol}-${row.exit_time}-${idx}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.symbol}</td><td className="px-3 py-2">{row.timeframe || '-'}</td><td className={`px-3 py-2 font-semibold ${Number(row.actual_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.actual_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.shadow_exit_r, 4)}</td><td className={`px-3 py-2 font-semibold ${Number(row.shadow_delta_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.shadow_delta_r, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(row.max_gain_r, 4)}</td><td className="px-3 py-2">{row.exit_reason || '-'}</td><td className="px-3 py-2">{row.exit_time || '-'}</td></tr>)}</tbody>
+              {closedRows.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No closed shadow results yet.</caption>}
+            </LedgerTable>
+          </div>
+        </Card>;
+      }
+
+
+      function ExecutorRegimePerformancePanel({ payload, onRefresh }) {
+        const byBtc = payload?.by_btc_regime || [];
+        const byMarket = payload?.by_market_regime || [];
+        const blocked = payload?.blocked_entries || {};
+        const blockedByMarket = blocked.by_market_regime || [];
+        const latest = blocked.latest || [];
+        const fmtNum = (value, digits = 4) => value === null || value === undefined || value === '' ? '-' : Number(value || 0).toFixed(digits);
+        const fmtPct = (value) => value === null || value === undefined ? '-' : `${(Number(value || 0) * 100).toFixed(1)}%`;
+        const fmtDate = (value) => value ? new Date(value).toLocaleString() : '-';
+        const PerfRows = ({ rows, keyName }) => <>
+          <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Regime</th><th className="px-3 py-2">Trades</th><th className="px-3 py-2">W/L/F</th><th className="px-3 py-2">Win Rate</th><th className="px-3 py-2">Net R</th><th className="px-3 py-2">Avg R</th><th className="px-3 py-2">PF</th><th className="px-3 py-2">Avg Max R</th><th className="px-3 py-2">Avg DD R</th></tr></thead>
+          <tbody>{rows.map((row) => <tr key={row[keyName]} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row[keyName]}</td><td className="px-3 py-2">{row.total_trades}</td><td className="px-3 py-2"><span className="text-emerald-300">{row.wins}</span>/<span className="text-red-300">{row.losses}</span>/{row.breakeven_or_flat}</td><td className="px-3 py-2">{fmtPct(row.win_rate)}</td><td className={`px-3 py-2 font-semibold ${Number(row.net_r || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>{fmtNum(row.net_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.avg_r, 4)}</td><td className="px-3 py-2">{fmtNum(row.profit_factor, 4)}</td><td className="px-3 py-2 text-emerald-300">{fmtNum(row.avg_max_gain_r, 4)}</td><td className="px-3 py-2 text-red-300">{fmtNum(row.avg_max_drawdown_r, 4)}</td></tr>)}</tbody>
+        </>;
+        return <Card title="Executor Performance by BTC Regime" action={<button onClick={onRefresh} className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20">Refresh regimes</button>}>
+          <div className="space-y-5">
+            <div className="grid gap-3 md:grid-cols-3">
+              <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3"><p className="text-xs uppercase tracking-wide text-slate-500">Closed Trades</p><p className="mt-2 text-2xl font-black">{payload?.summary?.total_closed_trades ?? 0}</p></div>
+              <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3"><p className="text-xs uppercase tracking-wide text-slate-500">Known BTC Regime</p><p className="mt-2 text-2xl font-black text-emerald-200">{payload?.summary?.known_btc_regime_trades ?? 0}</p></div>
+              <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-3"><p className="text-xs uppercase tracking-wide text-slate-500">Blocked by Market Regime</p><p className="mt-2 text-2xl font-black text-amber-200">{blocked.total_blocked ?? 0}</p></div>
+            </div>
+            <LedgerTable title="BTC Regime Performance"><PerfRows rows={byBtc} keyName="btc_regime" />{byBtc.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No BTC regime trades yet.</caption>}</LedgerTable>
+            <LedgerTable title="Market Regime Performance"><PerfRows rows={byMarket} keyName="market_regime" />{byMarket.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No market regime trades yet.</caption>}</LedgerTable>
+            <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3"><h3 className="mb-2 text-sm font-bold text-slate-200">Blocked by Market Regime</h3><div className="flex flex-wrap gap-2">{blockedByMarket.map((row) => <Badge key={row.market_regime} tone={Number(row.total || 0) > 0 ? 'amber' : 'slate'}>{row.market_regime}: {row.total}</Badge>)}</div></div>
+            <LedgerTable title="Latest Blocked Entries">
+              <thead className="bg-slate-900 text-xs uppercase tracking-wider text-slate-500"><tr><th className="px-3 py-2">Symbol</th><th className="px-3 py-2">TF</th><th className="px-3 py-2">Side</th><th className="px-3 py-2">Action</th><th className="px-3 py-2">Reason</th><th className="px-3 py-2">BTC</th><th className="px-3 py-2">Market</th><th className="px-3 py-2">Price</th><th className="px-3 py-2">Updated</th></tr></thead>
+              <tbody>{latest.map((row, idx) => <tr key={`${row.source}-${row.signal_key}-${idx}`} className="border-t border-slate-800"><td className="px-3 py-2 font-semibold">{row.symbol}</td><td className="px-3 py-2">{row.timeframe || '-'}</td><td className="px-3 py-2">{row.side || '-'}</td><td className="px-3 py-2">{row.action || '-'}</td><td className="px-3 py-2">{row.reason || '-'}</td><td className="px-3 py-2">{row.btc_regime || 'UNKNOWN'}</td><td className="px-3 py-2">{row.market_regime || 'UNKNOWN'}</td><td className="px-3 py-2">{fmtNum(row.price, 6)}</td><td className="px-3 py-2">{fmtDate(row.updated_at || row.created_at)}</td></tr>)}</tbody>
+              {latest.length === 0 && <caption className="caption-bottom p-4 text-left text-sm text-slate-500">No market-regime blocked entries yet.</caption>}
+            </LedgerTable>
+          </div>
+        </Card>;
+      }
+
+
+      function LedgerTable({ title, children }) {
+        return <div>
+          <h3 className="mb-2 text-sm font-bold text-slate-200">{title}</h3>
+          <div className="max-h-[520px] overflow-auto rounded-xl border border-slate-800">
+            <table className="min-w-full text-left text-sm">{children}</table>
+          </div>
+        </div>;
+      }
+
+
+      function SignalIntelligencePanel({ data, onRefresh }) {
+        const focusGroups = data?.focus_groups || {};
+        const configs = [
+          ['HIGH_POTENTIAL', 'HIGH POTENTIAL', 'green'],
+          ['EXECUTION_STABLE', 'EXECUTION STABLE', 'blue'],
+          ['EXPERIMENTAL', 'EXPERIMENTAL', 'amber'],
+          ['OTHER', 'OTHER', 'slate'],
+        ];
+        return <Card title="Signal Intelligence" action={<button onClick={onRefresh} className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-400/20">Refresh taxonomy</button>}>
+          <div className="space-y-4">
+            <p className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-3 py-2 text-xs font-semibold text-cyan-100">Profit potential is from offline backtest reports, not live trading.</p>
+            <ProfitPotentialPanel potential={data?.profit_potential || data?.high_potential_focus?.profit_potential || {}} />
+            <HighPotentialFocusPanel focus={data?.high_potential_focus || {}} />
+            <FocusComparisonCards rows={data?.high_potential_focus?.focus_group_comparison || []} />
+            <div className="grid gap-4 xl:grid-cols-2">
+              {configs.map(([key, title, tone]) => <SignalFocusGroupCard key={key} title={title} tone={tone} rows={focusGroups[key] || []} />)}
+            </div>
+          </div>
+        </Card>;
+      }
+
+
+      function ProfitPotentialPanel({ potential }) {
+        const fallbackKinds = ['ACCUMULATION_WATCH', 'ABSORPTION_ZONE', 'PRE_IMPULSE_ZONE', 'BREAKOUT_PRESSURE'];
+        const byKind = potential?.by_kind || {};
+        const rows = (potential?.key_kinds && potential.key_kinds.length > 0)
+          ? potential.key_kinds
+          : fallbackKinds.map((kind) => ({ kind, profit_potential: byKind[kind] || null }));
+        return <div className="overflow-auto rounded-xl border border-cyan-400/20 bg-cyan-400/5">
+          <div className="flex items-center justify-between bg-cyan-950/30 px-3 py-2">
+            <span className="text-sm font-bold text-cyan-100">Profit-backtest Potential</span>
+            <span className="text-xs text-cyan-200">{potential?.available ? 'offline report loaded' : 'no reports_profit_backtest data'}</span>
+          </div>
+          <table className="min-w-full text-left text-xs">
+            <thead className="bg-slate-900/60 text-slate-500">
+              <tr>
+                <th className="px-2 py-2">Kind</th>
+                <th className="px-2 py-2">Potential avg %</th>
+                <th className="px-2 py-2">Hit 10%</th>
+                <th className="px-2 py-2">Hit 20%</th>
+                <th className="px-2 py-2">Hit 50%</th>
+                <th className="px-2 py-2">Potential $ on $10 stake</th>
+                <th className="px-2 py-2">First-touch $</th>
+              </tr>
+            </thead>
+            <tbody>{rows.map((row) => {
+              const metrics = row.profit_potential || byKind[row.kind] || null;
+              return <tr key={row.kind} className="border-t border-slate-800">
+                <td className="px-2 py-2 font-semibold text-cyan-100">{row.kind}</td>
+                <td className="px-2 py-2">{fmtPotentialPct(metrics?.avg_max_gain_pct)}</td>
+                <td className="px-2 py-2">{fmtPotentialShare(metrics?.hit_10_pct_share)}</td>
+                <td className="px-2 py-2">{fmtPotentialShare(metrics?.hit_20_pct_share)}</td>
+                <td className="px-2 py-2">{fmtPotentialShare(metrics?.hit_50_pct_share)}</td>
+                <td className="px-2 py-2 text-emerald-200">{fmtPotentialUsd(metrics?.avg_potential_profit_usd)}</td>
+                <td className="px-2 py-2 text-amber-200">{fmtPotentialUsd(metrics?.first_touch_avg_profit_usd)}</td>
+              </tr>;
+            })}</tbody>
+          </table>
+        </div>;
+      }
+
+      function HighPotentialFocusPanel({ focus }) {
+        const priority = ['ACCUMULATION_WATCH', 'ABSORPTION_ZONE', 'PRE_IMPULSE_ZONE'];
+        const rows = [...(focus?.by_kind || [])].sort((a, b) => priority.indexOf(a.kind) - priority.indexOf(b.kind));
+        return <div className="overflow-auto rounded-xl border border-emerald-400/20 bg-emerald-400/5">
+          <div className="flex items-center justify-between bg-emerald-950/40 px-3 py-2">
+            <span className="text-sm font-bold text-emerald-100">High Potential Focus</span>
+            <span className="text-xs text-emerald-200">diagnostics only · no trading changes</span>
+          </div>
+          <table className="min-w-full text-left text-xs">
+            <thead className="bg-slate-900/60 text-slate-500">
+              <tr>
+                <th className="px-2 py-2">Kind</th><th className="px-2 py-2">Total</th><th className="px-2 py-2">TP2 / SL / exp</th><th className="px-2 py-2">TP2%</th><th className="px-2 py-2">Score max</th><th className="px-2 py-2">Max gain</th><th className="px-2 py-2">Drawdown</th><th className="px-2 py-2">Recommendation</th>
+              </tr>
+            </thead>
+            <tbody>{rows.map((row) => <tr key={row.kind} className="border-t border-slate-800">
+              <td className="px-2 py-2 font-semibold text-emerald-100">{row.kind}</td>
+              <td className="px-2 py-2">{row.total}</td>
+              <td className="px-2 py-2"><span className="text-emerald-300">{row.tp2}</span> / <span className="text-red-300">{row.sl}</span> / <span className="text-slate-400">{row.expired}</span></td>
+              <td className="px-2 py-2">{Number(row.tp2_rate_closed_pct || 0).toFixed(1)}%</td>
+              <td className="px-2 py-2">{Number(row.avg_score_max || 0).toFixed(2)}</td>
+              <td className="px-2 py-2">{Number(row.avg_max_gain_pct || 0).toFixed(2)}%</td>
+              <td className="px-2 py-2">{Number(row.avg_max_drawdown_pct || 0).toFixed(2)}%</td>
+              <td className="px-2 py-2 text-amber-200">{row.recommended_management || row.recommendation || '-'}</td>
+            </tr>)}</tbody>
+          </table>
+          {rows.length === 0 && <p className="p-3 text-xs text-slate-500">No high-potential diagnostics yet.</p>}
+        </div>;
+      }
+
+      function FocusComparisonCards({ rows }) {
+        const byGroup = Object.fromEntries((rows || []).map((row) => [row.signal_focus_group, row]));
+        return <div className="grid gap-3 md:grid-cols-3">
+          {['HIGH_POTENTIAL', 'EXECUTION_STABLE', 'EXPERIMENTAL'].map((group) => {
+            const row = byGroup[group] || { total: 0, tp2: 0, sl: 0, expired: 0, tp2_rate_closed_pct: 0, avg_max_gain_pct: 0, recommended_management: '-' };
+            return <div key={group} className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-500">{group}</p>
+              <div className="mt-2 flex items-end justify-between"><span className="text-2xl font-bold">{row.total}</span><span className="text-xs text-slate-400">TP2 {Number(row.tp2_rate_closed_pct || 0).toFixed(1)}%</span></div>
+              <p className="mt-1 text-xs text-slate-400">TP2/SL/exp: {row.tp2}/{row.sl}/{row.expired}</p>
+              <p className="mt-1 text-xs text-amber-200">{row.recommended_management}</p>
+            </div>;
+          })}
+        </div>;
+      }
+
+      function SignalFocusGroupCard({ title, tone, rows }) {
+        const sortedRows = [...rows].sort((a, b) => {
+          const priority = ['ACCUMULATION_WATCH', 'ABSORPTION_ZONE', 'PRE_IMPULSE_ZONE'];
+          const pa = priority.indexOf(a.kind);
+          const pb = priority.indexOf(b.kind);
+          if (pa !== -1 || pb !== -1) return (pa === -1 ? 99 : pa) - (pb === -1 ? 99 : pb);
+          return (b.total || 0) - (a.total || 0);
+        });
+        return <div className="overflow-auto rounded-xl border border-slate-800">
+          <div className="flex items-center justify-between bg-slate-900 px-3 py-2">
+            <span className="text-sm font-bold">{title}</span>
+            <Badge tone={tone}>{rows.reduce((sum, row) => sum + Number(row.total || 0), 0)} signals</Badge>
+          </div>
+          <table className="min-w-full text-left text-xs">
+            <thead className="bg-slate-900/50 text-slate-500">
+              <tr>
+                <th className="px-2 py-2">Kind</th>
+                <th className="px-2 py-2">Family</th>
+                <th className="px-2 py-2">TF</th>
+                <th className="px-2 py-2">Src</th>
+                <th className="px-2 py-2">Total</th>
+                <th className="px-2 py-2">TP2</th>
+                <th className="px-2 py-2">SL</th>
+                <th className="px-2 py-2">EXP</th>
+                <th className="px-2 py-2">TP2%</th>
+                <th className="px-2 py-2">Score</th>
+                <th className="px-2 py-2">MFE/MAE</th>
+                <th className="px-2 py-2">Mgmt</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedRows.map((row, idx) => <tr key={`${row.kind}-${row.timeframe}-${row.source}-${idx}`} className="border-t border-slate-800">
+                <td className="px-2 py-2 font-semibold text-slate-200">{row.kind}</td>
+                <td className="px-2 py-2 text-slate-400">{row.signal_family}</td>
+                <td className="px-2 py-2">{row.timeframe}</td>
+                <td className="px-2 py-2">{row.source}</td>
+                <td className="px-2 py-2">{row.total}</td>
+                <td className="px-2 py-2 text-emerald-300">{row.tp2}</td>
+                <td className="px-2 py-2 text-red-300">{row.sl}</td>
+                <td className="px-2 py-2 text-slate-400">{row.expired}</td>
+                <td className="px-2 py-2">{Number(row.tp2_rate_closed_pct || 0).toFixed(1)}%</td>
+                <td className="px-2 py-2">{Number(row.avg_score_last || 0).toFixed(2)} / {Number(row.avg_score_max || 0).toFixed(2)}</td>
+                <td className="px-2 py-2">{Number(row.avg_max_gain_pct || 0).toFixed(2)}% / {Number(row.avg_max_drawdown_pct || 0).toFixed(2)}%</td>
+                <td className="px-2 py-2 text-amber-200">{row.recommended_management || '-'}</td>
+              </tr>)}
+            </tbody>
+          </table>
+          {rows.length === 0 && <p className="p-3 text-xs text-slate-500">No signal kind rows yet.</p>}
+        </div>;
+      }
+
+      function SetupPerformancePanel({ perf, onRefresh }) {
+        return <Card title="Setup Performance (signals.db)" action={<button onClick={onRefresh} className="rounded-full border border-indigo-400/30 bg-indigo-400/10 px-3 py-1 text-xs font-semibold text-indigo-200 hover:bg-indigo-400/20">Refresh performance</button>}>
+          <div className="grid gap-4 lg:grid-cols-3">
+            <BreakdownMini title="By reason" labelKey="reason" rows={perf?.by_reason || []} />
+            <BreakdownMini title="By score bucket" labelKey="score_bucket" rows={perf?.by_score_bucket || []} />
+            <BreakdownMini title="By timeframe" labelKey="timeframe" rows={perf?.by_timeframe || []} />
+            <BreakdownMini title="By kind" labelKey="kind" rows={perf?.by_kind || []} />
+            <BreakdownMini title="By source" labelKey="source" rows={perf?.by_source || []} />
+            <BreakdownMini title="By family" labelKey="family" rows={perf?.by_family || []} />
+            <BreakdownMini title="By focus" labelKey="focus_group" rows={perf?.by_focus_group || []} />
+          </div>
+        </Card>;
+      }
+
+      function BreakdownMini({ title, labelKey, rows }) {
+        return <div className="overflow-auto rounded-xl border border-slate-800">
+          <div className="bg-slate-900 px-3 py-2 text-sm font-bold">{title}</div>
+          <table className="min-w-full text-left text-xs">
+            <thead className="bg-slate-900/50 text-slate-500">
+              <tr>
+                <th className="px-2 py-2">{labelKey}</th>
+                <th className="px-2 py-2">total</th>
+                <th className="px-2 py-2">TP</th>
+                <th className="px-2 py-2">SL</th>
+                <th className="px-2 py-2">win%</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.slice(0, 12).map((row, idx) => <tr key={`${row[labelKey]}-${idx}`} className="border-t border-slate-800">
+                <td className="px-2 py-2">{row[labelKey]}</td>
+                <td className="px-2 py-2">{row.total}</td>
+                <td className="px-2 py-2">{row.tp}</td>
+                <td className="px-2 py-2">{row.sl}</td>
+                <td className="px-2 py-2">{Number(row.win_rate || 0).toFixed(1)}%</td>
+              </tr>)}
+            </tbody>
+          </table>
+          {rows.length === 0 && <p className="p-3 text-xs text-slate-500">No performance rows yet.</p>}
+        </div>;
+      }
+
+      function BreakdownTable({ title, rows, labelKey }) {
+        return <div className="overflow-auto rounded-xl border border-slate-800">
+          <div className="bg-slate-900 px-3 py-2 text-sm font-bold">{title}</div>
+          <table className="min-w-full text-left text-xs">
+            <thead className="text-slate-500"><tr><th className="px-3 py-2">Name</th><th className="px-3 py-2">N</th><th className="px-3 py-2">WR</th><th className="px-3 py-2">Avg R</th></tr></thead>
+            <tbody>{rows.slice(0, 8).map((row) => <tr key={row[labelKey]} className="border-t border-slate-800"><td className="px-3 py-2">{row[labelKey]}</td><td className="px-3 py-2">{row.total}</td><td className="px-3 py-2">{((row.win_rate || 0) * 100).toFixed(1)}%</td><td className="px-3 py-2">{row.avg_r}</td></tr>)}</tbody>
+          </table>
+          {rows.length === 0 && <p className="p-3 text-xs text-slate-500">No data</p>}
+        </div>;
+      }
+
+      function CoinAnalytics({ coin }) {
+        const rows = [
+          ['Market Cap', coin.market_cap_usd ? fmtUsd(coin.market_cap_usd) : 'N/A from Bybit'], ['24h Volume', fmtUsd(coin.volume_24h_usd)], ['Money Inflow 1h', fmtUsd(coin.money_inflow_1h_usd)], ['Money Inflow 4h', fmtUsd(coin.money_inflow_4h_usd)], ['Money Inflow 24h', fmtUsd(coin.money_inflow_24h_usd)], ['CEX Netflow', coin.cex_netflow_usd ? fmtUsd(coin.cex_netflow_usd) : 'N/A from Bybit'], ['Whale Activity', coin.whale_activity], ['Accumulation Score', coin.accumulation_score], ['Orderbook Imbalance', coin.orderbook_imbalance], ['RSI', coin.rsi], ['ATR%', coin.atr_pct], ['EMA20 / EMA50 / EMA200', `${coin.ema20} / ${coin.ema50} / ${coin.ema200}`], ['Volume Spike', coin.volume_spike], ['Support / Resistance', `${coin.support} / ${coin.resistance}`],
+        ];
+        return <div><h3 className="mb-3 text-2xl font-black">{coin.symbol}</h3><div className="grid gap-2 sm:grid-cols-2">{rows.map(([k, v]) => <div key={k} className="rounded-xl bg-slate-900/70 p-3"><p className="text-xs text-slate-500">{k}</p><p className="font-bold">{v}</p></div>)}</div><div className="mt-4 rounded-xl border border-cyan-400/20 bg-cyan-400/10 p-4"><p className="text-xs uppercase tracking-widest text-cyan-300">Bot Verdict</p><p className="mt-1 text-slate-200">{coin.bot_verdict}</p></div></div>;
+      }
+
+      function Health({ status }) {
+        const items = [['Scanner', status.scanner], ['Executor', status.executor], ['Telegram', status.telegram], ['X', status.x_delivery], ['Bybit API', status.bybit_api], ['Binance API', status.binance_api], ['Database', status.database], ['Redis', status.redis], ['Rate-limit', status.rate_limit]];
+        return <div className="space-y-2"><h3 className="font-semibold">Bot Health</h3>{items.map(([k, v]) => <div key={k} className="flex justify-between rounded-lg bg-slate-900/70 px-3 py-2 text-sm"><span className="text-slate-400">{k}</span><b>{v}</b></div>)}</div>;
+      }
+
+export default App;
