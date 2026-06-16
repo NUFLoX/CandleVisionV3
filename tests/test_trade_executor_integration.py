@@ -203,6 +203,26 @@ def set_learning_gate_env(monkeypatch, **overrides) -> None:
         monkeypatch.setenv(key, value)
 
 
+def set_forward_tracking_env(monkeypatch, **overrides) -> None:
+    values = {
+        "SIGNAL_FORWARD_TRACKING_ENABLED": "true",
+        "SIGNAL_FORWARD_TRACKING_HOURS": "72",
+        "SIGNAL_FORWARD_TARGETS_PCT": "3,5,10,15",
+        "EXECUTOR_EARLY_BREAKOUT_ENTRY": "true",
+        "EXECUTOR_EARLY_BREAKOUT_MAX_RETEST_BPS": "35",
+        "EXECUTOR_EARLY_BREAKOUT_MIN_HOLD_BARS": "1",
+        "EXECUTOR_EARLY_BREAKOUT_REQUIRE_VOLUME_NOT_DEAD": "true",
+        "EXECUTOR_LATE_CHASE_GATE": "true",
+        "EXECUTOR_MAX_ENTRY_DISTANCE_FROM_SIGNAL_BPS": "120",
+        "EXECUTOR_MAX_ENTRY_DISTANCE_FROM_RANGE_HIGH_BPS": "60",
+        "EXECUTOR_MAX_MISSED_MOVE_BEFORE_ENTRY_PCT": "5.0",
+        "EXECUTOR_LATE_CHASE_LOOKBACK_MINUTES": "240",
+    }
+    values.update({key: str(value) for key, value in overrides.items()})
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+
 def add_closed_executor_trade(
     store: SignalStore,
     idx: int,
@@ -444,6 +464,249 @@ def test_learning_gate_disabled_restores_entry_behavior(tmp_path: Path, monkeypa
     assert row["action"] == "ENTER_LONG"
     diagnostics = json.loads(row["diagnostics_json"])
     assert "learning_gate_enabled" not in diagnostics
+    runner.signal_store.close()
+
+
+def test_signal_forward_outcome_tracks_blocked_early_signal_to_10pct(tmp_path: Path, monkeypatch) -> None:
+    set_forward_tracking_env(monkeypatch, EXECUTOR_EARLY_BREAKOUT_ENTRY="false")
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    signal = make_signal(
+        kind="BREAKOUT_PRESSURE",
+        score=9.0,
+        reasons=["BREAKOUT_PRESSURE"],
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_NEUTRAL",
+            "range_high": 101.0,
+            "range_low": 98.5,
+            "executor_snapshot": make_snapshot(price=100.0, resistance=101.0),
+        },
+    )
+    key = signal_key(signal)
+
+    runner._process_paper_executor(signal, "linear", "BREAKOUT_PRESSURE")
+    signal.meta["executor_snapshot"] = make_snapshot(price=110.0, resistance=101.0)
+    runner._process_paper_executor(signal, "linear", "BREAKOUT_PRESSURE")
+
+    row = runner.signal_store.get_signal_forward_outcome(key)
+    assert row is not None
+    assert row["executor_block_reason"] == "executor_not_processed_signal_status"
+    assert row["max_forward_gain_pct"] >= 10.0
+    assert row["hit_10pct"] == 1
+    assert row_count(runner.signal_store) == 0
+    runner.signal_store.close()
+
+
+def test_missed_signal_forward_stats_are_added_to_future_executor_decisions(tmp_path: Path, monkeypatch) -> None:
+    set_forward_tracking_env(monkeypatch, EXECUTOR_EARLY_BREAKOUT_ENTRY="false", EXECUTOR_LATE_CHASE_GATE="false")
+    runner = make_runner(tmp_path)
+    old_signal = make_signal(
+        kind="BREAKOUT_PRESSURE",
+        score=9.0,
+        reasons=["BREAKOUT_PRESSURE"],
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "range_high": 101.0,
+            "range_low": 99.0,
+            "executor_snapshot": make_snapshot(price=107.0, resistance=101.0),
+        },
+    )
+    runner._record_signal_forward_outcome(
+        signal_key(old_signal),
+        old_signal,
+        status="BREAKOUT_PRESSURE",
+        snapshot=runner._paper_executor_snapshot(old_signal)[0],
+        executor_block_reason="entry_blocked_buy_flow",
+    )
+    signal = make_signal(meta={"tf": "5", "market": "linear", "executor_snapshot": make_snapshot()})
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert diagnostics["missed_signal_memory_enabled"] is True
+    assert diagnostics["missed_signal_similar_count"] == 1
+    assert diagnostics["missed_signal_positive_count"] == 1
+    assert diagnostics["missed_signal_best_forward_gain_pct"] >= 7.0
+    assert diagnostics["missed_signal_common_block_reasons"] == ["entry_blocked_buy_flow"]
+    runner.signal_store.close()
+
+
+def test_early_breakout_retest_can_enter_before_late_volume_spike(tmp_path: Path, monkeypatch) -> None:
+    set_forward_tracking_env(monkeypatch, EXECUTOR_LATE_CHASE_GATE="false")
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    signal = make_signal(
+        kind="BREAKOUT_PRESSURE",
+        score=9.0,
+        reasons=["BREAKOUT_PRESSURE"],
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_NEUTRAL",
+            "range_high": 100.5,
+            "range_low": 99.0,
+            "executor_snapshot": make_snapshot(
+                price=100.6,
+                resistance=100.5,
+                buy_flow=105.0,
+                sell_flow=100.0,
+                volume_impulse=0.9,
+                bars_since_entry=1,
+            ),
+        },
+    )
+
+    runner._process_paper_executor(signal, "linear", "BREAKOUT_PRESSURE")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row["action"] == "ENTER_LONG"
+    assert row["reason"] == "entry_allowed_early_breakout_retest"
+    assert diagnostics["early_breakout_entry_allowed"] is True
+    assert diagnostics["early_breakout_volume_not_dead"] is True
+    runner.signal_store.close()
+
+
+def test_late_chase_blocks_entry_when_too_far_above_signal_or_range(tmp_path: Path, monkeypatch) -> None:
+    set_forward_tracking_env(monkeypatch)
+    runner = make_runner(tmp_path)
+    signal = make_signal(
+        kind="BREAKOUT_PRESSURE",
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_NEUTRAL",
+            "original_signal_price": 100.0,
+            "range_high": 101.0,
+            "executor_snapshot": make_snapshot(price=103.0, resistance=104.0, buy_flow=170.0, sell_flow=90.0, volume_impulse=1.6),
+        },
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row["action"] == "WATCH"
+    assert row["reason"] == "entry_blocked_late_chase_distance"
+    assert diagnostics["entry_blocked_late_chase"] is True
+    assert diagnostics["distance_from_signal_bps"] > 120.0
+    runner.signal_store.close()
+
+
+def test_late_chase_blocks_entry_when_missed_forward_gain_exceeds_threshold(tmp_path: Path, monkeypatch) -> None:
+    set_forward_tracking_env(monkeypatch, EXECUTOR_MAX_ENTRY_DISTANCE_FROM_SIGNAL_BPS="200")
+    runner = make_runner(tmp_path)
+    missed = make_signal(
+        kind="BREAKOUT_PRESSURE",
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "range_high": 101.0,
+            "range_low": 99.0,
+            "executor_snapshot": make_snapshot(price=106.0, resistance=101.0),
+        },
+    )
+    runner._record_signal_forward_outcome(
+        signal_key(missed),
+        missed,
+        status="BREAKOUT_PRESSURE",
+        snapshot=runner._paper_executor_snapshot(missed)[0],
+        executor_block_reason="entry_blocked_volume_impulse",
+    )
+    signal = make_signal(
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "executor_snapshot": make_snapshot(price=101.1, resistance=102.0, buy_flow=160.0, sell_flow=90.0, volume_impulse=1.5),
+        }
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row["action"] == "WATCH"
+    assert row["reason"] == "entry_blocked_late_chase_missed_move"
+    assert diagnostics["missed_forward_gain_pct"] >= 5.0
+    runner.signal_store.close()
+
+
+def test_distribution_risk_after_impulse_blocks_entry(tmp_path: Path, monkeypatch) -> None:
+    set_forward_tracking_env(monkeypatch)
+    runner = make_runner(tmp_path)
+    signal = make_signal(
+        kind="BREAKOUT_PRESSURE",
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "btc_regime": "BTC_NEUTRAL",
+            "original_signal_price": 100.0,
+            "range_high": 100.8,
+            "upper_wick_ratio": 0.65,
+            "repeated_resistance_retests": 3,
+            "sell_flow_dominance_after_breakout": True,
+            "buy_flow_decelerating": True,
+            "executor_snapshot": make_snapshot(
+                price=101.0,
+                resistance=102.0,
+                buy_flow=170.0,
+                sell_flow=90.0,
+                volume_impulse=1.6,
+            ),
+        },
+    )
+
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row["action"] == "WATCH"
+    assert row["reason"] == "entry_blocked_distribution_risk_after_impulse"
+    assert diagnostics["upper_wick_ratio_high"] is True
+    assert diagnostics["repeated_resistance_retests_after_impulse"] is True
+    assert diagnostics["sell_flow_dominance_after_breakout"] is True
+    runner.signal_store.close()
+
+
+def test_disabling_forward_tracking_flags_restores_old_behavior(tmp_path: Path, monkeypatch) -> None:
+    set_forward_tracking_env(
+        monkeypatch,
+        SIGNAL_FORWARD_TRACKING_ENABLED="false",
+        EXECUTOR_EARLY_BREAKOUT_ENTRY="false",
+        EXECUTOR_LATE_CHASE_GATE="false",
+    )
+    runner = make_runner(tmp_path, enabled=True, mode="paper")
+    early = make_signal(
+        kind="BREAKOUT_PRESSURE",
+        score=9.0,
+        reasons=["BREAKOUT_PRESSURE"],
+        meta={"tf": "5", "market": "linear", "range_high": 100.5, "executor_snapshot": make_snapshot(price=100.6, resistance=100.5)},
+    )
+
+    runner._process_paper_executor(early, "linear", "BREAKOUT_PRESSURE")
+
+    assert row_count(runner.signal_store) == 0
+    assert runner.signal_store.get_signal_forward_outcome(signal_key(early)) is None
+
+    signal = make_signal(
+        kind="BREAKOUT_PRESSURE",
+        meta={
+            "tf": "5",
+            "market": "linear",
+            "original_signal_price": 100.0,
+            "range_high": 101.0,
+            "executor_snapshot": make_snapshot(price=103.0, resistance=104.0, buy_flow=170.0, sell_flow=90.0, volume_impulse=1.6),
+        },
+    )
+    runner._process_paper_executor(signal, "linear", "CONFIRMED_LONG")
+
+    row = runner.signal_store.get_executor_outcome(signal_key(signal))
+    diagnostics = json.loads(row["diagnostics_json"])
+    assert row["action"] == "ENTER_LONG"
+    assert "late_chase_gate_enabled" not in diagnostics
+    assert "missed_signal_memory_enabled" not in diagnostics
     runner.signal_store.close()
 
 
