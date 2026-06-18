@@ -115,6 +115,13 @@ class SmartTradeExecutor:
         management_policy: str = MANAGEMENT_POLICY_LEGACY,
         protect_after_1r: bool = False,
         min_protected_r_after_1r: float = 0.25,
+        soft_orderflow_exit_min_r: float = 0.25,
+        soft_orderflow_exit_min_bars: int = 2,
+        structural_trailing_enabled: bool = True,
+        structural_trailing_start_r: float = 0.5,
+        structural_trailing_buffer_bps: float = 15.0,
+        structural_trailing_min_lock_r: float = 0.25,
+        nearest_structure_sl_enabled: bool = True,
         absorption_flow_ratio: float = 1.15,
         trade_executor_mode: str = "paper",
         testnet_volume_impulse_relaxation: float = 0.85,
@@ -146,6 +153,13 @@ class SmartTradeExecutor:
         self.management_policy = str(management_policy or MANAGEMENT_POLICY_LEGACY).strip().lower()
         self.protect_after_1r = bool(protect_after_1r)
         self.min_protected_r_after_1r = max(float(min_protected_r_after_1r), 0.0)
+        self.soft_orderflow_exit_min_r = max(float(soft_orderflow_exit_min_r), 0.0)
+        self.soft_orderflow_exit_min_bars = max(int(soft_orderflow_exit_min_bars), 0)
+        self.structural_trailing_enabled = bool(structural_trailing_enabled)
+        self.structural_trailing_start_r = max(float(structural_trailing_start_r), 0.0)
+        self.structural_trailing_buffer_bps = max(float(structural_trailing_buffer_bps), 0.0)
+        self.structural_trailing_min_lock_r = max(float(structural_trailing_min_lock_r), 0.0)
+        self.nearest_structure_sl_enabled = bool(nearest_structure_sl_enabled)
 
     def evaluate_entry(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> TradeDecision:
         if setup.side == BUY:
@@ -294,7 +308,9 @@ class SmartTradeExecutor:
         if position.state == EXITED:
             return TradeDecision(HOLD, "position_already_exited", EXITED, position)
 
+        position = self._normalize_protection_state(position)
         updated = self._refresh_position_metrics(position, snapshot)
+        updated = self._apply_structural_trailing_stop(updated, snapshot)
         updated, management_exit_reason = self._apply_management_v2(updated, snapshot)
         if management_exit_reason is not None:
             exited = replace(
@@ -556,6 +572,83 @@ class SmartTradeExecutor:
             bars_in_trade=bars_in_trade,
         )
 
+    def _stop_protects_breakeven(self, position: TradePosition) -> bool:
+        if position.side == BUY:
+            return float(position.current_sl) >= float(position.entry_price)
+        if position.side == SELL:
+            return float(position.current_sl) <= float(position.entry_price)
+        return False
+
+    def _normalize_protection_state(self, position: TradePosition) -> TradePosition:
+        if position.state in {PROTECT_BREAKEVEN, TRAILING_PROFIT} and not self._stop_protects_breakeven(position):
+            return replace(position, state=ENTERED)
+        return position
+
+    def _apply_structural_trailing_stop(self, position: TradePosition, snapshot: OrderflowSnapshot) -> TradePosition:
+        """Step-lock profit based on observed Max R distribution.
+
+        The historical executor table shows many trades reach 0.25R-0.70R and
+        then revert to stop. This logic protects profit earlier instead of
+        waiting for 1R.
+        """
+        if not getattr(self, "structural_trailing_enabled", False):
+            return position
+
+        max_gain_r = float(position.max_gain_r or 0.0)
+        current_sl = float(position.current_sl)
+        price = float(snapshot.price)
+
+        # Step lock table:
+        # reached R -> protected R
+        lock_r = None
+        if max_gain_r >= 1.00:
+            lock_r = 0.50
+        elif max_gain_r >= 0.85:
+            lock_r = 0.45
+        elif max_gain_r >= 0.65:
+            lock_r = 0.30
+        elif max_gain_r >= 0.50:
+            lock_r = 0.15
+        elif max_gain_r >= 0.25:
+            lock_r = 0.00
+
+        candidate_sl: float | None = None
+
+        if lock_r is not None:
+            if position.side == BUY:
+                candidate_sl = position.entry_price + lock_r * position.initial_risk
+            elif position.side == SELL:
+                candidate_sl = position.entry_price - lock_r * position.initial_risk
+
+        # Also respect nearest structural wall when it improves protection.
+        buffer = getattr(self, "structural_trailing_buffer_bps", 15.0) / 10000.0
+
+        if position.side == BUY:
+            if snapshot.support is not None:
+                support_sl = float(snapshot.support) * (1.0 - buffer)
+                if support_sl < price:
+                    candidate_sl = max(candidate_sl, support_sl) if candidate_sl is not None else support_sl
+
+            # Never move SL down for Buy.
+            if candidate_sl is not None and candidate_sl > current_sl and candidate_sl < price:
+                return replace(position, current_sl=candidate_sl, state=TRAILING_PROFIT)
+
+            return position
+
+        if position.side == SELL:
+            if snapshot.resistance is not None:
+                resistance_sl = float(snapshot.resistance) * (1.0 + buffer)
+                if resistance_sl > price:
+                    candidate_sl = min(candidate_sl, resistance_sl) if candidate_sl is not None else resistance_sl
+
+            # Never move SL up for Sell.
+            if candidate_sl is not None and candidate_sl < current_sl and candidate_sl > price:
+                return replace(position, current_sl=candidate_sl, state=TRAILING_PROFIT)
+
+            return position
+
+        return position
+
     def _apply_management_v2(
         self, position: TradePosition, snapshot: OrderflowSnapshot
     ) -> tuple[TradePosition, Optional[str]]:
@@ -644,6 +737,24 @@ class SmartTradeExecutor:
             return min(position.current_sl, position.entry_price * self.sell_fee_buffer_multiplier)
         raise ValueError(f"unsupported side: {position.side}")
 
+    def _soft_orderflow_exit_allowed(self, position: TradePosition, snapshot: OrderflowSnapshot) -> bool:
+        """Allow sell-flow / wall-pressure exits only after enough profit/time.
+
+        Stop-loss remains hard and immediate. This guard prevents tiny-profit exits
+        caused by one temporary orderflow spike right after entry.
+        """
+        bars_since_entry = snapshot.bars_since_entry if snapshot.bars_since_entry is not None else position.bars_in_trade
+        if bars_since_entry < self.soft_orderflow_exit_min_bars:
+            return False
+
+        current_r = self._current_unrealized_r(
+            position.side,
+            position.entry_price,
+            float(snapshot.price),
+            position.initial_risk,
+        )
+        return current_r >= self.soft_orderflow_exit_min_r
+
     def _exit_reason(self, position: TradePosition, snapshot: OrderflowSnapshot) -> Optional[str]:
         bars_since_entry = snapshot.bars_since_entry if snapshot.bars_since_entry is not None else position.bars_in_trade
         price = float(snapshot.price)
@@ -651,10 +762,13 @@ class SmartTradeExecutor:
         if position.side == BUY:
             if price <= position.current_sl:
                 return "exit_stop_loss_hit"
+
+            soft_exit_allowed = self._soft_orderflow_exit_allowed(position, snapshot)
             if snapshot.sell_flow > snapshot.buy_flow * self.strong_reversal_ratio:
-                return "exit_sell_flow_dominance"
+                return "exit_sell_flow_dominance" if soft_exit_allowed else None
             if snapshot.ask_wall_strength >= self.strong_wall_exit_threshold and snapshot.buy_flow < snapshot.sell_flow:
-                return "exit_ask_wall_pressure"
+                return "exit_ask_wall_pressure" if soft_exit_allowed else None
+
             if snapshot.support is not None and price < snapshot.support and bars_since_entry >= 2:
                 return "exit_lost_support"
             if snapshot.ema20 is not None and price < snapshot.ema20 and snapshot.sell_flow > snapshot.buy_flow:
@@ -664,10 +778,13 @@ class SmartTradeExecutor:
         if position.side == SELL:
             if price >= position.current_sl:
                 return "exit_stop_loss_hit"
+
+            soft_exit_allowed = self._soft_orderflow_exit_allowed(position, snapshot)
             if snapshot.buy_flow > snapshot.sell_flow * self.strong_reversal_ratio:
-                return "exit_buy_flow_dominance"
+                return "exit_buy_flow_dominance" if soft_exit_allowed else None
             if snapshot.bid_wall_strength >= self.strong_wall_exit_threshold and snapshot.sell_flow < snapshot.buy_flow:
-                return "exit_bid_wall_pressure"
+                return "exit_bid_wall_pressure" if soft_exit_allowed else None
+
             if snapshot.resistance is not None and price > snapshot.resistance and bars_since_entry >= 2:
                 return "exit_lost_resistance"
             if snapshot.ema20 is not None and price > snapshot.ema20 and snapshot.buy_flow > snapshot.sell_flow:

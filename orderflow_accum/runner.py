@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import asyncio
 import fnmatch
 import json
 import logging
 import os
+import dataclasses
+import sqlite3
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -195,6 +199,13 @@ class AccumulationRunner:
             management_policy=self._resolve_executor_management_policy(),
             protect_after_1r=self._env_bool("EXECUTOR_PROTECT_AFTER_1R", False),
             min_protected_r_after_1r=self._env_float("EXECUTOR_MIN_PROTECTED_R_AFTER_1R", 0.25),
+            soft_orderflow_exit_min_r=self._env_float("EXECUTOR_SOFT_ORDERFLOW_EXIT_MIN_R", 0.25),
+            soft_orderflow_exit_min_bars=self._env_int("EXECUTOR_SOFT_ORDERFLOW_EXIT_MIN_BARS", 2),
+            structural_trailing_enabled=self._env_bool("EXECUTOR_STRUCTURAL_TRAILING_ENABLED", True),
+            structural_trailing_start_r=self._env_float("EXECUTOR_STRUCTURAL_TRAILING_START_R", 0.5),
+            structural_trailing_buffer_bps=self._env_float("EXECUTOR_STRUCTURAL_TRAILING_BUFFER_BPS", 15.0),
+            structural_trailing_min_lock_r=self._env_float("EXECUTOR_STRUCTURAL_TRAILING_MIN_LOCK_R", 0.25),
+            nearest_structure_sl_enabled=self._env_bool("EXECUTOR_NEAREST_STRUCTURE_SL_ENABLED", True),
         )
 
     def _executor_learning_gate(self) -> ExecutorLearningGate:
@@ -1135,6 +1146,89 @@ class AccumulationRunner:
         context = self._testnet_observation_entry_context(signal, confirmed_status)
         return bool(context.get("testnet_observation_entry_candidate")), context
 
+    def _executor_allowed_sides(self) -> set[str]:
+        raw = os.getenv("EXECUTOR_ALLOWED_SIDES", "Buy,Sell")
+        allowed: set[str] = set()
+        for item in raw.split(","):
+            side = item.strip().lower()
+            if side in {"buy", "long"}:
+                allowed.add("Buy")
+            elif side in {"sell", "short"}:
+                allowed.add("Sell")
+        return allowed or {"Buy", "Sell"}
+
+    def _executor_side_allowed(self, side: str) -> bool:
+        return str(side) in self._executor_allowed_sides()
+
+    def _executor_buy_momentum_symbol_blocked(self, symbol: str) -> bool:
+        raw = os.getenv(
+            "EXECUTOR_BUY_MOMENTUM_SYMBOL_BLOCKLIST",
+            os.getenv("EXECUTOR_SYMBOL_BLOCKLIST", "BTCUSDT"),
+        )
+        blocked = {item.strip().upper() for item in raw.split(",") if item.strip()}
+        return str(symbol or "").upper() in blocked
+
+    def _executor_buy_momentum_override_decision(self, setup, snapshot, entry_decision):
+        if not self._env_bool("EXECUTOR_BUY_MOMENTUM_OVERRIDE_ENABLED", True):
+            return entry_decision
+
+        if str(getattr(setup, "side", "")) != "Buy":
+            return entry_decision
+
+        if hasattr(self, "_executor_side_allowed") and not self._executor_side_allowed("Buy"):
+            return entry_decision
+
+        if str(getattr(entry_decision, "action", "")) in {ENTER_LONG, ENTER_SHORT}:
+            return entry_decision
+
+        reason = str(getattr(entry_decision, "reason", "") or "")
+        raw_reasons = os.getenv(
+            "EXECUTOR_BUY_MOMENTUM_OVERRIDE_REASONS",
+            "entry_blocked_absorption_weak_confirmation,entry_blocked_ask_wall",
+        )
+        allowed_reasons = {item.strip() for item in raw_reasons.split(",") if item.strip()}
+        if reason not in allowed_reasons:
+            return entry_decision
+
+        if self._executor_buy_momentum_symbol_blocked(getattr(setup, "symbol", "")):
+            return entry_decision
+
+        buy_flow = float(getattr(snapshot, "buy_flow", 0.0) or 0.0)
+        sell_flow = float(getattr(snapshot, "sell_flow", 0.0) or 0.0)
+        volume_impulse = float(getattr(snapshot, "volume_impulse", 0.0) or 0.0)
+
+        if buy_flow <= 0:
+            return entry_decision
+
+        flow_ratio = buy_flow / max(sell_flow, 1e-9)
+
+        min_flow_ratio = self._env_float("EXECUTOR_BUY_MOMENTUM_MIN_FLOW_RATIO", 2.5)
+        min_volume_impulse = self._env_float("EXECUTOR_BUY_MOMENTUM_MIN_VOLUME_IMPULSE", 2.0)
+
+        if reason == "entry_blocked_ask_wall":
+            min_flow_ratio = self._env_float("EXECUTOR_BUY_MOMENTUM_ASK_WALL_MIN_FLOW_RATIO", 4.0)
+            min_volume_impulse = self._env_float("EXECUTOR_BUY_MOMENTUM_ASK_WALL_MIN_VOLUME_IMPULSE", 2.5)
+
+            ask_wall = float(getattr(snapshot, "ask_wall_strength", 0.0) or 0.0)
+            bid_wall = float(getattr(snapshot, "bid_wall_strength", 0.0) or 0.0)
+            max_ask_to_bid = self._env_float("EXECUTOR_BUY_MOMENTUM_MAX_ASK_TO_BID_WALL", 3.0)
+
+            if bid_wall > 0 and ask_wall > bid_wall * max_ask_to_bid:
+                return entry_decision
+
+        if flow_ratio < min_flow_ratio:
+            return entry_decision
+
+        if volume_impulse < min_volume_impulse:
+            return entry_decision
+
+        return TradeDecision(
+            ENTER_LONG,
+            "entry_allowed_buy_momentum_override",
+            ENTERED,
+            None,
+        )
+
     def _paper_executor_setup(self, signal) -> TradeSetup:
         return TradeSetup(
             symbol=str(signal.symbol),
@@ -1149,6 +1243,341 @@ class AccumulationRunner:
             market_regime=str(signal.meta.get("market_regime") or signal.meta.get("btc_regime") or "BTC_NEUTRAL"),
         )
 
+
+    def _symbol_position_lock_enabled(self) -> bool:
+        return self._env_bool("EXECUTOR_SYMBOL_POSITION_LOCK", True)
+
+    def _executor_symbol_position_lock(self, signal_key: str, setup: TradeSetup) -> tuple[TradeDecision | None, dict[str, object]]:
+        """Block duplicate active executor positions for the same symbol.
+
+        This does not affect scanner/search logic. It only prevents the executor
+        from opening another paper/testnet/live position on a symbol that already
+        has an active position under another signal key/timeframe/side.
+        """
+        diagnostics = {
+            "symbol_position_lock_enabled": self._symbol_position_lock_enabled(),
+            "symbol_position_lock_blocked": False,
+        }
+        if not self._symbol_position_lock_enabled():
+            return None, diagnostics
+
+        symbol = str(setup.symbol or "").strip()
+        if not symbol:
+            return None, diagnostics
+
+        db_path = getattr(getattr(self, "signal_store", None), "db_path", "data/signals.db")
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT signal_key, symbol, side, state, action, entry_price, updated_at
+                FROM executor_outcomes
+                WHERE symbol = ?
+                  AND COALESCE(signal_key, '') <> ?
+                  AND UPPER(COALESCE(state, '')) NOT IN ('EXITED', 'CLOSED')
+                  AND (
+                        UPPER(COALESCE(state, '')) IN ('ENTERED', 'PROTECT_BREAKEVEN', 'TRAILING_PROFIT')
+                        OR UPPER(COALESCE(action, '')) = 'HOLD'
+                  )
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (symbol, signal_key),
+            ).fetchone()
+        except Exception as exc:
+            diagnostics["symbol_position_lock_error"] = str(exc)
+            return None, diagnostics
+        finally:
+            if conn is not None:
+                conn.close()
+
+        if row is None:
+            return None, diagnostics
+
+        existing_side = str(row["side"] or "")
+        reason = (
+            "entry_blocked_opposite_side_already_open"
+            if existing_side and existing_side != str(setup.side)
+            else "entry_blocked_symbol_already_open"
+        )
+
+        diagnostics.update({
+            "symbol_position_lock_blocked": True,
+            "existing_signal_key": row["signal_key"],
+            "existing_symbol": row["symbol"],
+            "existing_side": existing_side,
+            "existing_state": row["state"],
+            "existing_action": row["action"],
+            "existing_entry_price": row["entry_price"],
+            "existing_updated_at": row["updated_at"],
+            "blocked_new_side": str(setup.side),
+            "blocked_reason": reason,
+        })
+
+        return TradeDecision(WATCH, reason, "TRADE_WATCH", None), diagnostics
+
+    def _rr_guard_enabled(self) -> bool:
+        return self._env_bool("EXECUTOR_RR_GUARD_ENABLED", True)
+
+    def _rr_guard_max_risk_pct(self, setup: TradeSetup) -> float:
+        tf = str(setup.timeframe or "").strip().lower()
+        if tf in {"1", "3", "5", "15", "30"}:
+            return max(self._env_float("EXECUTOR_RR_GUARD_MAX_RISK_PCT_FAST", 2.5), 0.0)
+        if tf in {"60", "1h"}:
+            return max(self._env_float("EXECUTOR_RR_GUARD_MAX_RISK_PCT_1H", 4.0), 0.0)
+        if tf in {"240", "4h"}:
+            return max(self._env_float("EXECUTOR_RR_GUARD_MAX_RISK_PCT_4H", 7.0), 0.0)
+        return max(self._env_float("EXECUTOR_RR_GUARD_MAX_RISK_PCT_DEFAULT", 3.0), 0.0)
+
+    def _entry_risk_reward_guard(self, signal, setup: TradeSetup, snapshot: OrderflowSnapshot) -> tuple[TradeDecision | None, dict[str, object]]:
+        """Block executor entries with far SL or bad reward/risk.
+
+        This does not change scanner/search logic. It only prevents the executor
+        from opening mathematically bad trades where stop is far and target is close.
+        """
+        diagnostics: dict[str, object] = {
+            "rr_guard_enabled": self._rr_guard_enabled(),
+            "rr_guard_blocked": False,
+        }
+
+        if not self._rr_guard_enabled():
+            return None, diagnostics
+
+        if self.trade_executor is None:
+            return None, diagnostics
+
+        entry_price = self._optional_float(getattr(snapshot, "price", None))
+        if entry_price is None or entry_price <= 0:
+            return None, diagnostics
+
+        try:
+            initial_sl = self.trade_executor._initial_stop_loss(setup, snapshot)
+        except Exception as exc:
+            diagnostics["rr_guard_error"] = str(exc)
+            return None, diagnostics
+
+        tp1 = self._optional_float(getattr(signal, "take_profit_1", None))
+        tp2 = self._optional_float(getattr(signal, "take_profit_2", None))
+
+        side = str(setup.side or "")
+        if side == "Buy":
+            risk = entry_price - initial_sl
+            reward1 = (tp1 - entry_price) if tp1 is not None else None
+            reward2 = (tp2 - entry_price) if tp2 is not None else None
+        elif side == "Sell":
+            risk = initial_sl - entry_price
+            reward1 = (entry_price - tp1) if tp1 is not None else None
+            reward2 = (entry_price - tp2) if tp2 is not None else None
+        else:
+            return None, diagnostics
+
+        if risk <= 0:
+            return None, diagnostics
+
+        risk_pct = (risk / entry_price) * 100.0
+        reward1_pct = (reward1 / entry_price) * 100.0 if reward1 is not None else None
+        reward2_pct = (reward2 / entry_price) * 100.0 if reward2 is not None else None
+        rr1 = (reward1 / risk) if reward1 is not None and reward1 > 0 else None
+        rr2 = (reward2 / risk) if reward2 is not None and reward2 > 0 else None
+
+        max_risk_pct = self._rr_guard_max_risk_pct(setup)
+        min_rr_tp1 = max(self._env_float("EXECUTOR_RR_GUARD_MIN_RR_TP1", 0.8), 0.0)
+        min_rr_tp2 = max(self._env_float("EXECUTOR_RR_GUARD_MIN_RR_TP2", 1.3), 0.0)
+
+        diagnostics.update({
+            "rr_guard_side": side,
+            "rr_guard_timeframe": str(setup.timeframe),
+            "rr_guard_entry_price": float(entry_price),
+            "rr_guard_initial_sl": float(initial_sl),
+            "rr_guard_tp1": tp1,
+            "rr_guard_tp2": tp2,
+            "rr_guard_risk_pct": float(risk_pct),
+            "rr_guard_reward1_pct": reward1_pct,
+            "rr_guard_reward2_pct": reward2_pct,
+            "rr_guard_rr1": rr1,
+            "rr_guard_rr2": rr2,
+            "rr_guard_max_risk_pct": float(max_risk_pct),
+            "rr_guard_min_rr_tp1": float(min_rr_tp1),
+            "rr_guard_min_rr_tp2": float(min_rr_tp2),
+        })
+
+        if max_risk_pct > 0 and risk_pct > max_risk_pct:
+            diagnostics["rr_guard_blocked"] = True
+            diagnostics["rr_guard_block_reason"] = "entry_blocked_stop_loss_too_far"
+            return TradeDecision(WATCH, "entry_blocked_stop_loss_too_far", "TRADE_WATCH", None), diagnostics
+
+        has_rr_target = rr1 is not None or rr2 is not None
+        rr_ok = False
+        if rr2 is not None and rr2 >= min_rr_tp2:
+            rr_ok = True
+        if rr1 is not None and rr1 >= min_rr_tp1:
+            rr_ok = True
+
+        if has_rr_target and not rr_ok:
+            diagnostics["rr_guard_blocked"] = True
+            diagnostics["rr_guard_block_reason"] = "entry_blocked_bad_rr"
+            return TradeDecision(WATCH, "entry_blocked_bad_rr", "TRADE_WATCH", None), diagnostics
+
+        return None, diagnostics
+
+    def _stop_reclaim_reentry_enabled(self) -> bool:
+        return self._env_bool("EXECUTOR_STOP_RECLAIM_REENTRY_ENABLED", True)
+
+    def _latest_stop_loss_trade_for_reentry(self, setup: TradeSetup) -> dict[str, object] | None:
+        db_path = getattr(getattr(self, "signal_store", None), "db_path", "data/signals.db")
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT *
+                FROM executor_trades
+                WHERE symbol = ?
+                  AND side = ?
+                  AND exit_reason = 'exit_stop_loss_hit'
+                ORDER BY exit_time DESC
+                LIMIT 1
+                """,
+                (setup.symbol, setup.side),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        except Exception as exc:
+            self.logger.debug("Stop reclaim lookup failed for %s: %s", setup.symbol, exc)
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _recent_stop_loss_count_for_reentry(self, setup: TradeSetup, lookback_hours: float) -> int:
+        db_path = getattr(getattr(self, "signal_store", None), "db_path", "data/signals.db")
+        cutoff = datetime.fromtimestamp(time.time() - lookback_hours * 3600.0, UTC).isoformat()
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path))
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM executor_trades
+                WHERE symbol = ?
+                  AND side = ?
+                  AND exit_reason = 'exit_stop_loss_hit'
+                  AND exit_time >= ?
+                """,
+                (setup.symbol, setup.side, cutoff),
+            ).fetchone()
+            return int(row[0] if row is not None else 0)
+        except Exception:
+            return 0
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _evaluate_stop_reclaim_reentry(
+        self,
+        signal_key: str,
+        signal,
+        setup: TradeSetup,
+        snapshot: OrderflowSnapshot,
+    ) -> tuple[TradeDecision | None, dict[str, object]]:
+        """Allow one strict re-entry after a stop if price reclaims the stop level.
+
+        This is executor-only. It does not change scanner/search logic.
+        """
+        diagnostics: dict[str, object] = {
+            "stop_reclaim_reentry_enabled": self._stop_reclaim_reentry_enabled(),
+            "stop_reclaim_reentry_allowed": False,
+        }
+        if not self._stop_reclaim_reentry_enabled():
+            return None, diagnostics
+
+        lookback_hours = max(self._env_float("EXECUTOR_STOP_RECLAIM_LOOKBACK_HOURS", 24.0), 0.0)
+        cooldown_minutes = max(self._env_float("EXECUTOR_STOP_RECLAIM_COOLDOWN_MINUTES", 5.0), 0.0)
+        max_recent_stops = max(self._env_int("EXECUTOR_STOP_RECLAIM_MAX_RECENT_STOPS", 1), 0)
+        reclaim_buffer_bps = max(self._env_float("EXECUTOR_STOP_RECLAIM_BUFFER_BPS", 5.0), 0.0)
+        min_volume_impulse = max(self._env_float("EXECUTOR_STOP_RECLAIM_MIN_VOLUME_IMPULSE", 0.75), 0.0)
+        flow_ratio = max(self._env_float("EXECUTOR_STOP_RECLAIM_FLOW_RATIO", 1.05), 1.0)
+
+        row = self._latest_stop_loss_trade_for_reentry(setup)
+        if row is None:
+            diagnostics["stop_reclaim_reason"] = "no_recent_stop_loss"
+            return None, diagnostics
+
+        exit_time = row.get("exit_time")
+        exit_dt = self._parse_executor_time(exit_time)
+        if exit_dt is None:
+            diagnostics["stop_reclaim_reason"] = "missing_stop_exit_time"
+            return None, diagnostics
+
+        age_minutes = (datetime.now(UTC) - exit_dt).total_seconds() / 60.0
+        if age_minutes < cooldown_minutes:
+            diagnostics["stop_reclaim_reason"] = "cooldown_after_stop"
+            diagnostics["stop_reclaim_age_minutes"] = age_minutes
+            return None, diagnostics
+        if age_minutes > lookback_hours * 60.0:
+            diagnostics["stop_reclaim_reason"] = "stop_too_old"
+            diagnostics["stop_reclaim_age_minutes"] = age_minutes
+            return None, diagnostics
+
+        recent_stops = self._recent_stop_loss_count_for_reentry(setup, lookback_hours)
+        if max_recent_stops > 0 and recent_stops > max_recent_stops:
+            diagnostics["stop_reclaim_reason"] = "too_many_recent_stops"
+            diagnostics["stop_reclaim_recent_stops"] = recent_stops
+            return None, diagnostics
+
+        exit_price = self._optional_float(row.get("exit_price"))
+        current_price = self._optional_float(getattr(snapshot, "price", None))
+        if exit_price is None or exit_price <= 0 or current_price is None or current_price <= 0:
+            diagnostics["stop_reclaim_reason"] = "missing_stop_or_current_price"
+            return None, diagnostics
+
+        buffer = reclaim_buffer_bps / 10000.0
+        side = str(setup.side)
+        if side == "Buy":
+            reclaimed = current_price >= exit_price * (1.0 + buffer)
+            flow_ok = snapshot.buy_flow >= snapshot.sell_flow * flow_ratio
+            wall_ok = snapshot.ask_wall_strength <= float(getattr(self.trade_executor, "ask_wall_entry_limit", 0.65))
+            structure_ok = snapshot.support is not None and float(snapshot.support) < current_price
+            action = ENTER_LONG
+        elif side == "Sell":
+            reclaimed = current_price <= exit_price * (1.0 - buffer)
+            flow_ok = snapshot.sell_flow >= snapshot.buy_flow * flow_ratio
+            wall_ok = snapshot.bid_wall_strength <= float(getattr(self.trade_executor, "bid_wall_entry_limit", 0.65))
+            structure_ok = snapshot.resistance is not None and float(snapshot.resistance) > current_price
+            action = ENTER_SHORT
+        else:
+            return None, diagnostics
+
+        volume_ok = snapshot.volume_impulse >= min_volume_impulse
+        allowed = bool(reclaimed and flow_ok and wall_ok and volume_ok and structure_ok)
+
+        diagnostics.update({
+            "stop_reclaim_signal_key": signal_key,
+            "stop_reclaim_previous_signal_key": row.get("signal_key"),
+            "stop_reclaim_exit_price": exit_price,
+            "stop_reclaim_current_price": current_price,
+            "stop_reclaim_age_minutes": age_minutes,
+            "stop_reclaim_recent_stops": recent_stops,
+            "stop_reclaim_reclaimed": bool(reclaimed),
+            "stop_reclaim_flow_ok": bool(flow_ok),
+            "stop_reclaim_wall_ok": bool(wall_ok),
+            "stop_reclaim_volume_ok": bool(volume_ok),
+            "stop_reclaim_structure_ok": bool(structure_ok),
+            "stop_reclaim_reentry_allowed": allowed,
+            "stop_reclaim_reason": "entry_allowed_stop_reclaim_reentry" if allowed else "stop_reclaim_conditions_not_met",
+        })
+
+        if not allowed:
+            return None, diagnostics
+
+        return TradeDecision(action, "entry_allowed_stop_reclaim_reentry", ENTERED, None), diagnostics
+
+    def _executor_symbol_blocked(self, symbol: str) -> bool:
+        raw = os.getenv("EXECUTOR_SYMBOL_BLOCKLIST", "")
+        blocked = {item.strip().upper() for item in raw.split(",") if item.strip()}
+        return str(symbol or "").upper() in blocked
 
     def _entry_stop_loss_guard(self, setup: TradeSetup, snapshot: OrderflowSnapshot) -> tuple[TradeDecision | None, dict[str, object]]:
         """Block executor entries with invalid initial SL before opening/storing a trade.
@@ -2435,11 +2864,17 @@ class AccumulationRunner:
                 initial_sl=initial_sl,
                 current_sl=current_sl,
             )
-            moved_to_breakeven = bool(
-                (position is not None and str(getattr(position, "state", "")) in {PROTECT_BREAKEVEN, TRAILING_PROFIT})
-                or (previous_row is not None and str(previous_row["state"]) in {PROTECT_BREAKEVEN, TRAILING_PROFIT})
-                or (previous_row is not None and str(previous_row["action"]) == MOVE_SL_TO_BREAKEVEN)
-            )
+            # A breakeven flag is valid only when the stop is actually at or beyond entry.
+            # Do not trust state/action alone, because restored paper rows can carry
+            # PROTECT_BREAKEVEN/TRAILING_PROFIT while current_sl is still below entry.
+            protected_by_stop = False
+            if entry_price is not None and current_sl is not None:
+                if side == "Buy":
+                    protected_by_stop = current_sl >= entry_price
+                elif side == "Sell":
+                    protected_by_stop = current_sl <= entry_price
+
+            moved_to_breakeven = bool(protected_by_stop)
             breakeven_time = None
             if moved_to_breakeven:
                 events = self.signal_store.get_trade_lifecycle_events(signal_key)
@@ -2543,6 +2978,132 @@ class AccumulationRunner:
                 )
         except Exception:
             self.logger.exception("Failed to write executor_trades row for %s", signal_key)
+
+    def _parse_executor_dt(self, value) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _executor_no_progress_timeout_minutes(self, signal_key: str, signal) -> float:
+        raw = os.getenv(
+            "EXECUTOR_NO_PROGRESS_TIMEOUT_MINUTES_BY_TF",
+            "1:20,5:40,15:75,60:180,1h:180,4h:480",
+        )
+        mapping: dict[str, float] = {}
+        for item in raw.split(","):
+            if ":" not in item:
+                continue
+            key, value = item.split(":", 1)
+            try:
+                mapping[key.strip().lower()] = float(value.strip())
+            except ValueError:
+                continue
+
+        parts = str(signal_key or "").split("|")
+        tf = str(getattr(signal, "timeframe", "") or "").strip().lower()
+        if not tf and len(parts) > 2:
+            tf = str(parts[2] or "").strip().lower()
+        tf = tf or str(getattr(signal, "meta", {}).get("tf", "") or "").strip().lower()
+
+        return mapping.get(tf, self._env_float("EXECUTOR_NO_PROGRESS_TIMEOUT_MINUTES", 40.0))
+
+    def _executor_current_r(self, side: str, entry_price: float, price: float, initial_sl: float) -> float | None:
+        risk = abs(float(entry_price) - float(initial_sl))
+        if risk <= 0:
+            return None
+        if side == "Buy":
+            return (float(price) - float(entry_price)) / risk
+        if side == "Sell":
+            return (float(entry_price) - float(price)) / risk
+        return None
+
+    def _apply_no_progress_timeout_exit(self, signal_key, signal, position, snapshot, decision, row):
+        if not self._env_bool("EXECUTOR_NO_PROGRESS_EXIT_ENABLED", True):
+            return decision
+
+        if str(decision.action) != "HOLD" or decision.position is None:
+            return decision
+
+        updated_position = decision.position
+
+        # Не трогаем сделки, которые уже защищены step-lock/trailing.
+        if str(updated_position.state) in {"PROTECT_BREAKEVEN", "TRAILING_PROFIT", "EXITED"}:
+            return decision
+
+        target_r = self._env_float("EXECUTOR_NO_PROGRESS_TARGET_R", 0.25)
+        if float(updated_position.max_gain_r or 0.0) >= target_r:
+            return decision
+
+        diagnostics = self._parse_executor_diagnostics(row["diagnostics_json"] if "diagnostics_json" in row.keys() else None)
+
+        entry_time = (
+            diagnostics.get("executor_entry_time")
+            or diagnostics.get("entry_time")
+            or row["created_at"]
+        )
+        entry_dt = self._parse_executor_dt(entry_time)
+        if entry_dt is None:
+            return decision
+
+        elapsed_minutes = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 60.0
+        timeout_minutes = self._executor_no_progress_timeout_minutes(signal_key, signal)
+        if elapsed_minutes < timeout_minutes:
+            return decision
+
+        entry_price = self._optional_float(diagnostics.get("executor_entry_price")) or self._optional_float(row["entry_price"])
+        initial_sl = (
+            self._optional_float(diagnostics.get("executor_initial_sl"))
+            or self._optional_float(diagnostics.get("initial_sl"))
+            or self._optional_float(row["current_sl"])
+        )
+        price = float(snapshot.price)
+        side = str(updated_position.side)
+
+        if entry_price is None or initial_sl is None:
+            return decision
+
+        current_r = self._executor_current_r(side, entry_price, price, initial_sl)
+        if current_r is None:
+            return decision
+
+        max_current_r = self._env_float("EXECUTOR_NO_PROGRESS_MAX_CURRENT_R", 0.05)
+        if current_r > max_current_r:
+            return decision
+
+        if self._env_bool("EXECUTOR_NO_PROGRESS_REQUIRE_FLOW_FADE", True):
+            flow_ratio = self._env_float("EXECUTOR_NO_PROGRESS_FLOW_RATIO", 1.0)
+            if side == "Buy":
+                flow_faded = snapshot.buy_flow <= snapshot.sell_flow * flow_ratio or price <= entry_price
+            elif side == "Sell":
+                flow_faded = snapshot.sell_flow <= snapshot.buy_flow * flow_ratio or price >= entry_price
+            else:
+                flow_faded = True
+
+            if not flow_faded:
+                return decision
+
+        exit_position = dataclasses.replace(
+            updated_position,
+            state="EXITED",
+            exit_price=price,
+            exit_reason="exit_no_progress_timeout",
+        )
+
+        return TradeDecision(
+            "EXIT",
+            "exit_no_progress_timeout",
+            "EXITED",
+            exit_position,
+        )
 
     def _executor_signal_from_outcome_row(self, row):
         signal_key = str(row["signal_key"])
@@ -2659,6 +3220,24 @@ class AccumulationRunner:
 
                 position = self._position_from_executor_row(signal, row)
                 decision = self.trade_executor.update_position(position, snapshot)
+                _no_progress_signal_key = (
+                    locals().get("signal_key")
+                    or locals().get("key")
+                    or locals().get("trade_key")
+                    or locals().get("position_key")
+                    or (row["signal_key"] if "signal_key" in row.keys() else None)
+                    or (row["signal_id"] if "signal_id" in row.keys() else None)
+                    or (row["trade_key"] if "trade_key" in row.keys() else None)
+                    or ""
+                )
+                decision = self._apply_no_progress_timeout_exit(
+                    _no_progress_signal_key,
+                    locals().get("signal"),
+                    position,
+                    snapshot,
+                    decision,
+                    row,
+                )
                 self._store_paper_executor_decision(str(row["signal_key"]), signal, decision, decision.position, snapshot)
                 refreshed += 1
             except Exception:
@@ -2731,6 +3310,21 @@ class AccumulationRunner:
             return
 
         entry_decision = forced_early_decision or self.trade_executor.evaluate_entry(setup, snapshot)
+        entry_decision = self._executor_buy_momentum_override_decision(setup, snapshot, entry_decision)
+        if not self._executor_side_allowed(str(setup.side)):
+            entry_decision = TradeDecision(
+                "WATCH",
+                "entry_blocked_executor_side_not_allowed",
+                "TRADE_WATCH",
+                None,
+            )
+
+        if entry_decision.action not in {ENTER_LONG, ENTER_SHORT}:
+            reentry_decision, reentry_context = self._evaluate_stop_reclaim_reentry(signal_key, signal, setup, snapshot)
+            observation_context.update(reentry_context)
+            if reentry_decision is not None:
+                entry_decision = reentry_decision
+                forced_early_entry = True
         if entry_decision.action not in {ENTER_LONG, ENTER_SHORT}:
             early_decision, early_context = self._evaluate_early_breakout_entry(signal_key, signal, setup, snapshot)
             observation_context.update(early_context)
@@ -2738,6 +3332,52 @@ class AccumulationRunner:
                 entry_decision = early_decision
                 forced_early_entry = True
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
+            if self._executor_symbol_blocked(str(signal.symbol)):
+                block_decision = TradeDecision(WATCH, "entry_blocked_symbol_blocklist", "TRADE_WATCH", None)
+                block_context = {
+                    "executor_symbol_blocklist": os.getenv("EXECUTOR_SYMBOL_BLOCKLIST", ""),
+                    "executor_symbol_blocked": True,
+                }
+                observation_context.update(block_context)
+                self._store_paper_executor_decision(
+                    signal_key,
+                    signal,
+                    block_decision,
+                    None,
+                    snapshot,
+                    setup=setup,
+                    observation_context=observation_context,
+                )
+                return
+
+            rr_guard_decision, rr_guard_context = self._entry_risk_reward_guard(signal, setup, snapshot)
+            observation_context.update(rr_guard_context)
+            if rr_guard_decision is not None:
+                self._store_paper_executor_decision(
+                    signal_key,
+                    signal,
+                    rr_guard_decision,
+                    None,
+                    snapshot,
+                    setup=setup,
+                    observation_context=observation_context,
+                )
+                return
+
+            symbol_lock_decision, symbol_lock_context = self._executor_symbol_position_lock(signal_key, setup)
+            observation_context.update(symbol_lock_context)
+            if symbol_lock_decision is not None:
+                self._store_paper_executor_decision(
+                    signal_key,
+                    signal,
+                    symbol_lock_decision,
+                    None,
+                    snapshot,
+                    setup=setup,
+                    observation_context=observation_context,
+                )
+                return
+
             late_chase_watch_decision, late_chase_context = self._evaluate_late_chase_gate(
                 signal_key,
                 signal,
