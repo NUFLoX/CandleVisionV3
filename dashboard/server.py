@@ -2574,15 +2574,24 @@ def create_app() -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(
+            STATIC_DIR / "dist" / "index.html",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     @app.get("/react", include_in_schema=False)
     async def react_index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "dist" / "index.html")
+        return FileResponse(
+            STATIC_DIR / "dist" / "index.html",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
-    @app.get("/react", include_in_schema=False)
-    async def react_index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "dist" / "index.html")
+    @app.get("/legacy", include_in_schema=False)
+    async def legacy_index() -> FileResponse:
+        return FileResponse(
+            STATIC_DIR / "index.html",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     @app.get("/api/status")
     async def status():
