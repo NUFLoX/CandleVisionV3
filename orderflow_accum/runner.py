@@ -3305,6 +3305,21 @@ class AccumulationRunner:
 
         if existing is not None and not existing_is_terminal and str(existing["state"]) in self.ACTIVE_EXECUTOR_OUTCOME_STATES:
             position = self._position_from_executor_row(signal, existing)
+            if not self._executor_side_allowed(str(position.side)):
+                exit_position = dataclasses.replace(
+                    position,
+                    state="EXITED",
+                    exit_price=float(snapshot.price),
+                    exit_reason="exit_executor_side_disabled",
+                )
+                decision = TradeDecision(
+                    EXIT,
+                    "exit_executor_side_disabled",
+                    "EXITED",
+                    exit_position,
+                )
+                self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot, setup=setup, observation_context=observation_context)
+                return
             decision = self.trade_executor.update_position(position, snapshot)
             self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot, setup=setup, observation_context=observation_context)
             return
@@ -3331,6 +3346,16 @@ class AccumulationRunner:
             if early_decision is not None:
                 entry_decision = early_decision
                 forced_early_entry = True
+        # Final side gate: reentry/early overrides must not bypass EXECUTOR_ALLOWED_SIDES.
+        if entry_decision.action in {ENTER_LONG, ENTER_SHORT} and not self._executor_side_allowed(str(setup.side)):
+            entry_decision = TradeDecision(
+                WATCH,
+                "entry_blocked_executor_side_not_allowed",
+                "TRADE_WATCH",
+                None,
+            )
+            forced_early_entry = False
+
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
             if self._executor_symbol_blocked(str(signal.symbol)):
                 block_decision = TradeDecision(WATCH, "entry_blocked_symbol_blocklist", "TRADE_WATCH", None)
