@@ -32,6 +32,8 @@ class MarketStream:
         self.state: dict[str, SymbolFlowState] = defaultdict(SymbolFlowState)
         self._ws = None
         self.status = "BOOT"
+        self._subscribed_symbols: set[str] = set()
+        self._subscribe_lock = asyncio.Lock()
 
     async def run(self, symbols: list[str]) -> None:
         retry_delay = 3
@@ -50,6 +52,7 @@ class MarketStream:
                     max_queue=4096,
                 ) as ws:
                     self._ws = ws
+                    self._subscribed_symbols.clear()
                     await self._subscribe(symbols)
                     self.status = "LIVE"
                     heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws), name="accum_ws_heartbeat")
@@ -83,13 +86,37 @@ class MarketStream:
     async def _subscribe(self, symbols: list[str]) -> None:
         if not self._ws:
             return
+        clean: list[str] = []
+        seen: set[str] = set()
+        for symbol in symbols:
+            symbol = str(symbol or "").upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            clean.append(symbol)
+
         batch_size = 10
-        for idx in range(0, len(symbols), batch_size):
-            batch = symbols[idx: idx + batch_size]
+        for idx in range(0, len(clean), batch_size):
+            batch = clean[idx: idx + batch_size]
             args = [f"orderbook.50.{symbol}" for symbol in batch]
             args.extend([f"publicTrade.{symbol}" for symbol in batch])
             await self._ws.send(json.dumps({"op": "subscribe", "args": args}))
+            self._subscribed_symbols.update(batch)
             await asyncio.sleep(0.25)
+
+    async def subscribe_symbols(self, symbols: list[str]) -> None:
+        if not self._ws:
+            return
+        async with self._subscribe_lock:
+            fresh = []
+            for symbol in symbols:
+                symbol = str(symbol or "").upper()
+                if symbol and symbol not in self._subscribed_symbols:
+                    fresh.append(symbol)
+            if not fresh:
+                return
+            await self._subscribe(fresh)
+            logger.info("Subscribed WS for %s new watchlist symbols", len(fresh))
 
     def _handle_message(self, raw: str) -> None:
         payload = json.loads(raw)

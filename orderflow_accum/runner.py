@@ -7,6 +7,7 @@ import fnmatch
 import json
 import logging
 import os
+import sys
 import dataclasses
 import sqlite3
 import time
@@ -716,12 +717,179 @@ class AccumulationRunner:
 
         return out
 
+    def _watchlist_realtime_enabled(self) -> bool:
+        return self._env_bool("WATCHLIST_REALTIME_ENABLED", False)
+
+    def _watchlist_trade_eligible_only(self) -> bool:
+        return self._env_bool("WATCHLIST_USE_TRADE_ELIGIBLE_ONLY", True)
+
+    def _watchlist_db_path(self) -> str:
+        return os.getenv("SIGNALS_DB_PATH", "data/signals.db").strip() or "data/signals.db"
+
+    def _load_market_watchlist_targets(self, *, limit: int, trade_eligible_only: bool | None = None) -> list[ScanTarget]:
+        db_path = self._watchlist_db_path()
+        if not os.path.exists(db_path):
+            return []
+
+        if trade_eligible_only is None:
+            trade_eligible_only = self._watchlist_trade_eligible_only()
+
+        where = [
+            "active=1",
+            "(expires_at IS NULL OR expires_at='' OR expires_at >= ?)",
+        ]
+        params: list[object] = [datetime.now(timezone.utc).isoformat()]
+
+        if trade_eligible_only:
+            where.append("trade_eligible=1")
+
+        sql = f"""
+            SELECT symbol, market
+            FROM market_watchlist
+            WHERE {' AND '.join(where)}
+            ORDER BY trade_eligible DESC, score DESC, last_seen_at DESC
+            LIMIT ?
+        """
+        params.append(max(int(limit), 1))
+
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+            conn.close()
+        except sqlite3.Error as exc:
+            self.logger.warning("Market watchlist load failed: %r", exc)
+            return []
+
+        targets = [
+            ScanTarget(symbol=str(row["symbol"]).upper(), market=str(row["market"] or "linear").lower())
+            for row in rows
+            if row["symbol"]
+        ]
+        return self._filter_symbols(targets)
+
+    def _replace_scan_targets(self, current: list[ScanTarget], updated: list[ScanTarget], *, label: str) -> bool:
+        if not updated:
+            return False
+
+        current_keys = [(target.symbol, target.market) for target in current]
+        updated_keys = [(target.symbol, target.market) for target in updated]
+
+        if current_keys == updated_keys:
+            return False
+
+        current[:] = updated
+        self.logger.info("Market watchlist replaced %s symbols: %s", label, len(updated))
+        return True
+
+    def _watchlist_initial_targets(self, fallback: list[ScanTarget], *, limit: int, label: str) -> list[ScanTarget]:
+        if not self._watchlist_realtime_enabled():
+            return fallback
+
+        targets = self._load_market_watchlist_targets(limit=limit)
+        if not targets:
+            self.logger.warning("Market watchlist enabled but empty for %s; using fallback symbols=%s", label, len(fallback))
+            return fallback
+
+        self.logger.info("Market watchlist enabled for %s: using %s symbols", label, len(targets))
+        return targets
+
+    async def _refresh_realtime_symbols_from_watchlist(self, stream: MarketStream, symbols: list[ScanTarget]) -> None:
+        if not self._watchlist_realtime_enabled():
+            return
+
+        interval = max(self._env_float("WATCHLIST_REALTIME_REFRESH_SECONDS", 300.0), 30.0)
+        now = time.monotonic()
+        last = float(getattr(self, "_last_watchlist_realtime_refresh", 0.0) or 0.0)
+
+        if now - last < interval:
+            return
+
+        self._last_watchlist_realtime_refresh = now
+
+        limit = self._env_int("WATCHLIST_REALTIME_LIMIT", self.settings.realtime_symbols_limit)
+        updated = self._load_market_watchlist_targets(limit=limit)
+        if not updated:
+            return
+
+        old_symbols = {target.symbol for target in symbols}
+        new_symbols = [target.symbol for target in updated if target.symbol not in old_symbols]
+
+        changed = self._replace_scan_targets(symbols, updated, label="realtime")
+        if changed and new_symbols:
+            await stream.subscribe_symbols(new_symbols)
+
+    def _refresh_macro_symbols_from_watchlist(self, symbols: list[ScanTarget]) -> None:
+        if not self._watchlist_realtime_enabled():
+            return
+
+        interval = max(self._env_float("WATCHLIST_MACRO_REFRESH_SECONDS", 900.0), 60.0)
+        now = time.monotonic()
+        last = float(getattr(self, "_last_watchlist_macro_refresh", 0.0) or 0.0)
+
+        if now - last < interval:
+            return
+
+        self._last_watchlist_macro_refresh = now
+
+        limit = self._env_int("WATCHLIST_MACRO_LIMIT", self.settings.macro_symbols_limit)
+        updated = self._load_market_watchlist_targets(limit=limit)
+        if updated:
+            self._replace_scan_targets(symbols, updated, label="macro")
+
+    async def _run_market_watchlist_builder(self, reason: str = "scheduled") -> None:
+        script = os.getenv("WATCHLIST_REBUILD_SCRIPT", "tools/market_watchlist_rebuild.py").strip()
+        if not script:
+            return
+
+        if not os.path.exists(script):
+            self.logger.warning("Market watchlist rebuild skipped: script not found: %s", script)
+            return
+
+        timeout = max(self._env_float("WATCHLIST_REBUILD_TIMEOUT_SECONDS", 900.0), 60.0)
+
+        self.logger.info("Market watchlist rebuild started | reason=%s | script=%s", reason, script)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.logger.warning("Market watchlist rebuild timed out after %.0fs", timeout)
+            return
+        except Exception as exc:
+            self.logger.warning("Market watchlist rebuild failed: %r", exc)
+            return
+
+        text = (stdout or b"").decode("utf-8", errors="replace")
+        tail = "\n".join(text.strip().splitlines()[-12:])
+
+        if proc.returncode != 0:
+            self.logger.warning("Market watchlist rebuild exited rc=%s\n%s", proc.returncode, tail)
+            return
+
+        self.logger.info("Market watchlist rebuild finished | reason=%s\n%s", reason, tail)
+
+    async def _run_market_watchlist_rebuild_loop(self) -> None:
+        interval = max(self._env_float("WATCHLIST_REBUILD_INTERVAL_SECONDS", 21600.0), 600.0)
+
+        while True:
+            await asyncio.sleep(interval)
+            await self._run_market_watchlist_builder("scheduled")
+
     async def run(self) -> None:
         async with BybitRestClient(
             self.settings.rest_base_url,
             timeout_seconds=self.settings.rest_timeout_seconds,
             retries=self.settings.rest_retries,
         ) as rest:
+            if self._watchlist_realtime_enabled() and self._env_bool("WATCHLIST_REBUILD_ON_STARTUP", True):
+                await self._run_market_watchlist_builder("startup")
+
             realtime_symbols = await rest.fetch_best_symbols(
                 quote_coin=self.settings.quote_coin,
                 limit=self.settings.realtime_symbols_limit,
@@ -745,6 +913,17 @@ class AccumulationRunner:
             realtime_symbols = self._filter_symbols(realtime_symbols)
             macro_symbols = self._filter_symbols(macro_symbols)
 
+            realtime_symbols = self._watchlist_initial_targets(
+                realtime_symbols,
+                limit=self._env_int("WATCHLIST_REALTIME_LIMIT", self.settings.realtime_symbols_limit),
+                label="realtime",
+            )
+            macro_symbols = self._watchlist_initial_targets(
+                macro_symbols,
+                limit=self._env_int("WATCHLIST_MACRO_LIMIT", self.settings.macro_symbols_limit),
+                label="macro",
+            )
+
             stream = MarketStream(
                 url=self.settings.ws_public_url,
                 book_depth=self.settings.book_depth,
@@ -767,8 +946,12 @@ class AccumulationRunner:
                 asyncio.create_task(stream.run([target.symbol for target in realtime_symbols]), name="accum_ws"),
                 asyncio.create_task(self._run_realtime_scan(rest, stream, realtime_symbols), name="accum_realtime"),
                 asyncio.create_task(self._run_macro_scan(rest, macro_symbols), name="accum_macro"),
-                asyncio.create_task(self._run_status(stream, len(realtime_symbols), len(macro_symbols)), name="accum_status"),
+                asyncio.create_task(self._run_status(stream, realtime_symbols, macro_symbols), name="accum_status"),
             ]
+            if self._watchlist_realtime_enabled() and self._env_bool("WATCHLIST_AUTO_REBUILD_ENABLED", True):
+                tasks.append(
+                    asyncio.create_task(self._run_market_watchlist_rebuild_loop(), name="accum_watchlist_rebuild")
+                )
             if self.trade_executor_enabled:
                 tasks.append(
                     asyncio.create_task(self._run_executor_maintenance(rest, stream), name="accum_executor_maintenance")
@@ -778,6 +961,8 @@ class AccumulationRunner:
 
     async def _run_status(self, stream: MarketStream, realtime_count: int, macro_count: int) -> None:
         while True:
+            await self._refresh_realtime_symbols_from_watchlist(stream, symbols)
+
             await self.dashboard.post_heartbeat(
                 "scanner",
                 meta={
@@ -943,12 +1128,15 @@ class AccumulationRunner:
         intervals = {"60": 60, "240": 50, "D": 45}
 
         while True:
+            self._refresh_macro_symbols_from_watchlist(symbols)
+
             await self.dashboard.post_heartbeat(
                 "scanner",
                 meta={
                     "runner": "orderflow_accum",
                     "loop": "macro",
                     "symbols": len(symbols),
+                    "watchlist_realtime_enabled": self._watchlist_realtime_enabled(),
                 },
             )
 
