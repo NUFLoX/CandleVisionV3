@@ -959,9 +959,10 @@ class AccumulationRunner:
 
             await asyncio.gather(*tasks)
 
-    async def _run_status(self, stream: MarketStream, realtime_count: int, macro_count: int) -> None:
+    async def _run_status(self, stream: MarketStream, realtime_symbols: list[ScanTarget], macro_symbols: list[ScanTarget]) -> None:
         while True:
-            await self._refresh_realtime_symbols_from_watchlist(stream, symbols)
+            realtime_count = len(realtime_symbols)
+            macro_count = len(macro_symbols)
 
             await self.dashboard.post_heartbeat(
                 "scanner",
@@ -971,6 +972,7 @@ class AccumulationRunner:
                     "ws_status": stream.status,
                     "realtime_symbols": realtime_count,
                     "macro_symbols": macro_count,
+                    "watchlist_realtime_enabled": self._watchlist_realtime_enabled(),
                     "macro_signals": self._counts["macro"],
                     "orderflow_signals": self._counts["orderflow"],
                 },
@@ -1028,12 +1030,15 @@ class AccumulationRunner:
         realtime_intervals = {value.upper() for value in self.settings.realtime_intervals}
 
         while True:
+            await self._refresh_realtime_symbols_from_watchlist(stream, symbols)
+
             await self.dashboard.post_heartbeat(
                 "scanner",
                 meta={
                     "runner": "orderflow_accum",
                     "loop": "realtime",
                     "symbols": len(symbols),
+                    "watchlist_realtime_enabled": self._watchlist_realtime_enabled(),
                 },
             )
 
