@@ -1,0 +1,10 @@
+[Unit]
+Description=CandleVision Market Momentum Pulse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/CandleVisionV3
+EnvironmentFile=-/opt/CandleVisionV3/.env
+ExecStart=/opt/CandleVisionV3/.venv/bin/python /opt/CandleVisionV3/tools/market_momentum_pulse.py

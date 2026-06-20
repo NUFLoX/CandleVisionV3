@@ -726,13 +726,33 @@ class AccumulationRunner:
     def _watchlist_db_path(self) -> str:
         return os.getenv("SIGNALS_DB_PATH", "data/signals.db").strip() or "data/signals.db"
 
-    def _load_market_watchlist_targets(self, *, limit: int, trade_eligible_only: bool | None = None) -> list[ScanTarget]:
+    def _watchlist_realtime_observe_phases(self) -> set[str]:
+        raw = os.getenv("WATCHLIST_REALTIME_OBSERVE_PHASES", "MOMENTUM_OBSERVE")
+        return {
+            item.strip().upper()
+            for item in raw.split(",")
+            if item and item.strip()
+        }
+
+    def _load_market_watchlist_targets(
+        self,
+        *,
+        limit: int,
+        trade_eligible_only: bool | None = None,
+        include_observe_phases: set[str] | None = None,
+    ) -> list[ScanTarget]:
         db_path = self._watchlist_db_path()
         if not os.path.exists(db_path):
             return []
 
         if trade_eligible_only is None:
             trade_eligible_only = self._watchlist_trade_eligible_only()
+
+        observe_phases = {
+            str(phase).strip().upper()
+            for phase in (include_observe_phases or set())
+            if str(phase).strip()
+        }
 
         where = [
             "active=1",
@@ -741,6 +761,12 @@ class AccumulationRunner:
         params: list[object] = [datetime.now(timezone.utc).isoformat()]
 
         if trade_eligible_only:
+            where.append("trade_eligible=1")
+        elif observe_phases:
+            placeholders = ",".join("?" for _ in observe_phases)
+            where.append(f"(trade_eligible=1 OR UPPER(phase) IN ({placeholders}))")
+            params.extend(sorted(observe_phases))
+        else:
             where.append("trade_eligible=1")
 
         sql = f"""
@@ -762,7 +788,10 @@ class AccumulationRunner:
             return []
 
         targets = [
-            ScanTarget(symbol=str(row["symbol"]).upper(), market=str(row["market"] or "linear").lower())
+            ScanTarget(
+                symbol=str(row["symbol"]).upper(),
+                market=str(row["market"] or "linear").lower(),
+            )
             for row in rows
             if row["symbol"]
         ]
@@ -782,16 +811,41 @@ class AccumulationRunner:
         self.logger.info("Market watchlist replaced %s symbols: %s", label, len(updated))
         return True
 
-    def _watchlist_initial_targets(self, fallback: list[ScanTarget], *, limit: int, label: str) -> list[ScanTarget]:
+    def _watchlist_initial_targets(
+        self,
+        fallback: list[ScanTarget],
+        *,
+        limit: int,
+        label: str,
+    ) -> list[ScanTarget]:
         if not self._watchlist_realtime_enabled():
             return fallback
 
-        targets = self._load_market_watchlist_targets(limit=limit)
+        if label == "realtime":
+            targets = self._load_market_watchlist_targets(
+                limit=limit,
+                trade_eligible_only=False,
+                include_observe_phases=self._watchlist_realtime_observe_phases(),
+            )
+        else:
+            targets = self._load_market_watchlist_targets(
+                limit=limit,
+                trade_eligible_only=True,
+            )
+
         if not targets:
-            self.logger.warning("Market watchlist enabled but empty for %s; using fallback symbols=%s", label, len(fallback))
+            self.logger.warning(
+                "Market watchlist enabled but empty for %s; using fallback symbols=%s",
+                label,
+                len(fallback),
+            )
             return fallback
 
-        self.logger.info("Market watchlist enabled for %s: using %s symbols", label, len(targets))
+        self.logger.info(
+            "Market watchlist enabled for %s: using %s symbols",
+            label,
+            len(targets),
+        )
         return targets
 
     async def _refresh_realtime_symbols_from_watchlist(self, stream: MarketStream, symbols: list[ScanTarget]) -> None:
@@ -808,7 +862,11 @@ class AccumulationRunner:
         self._last_watchlist_realtime_refresh = now
 
         limit = self._env_int("WATCHLIST_REALTIME_LIMIT", self.settings.realtime_symbols_limit)
-        updated = self._load_market_watchlist_targets(limit=limit)
+        updated = self._load_market_watchlist_targets(
+            limit=limit,
+            trade_eligible_only=False,
+            include_observe_phases=self._watchlist_realtime_observe_phases(),
+        )
         if not updated:
             return
 
@@ -833,7 +891,10 @@ class AccumulationRunner:
         self._last_watchlist_macro_refresh = now
 
         limit = self._env_int("WATCHLIST_MACRO_LIMIT", self.settings.macro_symbols_limit)
-        updated = self._load_market_watchlist_targets(limit=limit)
+        updated = self._load_market_watchlist_targets(
+            limit=limit,
+            trade_eligible_only=True,
+        )
         if updated:
             self._replace_scan_targets(symbols, updated, label="macro")
 
@@ -1333,11 +1394,115 @@ class AccumulationRunner:
         context["testnet_observation_entry_reason"] = "strong_non_confirmed_buy_signal"
         return context
 
-    def _should_process_paper_executor_status(self, signal, confirmed_status: str | None) -> tuple[bool, dict[str, object]]:
-        if confirmed_status in {"CONFIRMED_LONG", "CONFIRMED_SHORT"}:
-            return True, self._testnet_observation_entry_context(signal, confirmed_status)
+    def _paper_observation_entry_context(
+        self,
+        signal,
+        confirmed_status: str | None,
+    ) -> dict[str, object]:
         context = self._testnet_observation_entry_context(signal, confirmed_status)
-        return bool(context.get("testnet_observation_entry_candidate")), context
+
+        mode = self._normalize_trade_executor_mode(
+            getattr(self, "trade_executor_mode", "paper")
+        )
+        status = str(confirmed_status or "").strip().upper()
+        kind = str(getattr(signal, "kind", "") or "").strip().upper()
+        side = str(getattr(signal, "side", "") or "").strip()
+        score = self._optional_float(getattr(signal, "score", None)) or 0.0
+        meta = (
+            getattr(signal, "meta", {})
+            if isinstance(getattr(signal, "meta", {}), dict)
+            else {}
+        )
+        btc_regime = str(meta.get("btc_regime") or "BTC_NEUTRAL").strip().upper()
+
+        context.update(
+            {
+                "paper_observation_entry_candidate": False,
+                "paper_observation_entry_reason": "paper_observation_disabled",
+                "paper_observation_status": status or None,
+                "paper_observation_kind": kind or None,
+                "paper_observation_score": score,
+            }
+        )
+
+        if mode != "paper":
+            context["paper_observation_entry_reason"] = "not_paper_mode"
+            return context
+
+        if not self._env_bool("EXECUTOR_PAPER_OBSERVATION_ENTRY_ENABLED", False):
+            return context
+
+        if status in {"CONFIRMED_LONG", "CONFIRMED_SHORT"}:
+            context["paper_observation_entry_reason"] = (
+                "confirmed_signal_uses_standard_executor_path"
+            )
+            return context
+
+        allowed_statuses = {
+            item.strip().upper()
+            for item in os.getenv(
+                "EXECUTOR_PAPER_OBSERVATION_ALLOWED_STATUSES",
+                "PRE_IMPULSE,BREAKOUT_PRESSURE,PENDING",
+            ).split(",")
+            if item.strip()
+        }
+
+        allowed_kinds = {
+            item.strip().upper()
+            for item in os.getenv(
+                "EXECUTOR_PAPER_OBSERVATION_ALLOWED_KINDS",
+                "PRE_IMPULSE_ZONE,BREAKOUT_PRESSURE,ACCUMULATION_LONG_READY",
+            ).split(",")
+            if item.strip()
+        }
+
+        min_score = max(
+            self._env_float("EXECUTOR_PAPER_OBSERVATION_MIN_SCORE", 10.0),
+            0.0,
+        )
+
+        if side != "Buy":
+            context["paper_observation_entry_reason"] = "not_buy_signal"
+            return context
+
+        if kind not in allowed_kinds:
+            context["paper_observation_entry_reason"] = "signal_kind_not_allowed"
+            return context
+
+        if status not in allowed_statuses:
+            context["paper_observation_entry_reason"] = "signal_status_not_allowed"
+            return context
+
+        if score < min_score:
+            context["paper_observation_entry_reason"] = (
+                "score_below_paper_observation_threshold"
+            )
+            return context
+
+        if btc_regime in self.TESTNET_OBSERVATION_BLOCKED_BTC_REGIMES:
+            context["paper_observation_entry_reason"] = (
+                "btc_regime_blocks_paper_observation_entry"
+            )
+            return context
+
+        context["paper_observation_entry_candidate"] = True
+        context["paper_observation_entry_reason"] = "strong_early_buy_signal"
+        return context
+
+    def _should_process_paper_executor_status(
+        self,
+        signal,
+        confirmed_status: str | None,
+    ) -> tuple[bool, dict[str, object]]:
+        context = self._paper_observation_entry_context(signal, confirmed_status)
+
+        if confirmed_status in {"CONFIRMED_LONG", "CONFIRMED_SHORT"}:
+            return True, context
+
+        return bool(
+            context.get("paper_observation_entry_candidate")
+            or context.get("testnet_observation_entry_candidate")
+        ), context
 
     def _executor_allowed_sides(self) -> set[str]:
         raw = os.getenv("EXECUTOR_ALLOWED_SIDES", "Buy,Sell")
