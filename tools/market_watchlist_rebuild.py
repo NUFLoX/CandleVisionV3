@@ -172,6 +172,8 @@ def upsert_candidates(db_path: str, candidates: list[WatchCandidate], ttl_hours:
             UPDATE market_watchlist
             SET active=0, updated_at=?
             WHERE active=1
+              AND phase <> 'MOMENTUM_OBSERVE'
+              AND phase <> 'MOMENTUM_OBSERVE'
               AND symbol || '|' || market NOT IN ({placeholders})
             """,
             [now_s, *flat],

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run CandleVision Market Momentum Pulse Every 5 Minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
