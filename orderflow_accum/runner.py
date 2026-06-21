@@ -135,6 +135,10 @@ class AccumulationRunner:
         self.promoter = ConfirmedPromoter()
         self._cooldowns: dict[str, float] = {}
         self._counts = {"macro": 0, "orderflow": 0}
+
+        # H1 is analyzed only after the candle closes, and each closed H1 bar
+        # is evaluated once per symbol. This changes timing only, not setup logic.
+        self._processed_closed_h1_bars: dict[tuple[str, str], str] = {}
         self._preimpulse_kinds = {
             "ACCUMULATION_WATCH",
             "ABSORPTION_ZONE",
@@ -1079,6 +1083,178 @@ class AccumulationRunner:
             await self._post_executor_heartbeat(loop="executor_maintenance", refreshed=refreshed)
             await asyncio.sleep(refresh_seconds)
 
+    def _closed_candle_frame(self, df):
+        """Drop the currently forming candle and keep closed history only."""
+        if df is None or getattr(df, "empty", True) or len(df) < 2:
+            return None
+
+        closed = df.iloc[:-1].copy()
+        if getattr(closed, "empty", True):
+            return None
+
+        return closed
+
+    def _closed_h1_frame_once(self, *, symbol: str, market: str, interval: str, df):
+        """Return a newly closed H1 frame once; skip the forming H1 candle."""
+        normalized_interval = str(interval or "").strip().lower()
+
+        if normalized_interval not in {"60", "1h", "h1"}:
+            return df
+
+        if not self._env_bool("H1_CLOSED_CANDLE_ONLY", True):
+            return df
+
+        closed = self._closed_candle_frame(df)
+        if closed is None:
+            return None
+
+        bar_start = str(closed.iloc[-1].get("start", "") or "")
+        if not bar_start:
+            return None
+
+        key = (
+            str(symbol or "").upper(),
+            str(market or "").lower(),
+        )
+
+        if self._processed_closed_h1_bars.get(key) == bar_start:
+            return None
+
+        self._processed_closed_h1_bars[key] = bar_start
+        return closed
+
+    async def _h4_long_entry_gate_context(
+        self,
+        rest: BybitRestClient,
+        signal,
+    ) -> dict[str, object]:
+        """Return a conservative H4 context for future H1 Long entries.
+
+        Scanner/search formulas are untouched. This gate only decides whether an
+        executor entry is allowed after a H1 signal was already produced.
+        """
+        enabled = self._env_bool("EXECUTOR_H4_GATE_ENABLED", True)
+
+        context: dict[str, object] = {
+            "h4_entry_gate_enabled": enabled,
+            "h4_entry_gate_allowed": True,
+            "h4_entry_gate_reason": "h4_gate_not_checked",
+        }
+
+        if not enabled:
+            context["h4_entry_gate_reason"] = "h4_gate_disabled"
+            return context
+
+        side = str(getattr(signal, "side", "") or "")
+        timeframe = str(
+            getattr(signal, "meta", {}).get("tf")
+            if isinstance(getattr(signal, "meta", {}), dict)
+            else ""
+        ).strip().lower()
+
+        if side != "Buy":
+            context["h4_entry_gate_reason"] = "h4_gate_not_buy_signal"
+            return context
+
+        if timeframe not in {"60", "1h", "h1"}:
+            if self._env_bool("EXECUTOR_H1_ONLY_ENTRY_ENABLED", True):
+                context.update(
+                    {
+                        "h4_entry_gate_allowed": False,
+                        "h4_entry_gate_reason": "entry_blocked_entry_timeframe_not_h1",
+                        "h4_entry_gate_timeframe": timeframe or None,
+                    }
+                )
+            else:
+                context["h4_entry_gate_reason"] = "h4_gate_not_h1_signal"
+            return context
+
+        market = str(
+            getattr(signal, "meta", {}).get("market", "linear")
+            if isinstance(getattr(signal, "meta", {}), dict)
+            else "linear"
+        ).lower()
+
+        try:
+            raw_h4 = await rest.fetch_klines(
+                str(signal.symbol),
+                interval="240",
+                limit=80,
+                category=market,
+            )
+        except Exception as exc:
+            context.update(
+                {
+                    "h4_entry_gate_allowed": False,
+                    "h4_entry_gate_reason": "entry_blocked_h4_data_unavailable",
+                    "h4_entry_gate_error": str(exc),
+                }
+            )
+            return context
+
+        closed_h4 = self._closed_candle_frame(raw_h4)
+        if closed_h4 is None or len(closed_h4) < 52:
+            context.update(
+                {
+                    "h4_entry_gate_allowed": False,
+                    "h4_entry_gate_reason": "entry_blocked_h4_data_unavailable",
+                    "h4_entry_gate_error": "not_enough_closed_h4_bars",
+                }
+            )
+            return context
+
+        frame = add_indicators(closed_h4)
+        last = frame.iloc[-1]
+
+        close = self._optional_float(last.get("close"))
+        ema20 = self._optional_float(last.get("ema_20"))
+        ema50 = self._optional_float(last.get("ema_50"))
+        return_3 = self._optional_float(last.get("return_3"))
+
+        if None in {close, ema20, ema50, return_3}:
+            context.update(
+                {
+                    "h4_entry_gate_allowed": False,
+                    "h4_entry_gate_reason": "entry_blocked_h4_data_unavailable",
+                    "h4_entry_gate_error": "missing_h4_indicators",
+                }
+            )
+            return context
+
+        max_return_3 = self._env_float(
+            "EXECUTOR_H4_GATE_MAX_RETURN_3",
+            -0.01,
+        )
+
+        confirmed_bearish = bool(
+            close < ema20
+            and ema20 < ema50
+            and return_3 <= max_return_3
+        )
+
+        context.update(
+            {
+                "h4_entry_gate_close": close,
+                "h4_entry_gate_ema20": ema20,
+                "h4_entry_gate_ema50": ema50,
+                "h4_entry_gate_return_3": return_3,
+                "h4_entry_gate_max_return_3": max_return_3,
+                "h4_entry_gate_confirmed_bearish": confirmed_bearish,
+            }
+        )
+
+        if confirmed_bearish:
+            context.update(
+                {
+                    "h4_entry_gate_allowed": False,
+                    "h4_entry_gate_reason": "entry_blocked_h4_bearish_structure",
+                }
+            )
+        else:
+            context["h4_entry_gate_reason"] = "h4_not_confirmed_bearish"
+
+        return context
+
     async def _run_realtime_scan(
         self,
         rest: BybitRestClient,
@@ -1118,6 +1294,16 @@ class AccumulationRunner:
                             limit=180,
                             category=target.market,
                         )
+
+                        df = self._closed_h1_frame_once(
+                            symbol=symbol,
+                            market=target.market,
+                            interval=interval,
+                            df=df,
+                        )
+
+                        if df is None:
+                            continue
 
                         state = stream.get_state(symbol)
 
@@ -1212,13 +1398,20 @@ class AccumulationRunner:
                     frames = {}
 
                     for interval, limit in intervals.items():
-                        frames[interval] = await rest.fetch_klines(
+                        raw_frame = await rest.fetch_klines(
                             symbol,
                             interval=interval,
                             limit=limit,
                             category=target.market,
                         )
+                        frames[interval] = self._closed_candle_frame(raw_frame)
                         await asyncio.sleep(0.04)
+
+                    if any(
+                        frame is None or getattr(frame, "empty", True)
+                        for frame in frames.values()
+                    ):
+                        continue
 
                     signal = self.macro_engine.analyze(symbol, frames)
 
@@ -3618,7 +3811,14 @@ class AccumulationRunner:
         except Exception:
             self.logger.exception("Hybrid entry shadow observation failed for %s", signal_key)
 
-    def _process_paper_executor(self, signal, market: str, confirmed_status: str | None, state=None) -> None:
+    def _process_paper_executor(
+        self,
+        signal,
+        market: str,
+        confirmed_status: str | None,
+        state=None,
+        h4_entry_context: dict[str, object] | None = None,
+    ) -> None:
         if not self.trade_executor_enabled or self.trade_executor is None:
             return
         should_process, observation_context = self._should_process_paper_executor_status(signal, confirmed_status)
@@ -3627,6 +3827,7 @@ class AccumulationRunner:
         snapshot, weak = self._paper_executor_snapshot(signal, state)
         setup = self._paper_executor_setup(signal)
         observation_context = dict(observation_context or {})
+        observation_context.update(h4_entry_context or {})
         observation_context.update(self._missed_signal_memory_diagnostics(setup))
         forced_early_entry = False
         forced_early_decision = None
@@ -3715,6 +3916,28 @@ class AccumulationRunner:
             forced_early_entry = False
 
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT}:
+            if not bool(observation_context.get("h4_entry_gate_allowed", True)):
+                h4_gate_reason = str(
+                    observation_context.get("h4_entry_gate_reason")
+                    or "entry_blocked_h4_bearish_structure"
+                )
+                h4_gate_decision = TradeDecision(
+                    WATCH,
+                    h4_gate_reason,
+                    "TRADE_WATCH",
+                    None,
+                )
+                self._store_paper_executor_decision(
+                    signal_key,
+                    signal,
+                    h4_gate_decision,
+                    None,
+                    snapshot,
+                    setup=setup,
+                    observation_context=observation_context,
+                )
+                return
+
             if self._executor_symbol_blocked(str(signal.symbol)):
                 block_decision = TradeDecision(WATCH, "entry_blocked_symbol_blocklist", "TRADE_WATCH", None)
                 block_context = {
@@ -3866,7 +4089,17 @@ class AccumulationRunner:
         signal_key = self._signal_key(signal, market)
         self._record_signal_lifecycle(signal, signal_key, upsert, confirmed_status)
 
-        self._process_paper_executor(signal, market, confirmed_status, state)
+        h4_entry_context = None
+        if self.trade_executor_enabled:
+            h4_entry_context = await self._h4_long_entry_gate_context(rest, signal)
+
+        self._process_paper_executor(
+            signal,
+            market,
+            confirmed_status,
+            state,
+            h4_entry_context=h4_entry_context,
+        )
 
         now = time.time()
         cooldown = self._cooldown_seconds(signal)
