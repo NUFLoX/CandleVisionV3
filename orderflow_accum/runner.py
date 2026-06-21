@@ -1973,6 +1973,289 @@ class AccumulationRunner:
 
         return None, diagnostics
 
+    def _executor_target_quality_gate(
+        self,
+        signal,
+        setup: TradeSetup,
+        snapshot: OrderflowSnapshot,
+        confirmed_status: str | None,
+    ) -> tuple[TradeDecision | None, dict[str, object]]:
+        """Block executor entries with weak targets without changing scanner logic.
+
+        Signals are still discovered, stored and reported. This gate affects only
+        paper/testnet/live executor admission after an entry decision exists.
+        """
+        enabled = self._env_bool("EXECUTOR_TARGET_QUALITY_GATE_ENABLED", True)
+
+        kind = str(getattr(signal, "kind", "") or "").strip().upper()
+        status = str(confirmed_status or "").strip().upper()
+        side = str(getattr(setup, "side", "") or "").strip()
+        timeframe = str(getattr(setup, "timeframe", "") or "").strip().lower()
+
+        diagnostics: dict[str, object] = {
+            "target_quality_gate_enabled": enabled,
+            "target_quality_gate_allowed": True,
+            "target_quality_kind": kind or None,
+            "target_quality_status": status or None,
+            "target_quality_side": side or None,
+            "target_quality_timeframe": timeframe or None,
+        }
+
+        if not enabled:
+            diagnostics["target_quality_reason"] = "target_quality_gate_disabled"
+            return None, diagnostics
+
+        # The current executor policy is Buy-only. Preserve Sell behavior here so
+        # this gate cannot alter scanner/short-engine discovery.
+        if side != "Buy":
+            diagnostics["target_quality_reason"] = "target_quality_not_buy_side"
+            return None, diagnostics
+
+        allowed_kinds = {
+            item.strip().upper()
+            for item in os.getenv(
+                "EXECUTOR_TARGET_QUALITY_ALLOWED_KINDS",
+                "PRE_IMPULSE_ZONE,BREAKOUT_PRESSURE,ACCUMULATION_LONG_READY",
+            ).split(",")
+            if item.strip()
+        }
+
+        allowed_statuses = {
+            item.strip().upper()
+            for item in os.getenv(
+                "EXECUTOR_TARGET_QUALITY_ALLOWED_STATUSES",
+                "PRE_IMPULSE,BREAKOUT_PRESSURE,PENDING,CONFIRMED_LONG",
+            ).split(",")
+            if item.strip()
+        }
+
+        # A promoted CONFIRMED_LONG can retain its original scanner kind
+        # (for example ABSORPTION_ZONE), so confirmation is accepted explicitly.
+        kind_allowed = kind in allowed_kinds or status == "CONFIRMED_LONG"
+        status_allowed = status in allowed_statuses
+
+        diagnostics.update(
+            {
+                "target_quality_allowed_kinds": sorted(allowed_kinds),
+                "target_quality_allowed_statuses": sorted(allowed_statuses),
+                "target_quality_kind_allowed": kind_allowed,
+                "target_quality_status_allowed": status_allowed,
+            }
+        )
+
+        if not kind_allowed:
+            diagnostics.update(
+                {
+                    "target_quality_gate_allowed": False,
+                    "target_quality_reason": "entry_blocked_target_quality_kind_not_allowed",
+                }
+            )
+            return (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_kind_not_allowed",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                diagnostics,
+            )
+
+        if not status_allowed:
+            diagnostics.update(
+                {
+                    "target_quality_gate_allowed": False,
+                    "target_quality_reason": "entry_blocked_target_quality_status_not_allowed",
+                }
+            )
+            return (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_status_not_allowed",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                diagnostics,
+            )
+
+        entry_price = self._optional_float(getattr(snapshot, "price", None))
+        tp1 = self._optional_float(getattr(signal, "take_profit_1", None))
+
+        try:
+            initial_sl = self.trade_executor._initial_stop_loss(setup, snapshot)
+        except Exception as exc:
+            diagnostics.update(
+                {
+                    "target_quality_gate_allowed": False,
+                    "target_quality_reason": "entry_blocked_target_quality_invalid_stop",
+                    "target_quality_error": str(exc),
+                }
+            )
+            return (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_invalid_stop",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                diagnostics,
+            )
+
+        if entry_price is None or entry_price <= 0 or initial_sl is None:
+            diagnostics.update(
+                {
+                    "target_quality_gate_allowed": False,
+                    "target_quality_reason": "entry_blocked_target_quality_invalid_price",
+                }
+            )
+            return (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_invalid_price",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                diagnostics,
+            )
+
+        risk = entry_price - float(initial_sl)
+
+        if risk <= 0:
+            diagnostics.update(
+                {
+                    "target_quality_gate_allowed": False,
+                    "target_quality_reason": "entry_blocked_target_quality_invalid_stop",
+                    "target_quality_entry_price": entry_price,
+                    "target_quality_initial_sl": float(initial_sl),
+                }
+            )
+            return (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_invalid_stop",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                diagnostics,
+            )
+
+        risk_pct = risk / entry_price * 100.0
+        max_risk_pct = max(
+            self._env_float(
+                "EXECUTOR_TARGET_QUALITY_MAX_RISK_PCT_1H",
+                self._rr_guard_max_risk_pct(setup),
+            ),
+            0.0,
+        )
+
+        diagnostics.update(
+            {
+                "target_quality_entry_price": entry_price,
+                "target_quality_initial_sl": float(initial_sl),
+                "target_quality_risk_pct": risk_pct,
+                "target_quality_max_risk_pct": max_risk_pct,
+                "target_quality_tp1": tp1,
+            }
+        )
+
+        if max_risk_pct > 0 and risk_pct > max_risk_pct:
+            diagnostics.update(
+                {
+                    "target_quality_gate_allowed": False,
+                    "target_quality_reason": "entry_blocked_target_quality_stop_too_far",
+                }
+            )
+            return (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_stop_too_far",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                diagnostics,
+            )
+
+        if tp1 is None or tp1 <= entry_price:
+            diagnostics.update(
+                {
+                    "target_quality_gate_allowed": False,
+                    "target_quality_reason": "entry_blocked_target_quality_tp1_invalid",
+                }
+            )
+            return (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_tp1_invalid",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                diagnostics,
+            )
+
+        tp1_distance_pct = (tp1 - entry_price) / entry_price * 100.0
+        rr_tp1 = (tp1 - entry_price) / risk
+
+        min_tp1_distance_pct = max(
+            self._env_float(
+                "EXECUTOR_TARGET_QUALITY_MIN_TP1_DISTANCE_PCT",
+                0.20,
+            ),
+            0.0,
+        )
+
+        min_rr_tp1 = max(
+            self._env_float(
+                "EXECUTOR_TARGET_QUALITY_MIN_RR_TP1",
+                0.80,
+            ),
+            0.0,
+        )
+
+        diagnostics.update(
+            {
+                "target_quality_tp1_distance_pct": tp1_distance_pct,
+                "target_quality_min_tp1_distance_pct": min_tp1_distance_pct,
+                "target_quality_rr_tp1": rr_tp1,
+                "target_quality_min_rr_tp1": min_rr_tp1,
+            }
+        )
+
+        if tp1_distance_pct < min_tp1_distance_pct:
+            diagnostics.update(
+                {
+                    "target_quality_gate_allowed": False,
+                    "target_quality_reason": "entry_blocked_target_quality_micro_tp1",
+                }
+            )
+            return (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_micro_tp1",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                diagnostics,
+            )
+
+        if rr_tp1 < min_rr_tp1:
+            diagnostics.update(
+                {
+                    "target_quality_gate_allowed": False,
+                    "target_quality_reason": "entry_blocked_target_quality_rr_tp1",
+                }
+            )
+            return (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_rr_tp1",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                diagnostics,
+            )
+
+        diagnostics["target_quality_reason"] = "target_quality_passed"
+        return None, diagnostics
+
     def _stop_reclaim_reentry_enabled(self) -> bool:
         return self._env_bool("EXECUTOR_STOP_RECLAIM_REENTRY_ENABLED", True)
 
@@ -3949,6 +4232,25 @@ class AccumulationRunner:
                     signal_key,
                     signal,
                     block_decision,
+                    None,
+                    snapshot,
+                    setup=setup,
+                    observation_context=observation_context,
+                )
+                return
+
+            target_quality_decision, target_quality_context = self._executor_target_quality_gate(
+                signal,
+                setup,
+                snapshot,
+                confirmed_status,
+            )
+            observation_context.update(target_quality_context)
+            if target_quality_decision is not None:
+                self._store_paper_executor_decision(
+                    signal_key,
+                    signal,
+                    target_quality_decision,
                     None,
                     snapshot,
                     setup=setup,
