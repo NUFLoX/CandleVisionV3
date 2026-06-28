@@ -947,10 +947,50 @@ class AccumulationRunner:
             await self._run_market_watchlist_builder("scheduled")
 
     async def run(self) -> None:
+        rest_min_interval_seconds = max(
+            self._env_float(
+                "ACC_REST_MIN_INTERVAL_SECONDS",
+                0.25,
+            ),
+            0.05,
+        )
+        rest_rate_limit_retries = max(
+            0,
+            min(
+                self._env_int(
+                    "ACC_REST_RATE_LIMIT_RETRIES",
+                    4,
+                ),
+                8,
+            ),
+        )
+        rest_rate_limit_backoff_seconds = max(
+            self._env_float(
+                "ACC_REST_RATE_LIMIT_BACKOFF_SECONDS",
+                2.0,
+            ),
+            0.25,
+        )
+
+        self.logger.info(
+            "Bybit REST pacing enabled | "
+            "min_interval=%.2fs | "
+            "rate_limit_retries=%s | "
+            "backoff=%.2fs",
+            rest_min_interval_seconds,
+            rest_rate_limit_retries,
+            rest_rate_limit_backoff_seconds,
+        )
+
         async with BybitRestClient(
             self.settings.rest_base_url,
             timeout_seconds=self.settings.rest_timeout_seconds,
             retries=self.settings.rest_retries,
+            min_interval_seconds=rest_min_interval_seconds,
+            rate_limit_retries=rest_rate_limit_retries,
+            rate_limit_backoff_seconds=(
+                rest_rate_limit_backoff_seconds
+            ),
         ) as rest:
             if self._watchlist_realtime_enabled() and self._env_bool("WATCHLIST_REBUILD_ON_STARTUP", True):
                 await self._run_market_watchlist_builder("startup")

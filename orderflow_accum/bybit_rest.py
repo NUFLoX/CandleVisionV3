@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,11 +17,71 @@ class ScanTarget:
     market: str
 
 
+class BybitRateLimitError(RuntimeError):
+    """Raised when Bybit reports API rate limiting."""
+
+
+class AsyncRequestPacer:
+    """Serialize REST starts for one client and support global cooldowns."""
+
+    def __init__(self, min_interval_seconds: float = 0.0) -> None:
+        self.min_interval_seconds = max(
+            float(min_interval_seconds),
+            0.0,
+        )
+        self._next_allowed_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait_turn(self) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                wait_seconds = max(
+                    0.0,
+                    self._next_allowed_at - now,
+                )
+
+                if wait_seconds <= 0:
+                    self._next_allowed_at = (
+                        now + self.min_interval_seconds
+                    )
+                    return
+
+            await asyncio.sleep(wait_seconds)
+
+    async def defer(self, delay_seconds: float) -> None:
+        async with self._lock:
+            self._next_allowed_at = max(
+                self._next_allowed_at,
+                time.monotonic()
+                + max(float(delay_seconds), 0.0),
+            )
+
+
 class BybitRestClient:
-    def __init__(self, base_url: str, timeout_seconds: int = 25, retries: int = 2):
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: int = 25,
+        retries: int = 2,
+        min_interval_seconds: float = 0.0,
+        rate_limit_retries: int = 0,
+        rate_limit_backoff_seconds: float = 1.0,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        self.retries = retries
+        self.retries = max(int(retries), 0)
+        self.rate_limit_retries = max(
+            int(rate_limit_retries),
+            0,
+        )
+        self.rate_limit_backoff_seconds = max(
+            float(rate_limit_backoff_seconds),
+            0.0,
+        )
+        self._request_pacer = AsyncRequestPacer(
+            min_interval_seconds=min_interval_seconds
+        )
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self) -> "BybitRestClient":
@@ -31,25 +92,112 @@ class BybitRestClient:
         if self._session:
             await self._session.close()
 
-    async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def _get(
+        self,
+        path: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
         if not self._session:
-            raise RuntimeError("BybitRestClient session is not started")
+            raise RuntimeError(
+                "BybitRestClient session is not started"
+            )
+
         url = f"{self.base_url}{path}"
-        last_exc: Exception | None = None
-        for attempt in range(self.retries + 1):
+        network_attempt = 0
+        rate_limit_attempt = 0
+
+        while True:
+            await self._request_pacer.wait_turn()
+
             try:
-                async with self._session.get(url, params=params) as response:
+                async with self._session.get(
+                    url,
+                    params=params,
+                ) as response:
                     response.raise_for_status()
                     data = await response.json()
-                    if data.get("retCode") != 0:
-                        raise RuntimeError(f"Bybit API error: {data}")
-                    return data.get("result", {})
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_exc = exc
-                if attempt >= self.retries:
+
+                ret_code = data.get("retCode")
+
+                if str(ret_code) == "10006":
+                    raise BybitRateLimitError(
+                        f"Bybit API rate limit: {data}"
+                    )
+
+                if ret_code != 0:
+                    raise RuntimeError(
+                        f"Bybit API error: {data}"
+                    )
+
+                return data.get("result", {})
+
+            except BybitRateLimitError:
+                if rate_limit_attempt >= self.rate_limit_retries:
                     raise
-                await asyncio.sleep(0.6 * (attempt + 1))
-        raise RuntimeError(f"Request failed: {last_exc!r}")
+
+                cooldown_seconds = (
+                    self.rate_limit_backoff_seconds
+                    * (2 ** rate_limit_attempt)
+                )
+                rate_limit_attempt += 1
+
+                logger.warning(
+                    "Bybit rate limit on %s; retry %s/%s after %.2fs",
+                    path,
+                    rate_limit_attempt,
+                    self.rate_limit_retries,
+                    cooldown_seconds,
+                )
+
+                await self._request_pacer.defer(
+                    cooldown_seconds
+                )
+                continue
+
+            except aiohttp.ClientResponseError as exc:
+                if (
+                    exc.status == 429
+                    and rate_limit_attempt
+                    < self.rate_limit_retries
+                ):
+                    cooldown_seconds = (
+                        self.rate_limit_backoff_seconds
+                        * (2 ** rate_limit_attempt)
+                    )
+                    rate_limit_attempt += 1
+
+                    logger.warning(
+                        "Bybit HTTP 429 on %s; retry %s/%s after %.2fs",
+                        path,
+                        rate_limit_attempt,
+                        self.rate_limit_retries,
+                        cooldown_seconds,
+                    )
+
+                    await self._request_pacer.defer(
+                        cooldown_seconds
+                    )
+                    continue
+
+                if network_attempt >= self.retries:
+                    raise
+
+                network_attempt += 1
+                await asyncio.sleep(
+                    0.6 * network_attempt
+                )
+
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ):
+                if network_attempt >= self.retries:
+                    raise
+
+                network_attempt += 1
+                await asyncio.sleep(
+                    0.6 * network_attempt
+                )
 
     async def fetch_linear_symbols(self, quote_coin: str = "USDT") -> list[dict[str, Any]]:
         result = await self._get(
