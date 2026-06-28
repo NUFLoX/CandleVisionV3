@@ -11,6 +11,7 @@ from tools.universal_market_radar import (
     calculate_radar_score,
     cap_bucket,
     late_impulse_reasons,
+    is_bybit_rate_limit_error,
 )
 
 
@@ -151,3 +152,16 @@ def test_unverified_market_cap_never_receives_radar_score():
         volume_stability=0.80,
         is_late=False,
     ) > 0.0
+
+
+def test_detects_bybit_rate_limit_error():
+    rate_limit_error = RuntimeError(
+        "Bybit API error: {'retCode': 10006, "
+        "'retMsg': 'Too many visits. "
+        "Exceeded the API Rate Limit.'}"
+    )
+
+    unrelated_error = RuntimeError("Bybit API error: retCode=10001")
+
+    assert is_bybit_rate_limit_error(rate_limit_error)
+    assert not is_bybit_rate_limit_error(unrelated_error)

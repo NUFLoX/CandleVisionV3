@@ -408,6 +408,49 @@ def build_bybit_spot_base_index(
     }
 
 
+class AsyncRequestPacer:
+    def __init__(self, min_interval_seconds: float) -> None:
+        self.min_interval_seconds = max(
+            0.0,
+            float(min_interval_seconds),
+        )
+        self._next_allowed_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait_turn(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            wait_seconds = max(
+                0.0,
+                self._next_allowed_at - now,
+            )
+
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+
+            self._next_allowed_at = (
+                time.monotonic()
+                + self.min_interval_seconds
+            )
+
+    async def defer(self, delay_seconds: float) -> None:
+        async with self._lock:
+            self._next_allowed_at = max(
+                self._next_allowed_at,
+                time.monotonic() + max(0.0, delay_seconds),
+            )
+
+
+def is_bybit_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+
+    return (
+        "retcode': 10006" in message
+        or '"retcode": 10006' in message
+        or "exceeded the api rate limit" in message
+    )
+
+
 def calculate_h1_metrics(frame: pd.DataFrame) -> dict[str, Any]:
     if frame.empty:
         return {
@@ -475,26 +518,51 @@ def calculate_h1_metrics(frame: pd.DataFrame) -> dict[str, Any]:
 async def fetch_h1_metrics(
     rest: BybitRestClient,
     semaphore: asyncio.Semaphore,
+    pacer: AsyncRequestPacer,
     symbol: str,
     kline_limit: int,
+    rate_limit_retries: int,
+    rate_limit_backoff_seconds: float,
 ) -> tuple[str, dict[str, Any]]:
     async with semaphore:
-        try:
-            frame = await rest.fetch_klines(
-                symbol=symbol,
-                interval="60",
-                limit=kline_limit,
-                category="linear",
-            )
+        for attempt in range(rate_limit_retries + 1):
+            await pacer.wait_turn()
 
-            return symbol, calculate_h1_metrics(frame)
+            try:
+                frame = await rest.fetch_klines(
+                    symbol=symbol,
+                    interval="60",
+                    limit=kline_limit,
+                    category="linear",
+                )
 
-        except Exception as exc:
-            return symbol, {
-                "h1_closed_bars": 0,
-                "h1_status": "request_error",
-                "h1_error": f"{type(exc).__name__}: {str(exc)[:160]}",
-            }
+                return symbol, calculate_h1_metrics(frame)
+
+            except Exception as exc:
+                is_rate_limited = is_bybit_rate_limit_error(exc)
+
+                if is_rate_limited and attempt < rate_limit_retries:
+                    cooldown_seconds = (
+                        rate_limit_backoff_seconds
+                        * (2 ** attempt)
+                    )
+                    await pacer.defer(cooldown_seconds)
+                    continue
+
+                return symbol, {
+                    "h1_closed_bars": 0,
+                    "h1_status": "request_error",
+                    "h1_error": (
+                        f"attempts={attempt + 1}; "
+                        f"{type(exc).__name__}: {str(exc)[:160]}"
+                    ),
+                }
+
+        return symbol, {
+            "h1_closed_bars": 0,
+            "h1_status": "request_error",
+            "h1_error": "unexpected_h1_retry_exhaustion",
+        }
 
 
 def late_impulse_reasons(
@@ -803,6 +871,33 @@ async def main() -> None:
         ),
     )
 
+    kline_min_interval_seconds = max(
+        0.25,
+        env_float(
+            "UNIVERSAL_RADAR_KLINE_MIN_INTERVAL_SECONDS",
+            1.0,
+        ),
+    )
+
+    kline_rate_limit_retries = max(
+        0,
+        min(
+            env_int(
+                "UNIVERSAL_RADAR_KLINE_RATE_LIMIT_RETRIES",
+                4,
+            ),
+            8,
+        ),
+    )
+
+    kline_rate_limit_backoff_seconds = max(
+        1.0,
+        env_float(
+            "UNIVERSAL_RADAR_KLINE_RATE_LIMIT_BACKOFF_SECONDS",
+            5.0,
+        ),
+    )
+
     cap_timeout = max(
         10,
         env_int("COINPAPRIKA_TIMEOUT_SECONDS", 45),
@@ -833,6 +928,14 @@ async def main() -> None:
     print("quote:", settings.quote_coin)
     print("min_turnover_24h:", f"${min_turnover_24h:,.0f}")
     print("kline_concurrency:", concurrency)
+    print(
+        "kline_min_interval_seconds:",
+        kline_min_interval_seconds,
+    )
+    print(
+        "kline_rate_limit_retries:",
+        kline_rate_limit_retries,
+    )
 
     conn.execute(
         """
@@ -988,14 +1091,22 @@ async def main() -> None:
             )
 
             semaphore = asyncio.Semaphore(concurrency)
+            request_pacer = AsyncRequestPacer(
+                kline_min_interval_seconds
+            )
 
             metric_pairs = await asyncio.gather(
                 *[
                     fetch_h1_metrics(
                         rest=bybit,
                         semaphore=semaphore,
+                        pacer=request_pacer,
                         symbol=symbol,
                         kline_limit=kline_limit,
+                        rate_limit_retries=kline_rate_limit_retries,
+                        rate_limit_backoff_seconds=(
+                            kline_rate_limit_backoff_seconds
+                        ),
                     )
                     for symbol in liquid_symbols
                 ]
