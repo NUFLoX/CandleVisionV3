@@ -414,7 +414,8 @@ class DeferredEntryStore:
                 ready_at TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 last_snapshot_json TEXT NOT NULL DEFAULT '{}',
-                diagnostics_json TEXT NOT NULL DEFAULT '{}'
+                diagnostics_json TEXT NOT NULL DEFAULT '{}',
+                revalidation_json TEXT NOT NULL DEFAULT '{}'
             )
             """
         )
@@ -424,6 +425,23 @@ class DeferredEntryStore:
             ON deferred_entries(status, expires_at, updated_at)
             """
         )
+
+        columns = {
+            str(row[1])
+            for row in self.conn.execute(
+                "PRAGMA table_info(deferred_entries)"
+            ).fetchall()
+        }
+
+        if "revalidation_json" not in columns:
+            self.conn.execute(
+                """
+                ALTER TABLE deferred_entries
+                ADD COLUMN revalidation_json
+                TEXT NOT NULL DEFAULT '{}'
+                """
+            )
+
         self.conn.commit()
 
     @staticmethod
@@ -481,6 +499,7 @@ class DeferredEntryStore:
             "metadata_json",
             "last_snapshot_json",
             "diagnostics_json",
+            "revalidation_json",
         ):
             payload[key] = self._decode_json(payload.get(key))
         return payload
@@ -635,3 +654,71 @@ class DeferredEntryStore:
                 "deferred entry disappeared after update"
             )
         return row
+
+    def record_revalidation(
+        self,
+        signal_key: str,
+        *,
+        allowed_to_enter: bool,
+        reason: str,
+        diagnostics: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Persist the latest strict revalidation without changing lifecycle."""
+
+        record = self.get(signal_key)
+
+        if record is None:
+            raise KeyError(
+                f"unknown deferred entry: {signal_key}"
+            )
+
+        if str(record.get("status") or "") != DEFERRED_ENTRY_READY:
+            return None
+
+        previous = record.get("revalidation_json") or {}
+
+        if not isinstance(previous, dict):
+            previous = {}
+
+        try:
+            attempts = max(
+                int(previous.get("attempt_count") or 0),
+                0,
+            )
+        except (TypeError, ValueError):
+            attempts = 0
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        payload = {
+            "attempt_count": attempts + 1,
+            "allowed_to_enter": bool(allowed_to_enter),
+            "reason": str(reason or ""),
+            "recorded_at": now,
+            "diagnostics": dict(diagnostics or {}),
+        }
+
+        cursor = self.conn.execute(
+            """
+            UPDATE deferred_entries
+            SET
+                updated_at = ?,
+                last_reason = ?,
+                revalidation_json = ?
+            WHERE signal_key = ?
+              AND status = ?
+            """,
+            (
+                now,
+                str(reason or ""),
+                self._safe_json(payload),
+                signal_key,
+                DEFERRED_ENTRY_READY,
+            ),
+        )
+        self.conn.commit()
+
+        if cursor.rowcount != 1:
+            return None
+
+        return self.get(signal_key)
