@@ -27,8 +27,16 @@ from .chart_render import render_signal_chart
 from .signal_logger import RejectionCsvLogger, SignalCsvLogger
 from .signal_store import SignalStore
 from .deferred_entry import (
+    DEFERRED_ENTRY_READY,
     DeferredEntryStore,
     TRANSIENT_ENTRY_BLOCK_REASONS,
+)
+from .deferred_entry_revalidation import (
+    DeferredEntryRevalidationResult,
+    revalidate_ready_deferred_entry,
+)
+from .deferred_entry_revalidation_service import (
+    DeferredEntryRevalidationService,
 )
 from .deferred_entry_service import (
     DeferredEntryCoordinator,
@@ -135,6 +143,8 @@ class AccumulationRunner:
         self.deferred_entry_store = None
         self.deferred_entry_runtime = None
         self.deferred_entry_refresh_service = None
+        self.deferred_entry_revalidation_service = None
+        self._deferred_entry_revalidation_enabled = False
         self._deferred_entry_structure_cache: dict[
             tuple[str, str],
             tuple[float, dict[str, object]],
@@ -210,6 +220,20 @@ class AccumulationRunner:
                     ),
                 )
             )
+
+        if (
+            deferred_entry_enabled
+            and self._env_bool(
+                "EXECUTOR_DEFERRED_ENTRY_REVALIDATION_ENABLED",
+                False,
+            )
+        ):
+            self.deferred_entry_revalidation_service = (
+                DeferredEntryRevalidationService(
+                    coordinator,
+                )
+            )
+            self._deferred_entry_revalidation_enabled = True
 
         self.trade_executor_mode = self._resolve_trade_executor_mode(settings)
         self.trade_executor_enabled = (
@@ -1254,6 +1278,16 @@ class AccumulationRunner:
             except Exception:
                 self.logger.exception(
                     "Deferred entry lifecycle refresh failed"
+                )
+
+            try:
+                await self.revalidate_ready_deferred_entry_candidates(
+                    rest=rest,
+                    stream=stream,
+                )
+            except Exception:
+                self.logger.exception(
+                    "Deferred entry strict revalidation failed"
                 )
 
             await self._post_executor_heartbeat(
@@ -4306,11 +4340,32 @@ class AccumulationRunner:
         ):
             return None
 
+        vwap = None
+        try:
+            volume = frame["volume"].tail(20).astype(float)
+            typical_price = (
+                (
+                    frame["high"].tail(20).astype(float)
+                    + frame["low"].tail(20).astype(float)
+                    + frame["close"].tail(20).astype(float)
+                )
+                / 3.0
+            )
+            total_volume = float(volume.sum())
+            if total_volume > 0:
+                vwap = float(
+                    (typical_price * volume).sum()
+                    / total_volume
+                )
+        except Exception:
+            vwap = None
+
         structure: dict[str, object] = {
             "price": close,
             "candle_close": close,
             "support": support,
             "ema20": ema20,
+            "vwap": vwap,
             "closed_h1_start": str(
                 last.get("start", "") or ""
             ),
@@ -4321,6 +4376,611 @@ class AccumulationRunner:
             dict(structure),
         )
         return structure
+
+
+    def _deferred_entry_revalidation_due(self, record) -> bool:
+        cooldown_seconds = max(
+            self._env_float(
+                "EXECUTOR_DEFERRED_ENTRY_REVALIDATION_COOLDOWN_SECONDS",
+                300.0,
+            ),
+            0.0,
+        )
+
+        if cooldown_seconds <= 0:
+            return True
+
+        previous = record.get("revalidation_json")
+
+        if not isinstance(previous, dict):
+            return True
+
+        raw_recorded_at = str(
+            previous.get("recorded_at") or ""
+        ).strip()
+
+        if not raw_recorded_at:
+            return True
+
+        try:
+            recorded_at = datetime.fromisoformat(
+                raw_recorded_at.replace("Z", "+00:00")
+            )
+            if recorded_at.tzinfo is None:
+                recorded_at = recorded_at.replace(tzinfo=UTC)
+        except (TypeError, ValueError):
+            return True
+
+        elapsed_seconds = (
+            datetime.now(UTC) - recorded_at
+        ).total_seconds()
+
+        return elapsed_seconds >= cooldown_seconds
+
+    def _deferred_entry_revalidation_signal(
+        self,
+        record,
+        regime,
+    ):
+        metadata = record.get("metadata_json")
+
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        signal_meta = metadata.get("signal_meta")
+
+        if not isinstance(signal_meta, dict):
+            signal_meta = {}
+
+        meta = dict(signal_meta)
+
+        # Revalidation must use the fresh stream/H1 snapshot below, never a
+        # historical executor override or stale structural fields.
+        for key in (
+            "executor_snapshot",
+            "support",
+            "ema20",
+            "vwap",
+        ):
+            meta.pop(key, None)
+
+        meta["tf"] = str(record.get("timeframe") or "60")
+        meta["market"] = str(
+            record.get("market") or "linear"
+        ).lower()
+
+        raw_reasons = metadata.get("signal_reasons")
+
+        if isinstance(raw_reasons, (list, tuple, set)):
+            reasons = [
+                str(item)
+                for item in raw_reasons
+                if str(item).strip()
+            ]
+        elif raw_reasons:
+            reasons = [str(raw_reasons)]
+        else:
+            reasons = [
+                str(record.get("signal_kind") or "")
+            ]
+
+        signal = SimpleNamespace(
+            symbol=str(record.get("symbol") or "").upper(),
+            side=str(record.get("side") or "Buy"),
+            entry=self._optional_float(
+                record.get("origin_entry")
+            )
+            or 0.0,
+            stop_loss=self._optional_float(
+                record.get("origin_stop_loss")
+            )
+            or 0.0,
+            score=self._optional_float(
+                record.get("origin_score")
+            )
+            or 0.0,
+            kind=str(record.get("signal_kind") or ""),
+            source=str(metadata.get("source") or "orderflow"),
+            reasons=reasons,
+            take_profit_1=self._optional_float(
+                metadata.get("take_profit_1")
+            ),
+            take_profit_2=self._optional_float(
+                metadata.get("take_profit_2")
+            ),
+            meta=meta,
+        )
+
+        self._apply_market_regime_meta(signal, regime)
+
+        confirmed_status = str(
+            metadata.get("confirmed_status") or ""
+        )
+
+        return signal, confirmed_status
+
+    async def revalidate_ready_deferred_entry_candidates(
+        self,
+        *,
+        rest: BybitRestClient,
+        stream: MarketStream,
+    ) -> int:
+        """Observe strict readiness for READY deferred candidates only.
+
+        This bridge persists diagnostics only. It does not route an order,
+        mutate scanner discovery logic, or apply any entry override.
+        """
+
+        runtime = getattr(
+            self,
+            "deferred_entry_runtime",
+            None,
+        )
+        service = getattr(
+            self,
+            "deferred_entry_revalidation_service",
+            None,
+        )
+
+        if (
+            runtime is None
+            or service is None
+            or not getattr(
+                self,
+                "_deferred_entry_revalidation_enabled",
+                False,
+            )
+            or not runtime.config.enabled
+            or self.trade_executor_mode != "paper"
+        ):
+            return 0
+
+        max_active = max(
+            1,
+            min(
+                int(
+                    self._env_float(
+                        "EXECUTOR_DEFERRED_ENTRY_REVALIDATION_MAX_ACTIVE",
+                        12.0,
+                    )
+                ),
+                200,
+            ),
+        )
+
+        ready_records = [
+            record
+            for record in runtime.coordinator.store.list_active(
+                limit=max_active,
+                statuses=(DEFERRED_ENTRY_READY,),
+            )
+            if self._deferred_entry_revalidation_due(record)
+        ]
+
+        if not ready_records:
+            return 0
+
+        def blocked_result(
+            record,
+            reason: str,
+            diagnostics: dict[str, object] | None = None,
+        ) -> DeferredEntryRevalidationResult:
+            payload = {
+                "deferred_entry_revalidation_allowed": False,
+                "deferred_entry_revalidation_reason": reason,
+            }
+            payload.update(dict(diagnostics or {}))
+
+            return DeferredEntryRevalidationResult(
+                signal_key=str(record.get("signal_key") or ""),
+                allowed_to_enter=False,
+                reason=reason,
+                executor_decision=None,
+                diagnostics=payload,
+            )
+
+        if (
+            not self.trade_executor_enabled
+            or self.trade_executor is None
+        ):
+            batch = service.persist_ready_results(
+                [
+                    blocked_result(
+                        record,
+                        "deferred_entry_revalidation_executor_disabled",
+                    )
+                    for record in ready_records
+                ]
+            )
+            return batch.persisted
+
+        try:
+            btc_frames = await self._fetch_btc_regime_frames(rest)
+
+            if not btc_frames:
+                raise RuntimeError(
+                    "missing_btc_regime_frames"
+                )
+
+            regime = self.regime_analyzer.analyze_btc(
+                btc_frames
+            )
+            btc_regime = str(
+                getattr(regime, "btc_regime", "") or ""
+            ).strip()
+
+            if not btc_regime:
+                raise RuntimeError(
+                    "missing_btc_regime"
+                )
+        except Exception:
+            self.logger.debug(
+                "Deferred revalidation BTC regime unavailable",
+                exc_info=True,
+            )
+            batch = service.persist_ready_results(
+                [
+                    blocked_result(
+                        record,
+                        "deferred_entry_revalidation_btc_data_unavailable",
+                    )
+                    for record in ready_records
+                ]
+            )
+            return batch.persisted
+
+        max_orderflow_age_seconds = max(
+            5.0,
+            self._env_float(
+                "EXECUTOR_DEFERRED_ENTRY_MAX_ORDERFLOW_AGE_SECONDS",
+                90.0,
+            ),
+        )
+        results: list[DeferredEntryRevalidationResult] = []
+
+        for record in ready_records:
+            signal_key = str(record.get("signal_key") or "")
+            symbol = str(record.get("symbol") or "").upper()
+
+            try:
+                if not signal_key or not symbol:
+                    results.append(
+                        blocked_result(
+                            record,
+                            "deferred_entry_revalidation_invalid_record",
+                        )
+                    )
+                    continue
+
+                signal, confirmed_status = (
+                    self._deferred_entry_revalidation_signal(
+                        record,
+                        regime,
+                    )
+                )
+
+                structure = (
+                    await self._deferred_entry_closed_h1_structure(
+                        rest,
+                        record,
+                    )
+                )
+
+                if structure is None:
+                    results.append(
+                        blocked_result(
+                            record,
+                            "deferred_entry_revalidation_h1_data_unavailable",
+                            {
+                                "deferred_entry_revalidation_btc_regime": (
+                                    btc_regime
+                                ),
+                            },
+                        )
+                    )
+                    continue
+
+                state = (
+                    stream.get_state(symbol)
+                    if stream is not None
+                    and hasattr(stream, "get_state")
+                    else None
+                )
+                latest_book = (
+                    state.snapshots[-1]
+                    if state is not None
+                    and getattr(state, "snapshots", None)
+                    else None
+                )
+                live_price = self._optional_float(
+                    getattr(latest_book, "mid", None)
+                )
+                latest_ts = self._optional_float(
+                    getattr(latest_book, "ts", None)
+                )
+
+                orderflow_age_seconds = None
+
+                if latest_ts is not None and latest_ts > 0:
+                    orderflow_age_seconds = (
+                        time.time() - latest_ts
+                    )
+
+                snapshot_fresh = bool(
+                    latest_book is not None
+                    and live_price is not None
+                    and live_price > 0
+                    and orderflow_age_seconds is not None
+                    and 0.0 <= orderflow_age_seconds
+                    <= max_orderflow_age_seconds
+                )
+
+                if not snapshot_fresh:
+                    results.append(
+                        blocked_result(
+                            record,
+                            "deferred_entry_revalidation_missing_fresh_orderflow",
+                            {
+                                "deferred_entry_revalidation_btc_regime": (
+                                    btc_regime
+                                ),
+                                "deferred_entry_revalidation_h1_start": (
+                                    structure.get(
+                                        "closed_h1_start"
+                                    )
+                                ),
+                                "deferred_entry_revalidation_orderflow_age_seconds": (
+                                    orderflow_age_seconds
+                                ),
+                            },
+                        )
+                    )
+                    continue
+
+                live_snapshot, weak = (
+                    self._paper_executor_snapshot(
+                        signal,
+                        state,
+                    )
+                )
+
+                if weak:
+                    results.append(
+                        blocked_result(
+                            record,
+                            "deferred_entry_revalidation_missing_fresh_orderflow",
+                            {
+                                "deferred_entry_revalidation_btc_regime": (
+                                    btc_regime
+                                ),
+                                "deferred_entry_revalidation_h1_start": (
+                                    structure.get(
+                                        "closed_h1_start"
+                                    )
+                                ),
+                                "deferred_entry_revalidation_snapshot_weak": (
+                                    True
+                                ),
+                            },
+                        )
+                    )
+                    continue
+
+                volume_diagnostics = (
+                    self._derive_volume_impulse(
+                        signal,
+                        state,
+                        live_snapshot.buy_flow,
+                        live_snapshot.sell_flow,
+                    )
+                )
+
+                if bool(
+                    volume_diagnostics.get(
+                        "volume_impulse_missing"
+                    )
+                ):
+                    live_snapshot = dataclasses.replace(
+                        live_snapshot,
+                        volume_impulse=0.0,
+                    )
+
+                snapshot = dataclasses.replace(
+                    live_snapshot,
+                    support=self._optional_float(
+                        structure.get("support")
+                    ),
+                    ema20=self._optional_float(
+                        structure.get("ema20")
+                    ),
+                    vwap=self._optional_float(
+                        structure.get("vwap")
+                    ),
+                    candle_close=self._optional_float(
+                        structure.get("candle_close")
+                    )
+                    or live_snapshot.candle_close,
+                )
+
+                h4_context = (
+                    await self._h4_long_entry_gate_context(
+                        rest,
+                        signal,
+                    )
+                )
+                guard_context: dict[str, object] = {}
+
+                def final_guard_decisions():
+                    if self._executor_symbol_blocked(
+                        str(signal.symbol)
+                    ):
+                        guard_context.update(
+                            {
+                                "executor_symbol_blocked": True,
+                                "deferred_entry_revalidation_blocking_guard": (
+                                    "symbol_blocklist"
+                                ),
+                            }
+                        )
+                        yield (
+                            "symbol_blocklist",
+                            TradeDecision(
+                                WATCH,
+                                "entry_blocked_symbol_blocklist",
+                                "TRADE_WATCH",
+                                None,
+                            ),
+                        )
+                        return
+
+                    target_guard, target_context = (
+                        self._executor_target_quality_gate(
+                            signal,
+                            self._paper_executor_setup(
+                                signal
+                            ),
+                            snapshot,
+                            confirmed_status,
+                        )
+                    )
+                    guard_context.update(target_context)
+                    yield (
+                        "target_quality",
+                        target_guard,
+                    )
+
+                    setup = self._paper_executor_setup(signal)
+
+                    rr_guard, rr_context = (
+                        self._entry_risk_reward_guard(
+                            signal,
+                            setup,
+                            snapshot,
+                        )
+                    )
+                    guard_context.update(rr_context)
+                    yield ("rr", rr_guard)
+
+                    lock_guard, lock_context = (
+                        self._executor_symbol_position_lock(
+                            signal_key,
+                            setup,
+                        )
+                    )
+                    guard_context.update(lock_context)
+                    yield ("symbol_lock", lock_guard)
+
+                    late_guard, late_context = (
+                        self._evaluate_late_chase_gate(
+                            signal_key,
+                            signal,
+                            setup,
+                            snapshot,
+                        )
+                    )
+                    guard_context.update(late_context)
+                    yield ("late_chase", late_guard)
+
+                    learning_guard, learning_context = (
+                        self._evaluate_executor_learning_gate(
+                            setup
+                        )
+                    )
+                    guard_context.update(learning_context)
+                    yield ("learning", learning_guard)
+
+                    stop_guard, stop_context = (
+                        self._entry_stop_loss_guard(
+                            setup,
+                            snapshot,
+                        )
+                    )
+                    guard_context.update(stop_context)
+                    yield ("stop_loss", stop_guard)
+
+                setup = self._paper_executor_setup(signal)
+
+                result = revalidate_ready_deferred_entry(
+                    record=record,
+                    mode=self.trade_executor_mode,
+                    setup=setup,
+                    snapshot=snapshot,
+                    snapshot_fresh=True,
+                    h4_allowed=bool(
+                        h4_context.get(
+                            "h4_entry_gate_allowed",
+                            False,
+                        )
+                    ),
+                    h4_reason=str(
+                        h4_context.get(
+                            "h4_entry_gate_reason"
+                        )
+                        or ""
+                    ),
+                    executor=self.trade_executor,
+                    guard_decisions=final_guard_decisions(),
+                )
+
+                diagnostics = dict(result.diagnostics)
+                diagnostics.update(
+                    {
+                        "deferred_entry_revalidation_btc_regime": (
+                            btc_regime
+                        ),
+                        "deferred_entry_revalidation_market_regime": (
+                            str(
+                                getattr(
+                                    regime,
+                                    "market_regime",
+                                    "",
+                                )
+                                or btc_regime
+                            )
+                        ),
+                        "deferred_entry_revalidation_h1_start": (
+                            structure.get("closed_h1_start")
+                        ),
+                        "deferred_entry_revalidation_volume_source": (
+                            volume_diagnostics.get(
+                                "volume_impulse_source"
+                            )
+                        ),
+                    }
+                )
+                diagnostics.update(h4_context)
+                diagnostics.update(guard_context)
+
+                results.append(
+                    dataclasses.replace(
+                        result,
+                        diagnostics=diagnostics,
+                    )
+                )
+            except Exception:
+                self.logger.exception(
+                    "Deferred ready revalidation failed for %s",
+                    signal_key,
+                )
+                results.append(
+                    blocked_result(
+                        record,
+                        "deferred_entry_revalidation_internal_error",
+                    )
+                )
+
+        batch = service.persist_ready_results(results)
+
+        if batch.persisted:
+            self.logger.info(
+                "Deferred strict revalidation: persisted=%s "
+                "missing=%s not_ready=%s",
+                batch.persisted,
+                len(batch.skipped_missing),
+                len(batch.skipped_not_ready),
+            )
+
+        return batch.persisted
 
     async def refresh_deferred_entry_candidates(
         self,

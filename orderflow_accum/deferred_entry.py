@@ -573,9 +573,28 @@ class DeferredEntryStore:
         self,
         *,
         limit: int = 200,
+        statuses: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
-        statuses = sorted(ACTIVE_DEFERRED_STATUSES)
-        placeholders = ",".join("?" for _ in statuses)
+        requested_statuses = (
+            ACTIVE_DEFERRED_STATUSES
+            if statuses is None
+            else {
+                str(status)
+                for status in statuses
+            }
+        )
+        active_statuses = sorted(
+            status
+            for status in requested_statuses
+            if status in ACTIVE_DEFERRED_STATUSES
+        )
+
+        if not active_statuses:
+            return []
+
+        placeholders = ",".join(
+            "?" for _ in active_statuses
+        )
 
         rows = self.conn.execute(
             f"""
@@ -585,7 +604,7 @@ class DeferredEntryStore:
             ORDER BY updated_at ASC
             LIMIT ?
             """,
-            (*statuses, max(int(limit), 1)),
+            (*active_statuses, max(int(limit), 1)),
         ).fetchall()
 
         return [
