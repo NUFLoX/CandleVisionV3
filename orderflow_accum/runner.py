@@ -40,6 +40,12 @@ from .deferred_entry_runtime import (
 from .deferred_entry_runner_adapter import (
     register_deferred_watch,
 )
+from .deferred_entry_refresh_service import (
+    DeferredEntryRefreshService,
+)
+from .deferred_entry_snapshot_adapter import (
+    build_deferred_entry_snapshot,
+)
 from .confirmed_promoter import ConfirmedPromoter
 from .indicators import add_indicators
 from .hybrid_entry_shadow import HybridEntryShadowEngine
@@ -128,15 +134,21 @@ class AccumulationRunner:
         )
         self.deferred_entry_store = None
         self.deferred_entry_runtime = None
+        self.deferred_entry_refresh_service = None
+        self._deferred_entry_structure_cache: dict[
+            tuple[str, str],
+            tuple[float, dict[str, object]],
+        ] = {}
 
         if deferred_entry_enabled:
             self.deferred_entry_store = DeferredEntryStore(
                 str(self.signal_store.db_path)
             )
+            coordinator = DeferredEntryCoordinator(
+                self.deferred_entry_store
+            )
             self.deferred_entry_runtime = DeferredEntryRuntime(
-                DeferredEntryCoordinator(
-                    self.deferred_entry_store
-                ),
+                coordinator,
                 config=DeferredEntryRuntimeConfig(
                     enabled=True,
                     ttl_hours=self._env_float(
@@ -178,6 +190,25 @@ class AccumulationRunner:
                         ),
                     ),
                 ),
+            )
+
+        if deferred_entry_enabled:
+            self.deferred_entry_refresh_service = (
+                DeferredEntryRefreshService(
+                    coordinator,
+                    max_active=max(
+                        1,
+                        min(
+                            int(
+                                self._env_float(
+                                    "EXECUTOR_DEFERRED_ENTRY_REFRESH_MAX_ACTIVE",
+                                    12.0,
+                                )
+                            ),
+                            200,
+                        ),
+                    ),
+                )
             )
 
         self.trade_executor_mode = self._resolve_trade_executor_mode(settings)
@@ -1206,10 +1237,29 @@ class AccumulationRunner:
         while True:
             refreshed = 0
             try:
-                refreshed = await self.refresh_open_executor_positions(rest=rest, stream=stream)
+                refreshed = await self.refresh_open_executor_positions(
+                    rest=rest,
+                    stream=stream,
+                )
             except Exception:
-                self.logger.exception("Open executor position refresh failed")
-            await self._post_executor_heartbeat(loop="executor_maintenance", refreshed=refreshed)
+                self.logger.exception(
+                    "Open executor position refresh failed"
+                )
+
+            try:
+                await self.refresh_deferred_entry_candidates(
+                    rest=rest,
+                    stream=stream,
+                )
+            except Exception:
+                self.logger.exception(
+                    "Deferred entry lifecycle refresh failed"
+                )
+
+            await self._post_executor_heartbeat(
+                loop="executor_maintenance",
+                refreshed=refreshed,
+            )
             await asyncio.sleep(refresh_seconds)
 
     def _closed_candle_frame(self, df):
@@ -4158,6 +4208,327 @@ class AccumulationRunner:
             return snapshot
         except Exception:
             return {}
+
+    def _deferred_entry_structure_refresh_seconds(self) -> float:
+        """Keep H1 structure reads bounded independently from live flow refresh."""
+
+        return max(
+            60.0,
+            self._env_float(
+                "EXECUTOR_DEFERRED_ENTRY_STRUCTURE_REFRESH_SECONDS",
+                300.0,
+            ),
+        )
+
+    async def _deferred_entry_closed_h1_structure(
+        self,
+        rest: BybitRestClient,
+        record: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Return structure derived exclusively from the last closed H1 candle."""
+
+        timeframe = str(record.get("timeframe") or "").strip().lower()
+        if timeframe not in {"60", "1h", "h1"}:
+            return None
+
+        symbol = str(record.get("symbol") or "").upper()
+        market = str(record.get("market") or "linear").lower()
+
+        if not symbol:
+            return None
+
+        cache = getattr(
+            self,
+            "_deferred_entry_structure_cache",
+            None,
+        )
+        if not isinstance(cache, dict):
+            cache = {}
+            self._deferred_entry_structure_cache = cache
+
+        cache_key = (symbol, market)
+        now_monotonic = time.monotonic()
+        cache_entry = cache.get(cache_key)
+
+        if (
+            isinstance(cache_entry, tuple)
+            and len(cache_entry) == 2
+            and isinstance(cache_entry[0], (int, float))
+            and isinstance(cache_entry[1], dict)
+            and now_monotonic - float(cache_entry[0])
+            < self._deferred_entry_structure_refresh_seconds()
+        ):
+            return dict(cache_entry[1])
+
+        try:
+            raw_frame = await rest.fetch_klines(
+                symbol,
+                interval="60",
+                limit=30,
+                category=market,
+            )
+        except Exception:
+            self.logger.debug(
+                "Deferred closed-H1 structure fetch failed for %s",
+                symbol,
+                exc_info=True,
+            )
+            return None
+
+        closed = self._closed_candle_frame(raw_frame)
+        if closed is None or len(closed) < 20:
+            return None
+
+        try:
+            frame = add_indicators(closed)
+            last = frame.iloc[-1]
+
+            close = self._optional_float(last.get("close"))
+            support = self._optional_float(
+                frame["low"].tail(20).min()
+            )
+            ema20 = self._optional_float(last.get("ema_20"))
+        except Exception:
+            self.logger.debug(
+                "Deferred closed-H1 structure build failed for %s",
+                symbol,
+                exc_info=True,
+            )
+            return None
+
+        if (
+            close is None
+            or close <= 0
+            or support is None
+            or support <= 0
+            or ema20 is None
+            or ema20 <= 0
+        ):
+            return None
+
+        structure: dict[str, object] = {
+            "price": close,
+            "candle_close": close,
+            "support": support,
+            "ema20": ema20,
+            "closed_h1_start": str(
+                last.get("start", "") or ""
+            ),
+        }
+
+        cache[cache_key] = (
+            now_monotonic,
+            dict(structure),
+        )
+        return structure
+
+    async def refresh_deferred_entry_candidates(
+        self,
+        *,
+        rest: BybitRestClient,
+        stream: MarketStream,
+    ) -> int:
+        """Refresh deferred candidate lifecycle without opening positions.
+
+        This path only persists PENDING / PULLBACK_SEEN / READY / terminal
+        transitions. It never evaluates an entry decision and never calls
+        _open_executor_position.
+        """
+
+        runtime = getattr(
+            self,
+            "deferred_entry_runtime",
+            None,
+        )
+        service = getattr(
+            self,
+            "deferred_entry_refresh_service",
+            None,
+        )
+
+        if (
+            runtime is None
+            or service is None
+            or not runtime.config.enabled
+            or self.trade_executor_mode != "paper"
+        ):
+            return 0
+
+        records = runtime.coordinator.store.list_active(
+            limit=service.max_active,
+        )
+
+        snapshots_by_signal_key = {}
+        max_orderflow_age_seconds = max(
+            5.0,
+            self._env_float(
+                "EXECUTOR_DEFERRED_ENTRY_MAX_ORDERFLOW_AGE_SECONDS",
+                90.0,
+            ),
+        )
+
+        for record in records:
+            signal_key = str(record.get("signal_key") or "")
+            symbol = str(record.get("symbol") or "").upper()
+
+            if not signal_key or not symbol:
+                continue
+
+            try:
+                structure = (
+                    await self._deferred_entry_closed_h1_structure(
+                        rest,
+                        record,
+                    )
+                )
+                if structure is None:
+                    continue
+
+                state = (
+                    stream.get_state(symbol)
+                    if stream is not None
+                    and hasattr(stream, "get_state")
+                    else None
+                )
+
+                latest_book = (
+                    state.snapshots[-1]
+                    if state is not None
+                    and getattr(state, "snapshots", None)
+                    else None
+                )
+
+                live_price = self._optional_float(
+                    getattr(latest_book, "mid", None)
+                )
+                latest_ts = self._optional_float(
+                    getattr(latest_book, "ts", None)
+                )
+
+                if (
+                    latest_book is None
+                    or live_price is None
+                    or live_price <= 0
+                    or latest_ts is None
+                    or latest_ts <= 0
+                    or time.time() - latest_ts
+                    > max_orderflow_age_seconds
+                ):
+                    # No fresh orderflow means reclaim confirmation is forbidden,
+                    # but closed H1 data may still advance pullback tracking,
+                    # expire an old candidate, or detect stop invalidation.
+                    built = build_deferred_entry_snapshot(
+                        record,
+                        orderflow_snapshot=None,
+                        closed_h1_structure=structure,
+                    )
+                    if built.snapshot is not None:
+                        snapshots_by_signal_key[signal_key] = (
+                            built.snapshot
+                        )
+                    continue
+
+                refresh_signal = SimpleNamespace(
+                    symbol=symbol,
+                    side=str(record.get("side") or "Buy"),
+                    entry=self._optional_float(
+                        record.get("origin_entry")
+                    )
+                    or 0.0,
+                    stop_loss=self._optional_float(
+                        record.get("origin_stop_loss")
+                    )
+                    or 0.0,
+                    reasons=["deferred_entry_refresh"],
+                    meta={
+                        "tf": "60",
+                        "market": str(
+                            record.get("market") or "linear"
+                        ).lower(),
+                    },
+                )
+
+                live_snapshot, weak = self._paper_executor_snapshot(
+                    refresh_signal,
+                    state,
+                )
+
+                if weak:
+                    # The live price remains useful for stop invalidation and
+                    # pullback tracking, but zero flow/volume and max ask wall
+                    # make READY impossible until real flow returns.
+                    live_snapshot = OrderflowSnapshot(
+                        price=live_price,
+                        spread_bps=self._float_or_default(
+                            getattr(
+                                latest_book,
+                                "spread_bps",
+                                0.0,
+                            ),
+                            0.0,
+                        ),
+                        buy_flow=0.0,
+                        sell_flow=0.0,
+                        bid_wall_strength=0.0,
+                        ask_wall_strength=1.0,
+                        volume_impulse=0.0,
+                        support=None,
+                        resistance=None,
+                        ema20=None,
+                        vwap=None,
+                        candle_close=None,
+                    )
+                else:
+                    volume_diagnostics = (
+                        self._derive_volume_impulse(
+                            refresh_signal,
+                            state,
+                            live_snapshot.buy_flow,
+                            live_snapshot.sell_flow,
+                        )
+                    )
+                    if bool(
+                        volume_diagnostics.get(
+                            "volume_impulse_missing"
+                        )
+                    ):
+                        live_snapshot = dataclasses.replace(
+                            live_snapshot,
+                            volume_impulse=0.0,
+                        )
+
+                built = build_deferred_entry_snapshot(
+                    record,
+                    orderflow_snapshot=live_snapshot,
+                    closed_h1_structure=structure,
+                )
+
+                if built.snapshot is not None:
+                    snapshots_by_signal_key[signal_key] = (
+                        built.snapshot
+                    )
+            except Exception:
+                self.logger.exception(
+                    "Deferred entry refresh failed for %s",
+                    signal_key,
+                )
+
+        batch = service.refresh_active(
+            snapshots_by_signal_key,
+        )
+
+        if batch.refreshed:
+            self.logger.info(
+                "Deferred lifecycle refresh: refreshed=%s "
+                "ready=%s terminal=%s skipped=%s",
+                batch.refreshed,
+                len(batch.ready_signal_keys),
+                len(batch.terminal_signal_keys),
+                len(batch.skipped_missing_snapshot_keys),
+            )
+
+        return batch.refreshed
+
 
     async def refresh_open_executor_positions(self, *, rest: BybitRestClient | None = None, stream: MarketStream | None = None) -> int:
         if not self.trade_executor_enabled or self.trade_executor is None:
