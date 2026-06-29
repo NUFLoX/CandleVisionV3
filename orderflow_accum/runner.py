@@ -26,6 +26,20 @@ from .market_regime import MarketRegimeAnalyzer
 from .chart_render import render_signal_chart
 from .signal_logger import RejectionCsvLogger, SignalCsvLogger
 from .signal_store import SignalStore
+from .deferred_entry import (
+    DeferredEntryStore,
+    TRANSIENT_ENTRY_BLOCK_REASONS,
+)
+from .deferred_entry_service import (
+    DeferredEntryCoordinator,
+)
+from .deferred_entry_runtime import (
+    DeferredEntryRuntime,
+    DeferredEntryRuntimeConfig,
+)
+from .deferred_entry_runner_adapter import (
+    register_deferred_watch,
+)
 from .confirmed_promoter import ConfirmedPromoter
 from .indicators import add_indicators
 from .hybrid_entry_shadow import HybridEntryShadowEngine
@@ -105,6 +119,67 @@ class AccumulationRunner:
         self.csv_logger = SignalCsvLogger("accumulation_signals.csv")
         self.rejection_logger = RejectionCsvLogger("rejection_reasons.csv")
         self.signal_store = SignalStore()
+
+        # Deferred entry must have zero DB/schema side effects while disabled.
+        # The feature stays paper-only and off by default.
+        deferred_entry_enabled = self._env_bool(
+            "EXECUTOR_DEFERRED_ENTRY_ENABLED",
+            False,
+        )
+        self.deferred_entry_store = None
+        self.deferred_entry_runtime = None
+
+        if deferred_entry_enabled:
+            self.deferred_entry_store = DeferredEntryStore(
+                str(self.signal_store.db_path)
+            )
+            self.deferred_entry_runtime = DeferredEntryRuntime(
+                DeferredEntryCoordinator(
+                    self.deferred_entry_store
+                ),
+                config=DeferredEntryRuntimeConfig(
+                    enabled=True,
+                    ttl_hours=self._env_float(
+                        "EXECUTOR_DEFERRED_ENTRY_TTL_HOURS",
+                        24.0,
+                    ),
+                    h1_only=self._env_bool(
+                        "EXECUTOR_DEFERRED_ENTRY_H1_ONLY",
+                        True,
+                    ),
+                    early_statuses=self._env_upper_csv(
+                        "EXECUTOR_DEFERRED_ENTRY_ALLOWED_STATUSES",
+                        (
+                            "PRE_IMPULSE",
+                            "BREAKOUT_PRESSURE",
+                            "PENDING",
+                        ),
+                    ),
+                    early_kinds=self._env_upper_csv(
+                        "EXECUTOR_DEFERRED_ENTRY_ALLOWED_KINDS",
+                        (
+                            "PRE_IMPULSE_ZONE",
+                            "BREAKOUT_PRESSURE",
+                            "ACCUMULATION_LONG_READY",
+                        ),
+                    ),
+                    min_early_score=max(
+                        self._env_float(
+                            "EXECUTOR_DEFERRED_ENTRY_MIN_SCORE",
+                            10.0,
+                        ),
+                        0.0,
+                    ),
+                    blocked_btc_regimes=self._env_upper_csv(
+                        "EXECUTOR_DEFERRED_ENTRY_BLOCKED_BTC_REGIMES",
+                        (
+                            "BTC_BEARISH",
+                            "BTC_DUMP_RISK",
+                        ),
+                    ),
+                ),
+            )
+
         self.trade_executor_mode = self._resolve_trade_executor_mode(settings)
         self.trade_executor_enabled = (
             (os.getenv("RUN_TRADE_EXECUTOR", "false").strip().lower() == "true" and self.trade_executor_mode == "paper")
@@ -190,6 +265,20 @@ class AccumulationRunner:
             return int(float(value))
         except ValueError:
             return default
+
+    @staticmethod
+    def _env_upper_csv(
+        name: str,
+        default: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        raw = os.getenv(name)
+        source = raw if raw is not None else ",".join(default)
+        values = tuple(
+            item.strip().upper()
+            for item in source.split(",")
+            if item.strip()
+        )
+        return values or default
 
     def _resolve_executor_management_policy(self) -> str:
         configured_policy = getattr(self.settings, "executor_management_policy", None)
@@ -4152,6 +4241,59 @@ class AccumulationRunner:
         observation_context = dict(observation_context or {})
         observation_context.update(h4_entry_context or {})
         observation_context.update(self._missed_signal_memory_diagnostics(setup))
+
+        deferred_probe_only = False
+        deferred_runtime = getattr(
+            self,
+            "deferred_entry_runtime",
+            None,
+        )
+
+        if (
+            not should_process
+            and deferred_runtime is not None
+        ):
+            try:
+                deferred_probe = (
+                    deferred_runtime.probe_early_signal(
+                        mode=self.trade_executor_mode,
+                        timeframe=str(setup.timeframe),
+                        side=str(setup.side),
+                        signal_kind=str(setup.signal_kind),
+                        confirmed_status=confirmed_status,
+                        score=float(setup.score),
+                        btc_regime=str(setup.btc_regime),
+                    )
+                )
+                observation_context.update(
+                    {
+                        "deferred_entry_probe_only": bool(
+                            deferred_probe.allowed
+                        ),
+                        "deferred_entry_probe_reason": (
+                            deferred_probe.reason
+                        ),
+                    }
+                )
+
+                if deferred_probe.allowed:
+                    should_process = True
+                    deferred_probe_only = True
+            except Exception:
+                self.logger.exception(
+                    "Deferred-entry probe policy failed "
+                    "for %s",
+                    signal_key,
+                )
+                observation_context.update(
+                    {
+                        "deferred_entry_probe_only": False,
+                        "deferred_entry_probe_reason": (
+                            "deferred_entry_probe_error"
+                        ),
+                    }
+                )
+
         forced_early_entry = False
         forced_early_decision = None
         if not should_process and not weak:
@@ -4206,8 +4348,29 @@ class AccumulationRunner:
             self._store_paper_executor_decision(signal_key, signal, decision, decision.position, snapshot, setup=setup, observation_context=observation_context)
             return
 
-        entry_decision = forced_early_decision or self.trade_executor.evaluate_entry(setup, snapshot)
-        entry_decision = self._executor_buy_momentum_override_decision(setup, snapshot, entry_decision)
+        entry_decision = (
+            self.trade_executor.evaluate_entry(
+                setup,
+                snapshot,
+            )
+            if deferred_probe_only
+            else (
+                forced_early_decision
+                or self.trade_executor.evaluate_entry(
+                    setup,
+                    snapshot,
+                )
+            )
+        )
+
+        if not deferred_probe_only:
+            entry_decision = (
+                self._executor_buy_momentum_override_decision(
+                    setup,
+                    snapshot,
+                    entry_decision,
+                )
+            )
         if not self._executor_side_allowed(str(setup.side)):
             entry_decision = TradeDecision(
                 "WATCH",
@@ -4216,18 +4379,49 @@ class AccumulationRunner:
                 None,
             )
 
-        if entry_decision.action not in {ENTER_LONG, ENTER_SHORT}:
+        if (
+            not deferred_probe_only
+            and entry_decision.action
+            not in {ENTER_LONG, ENTER_SHORT}
+        ):
             reentry_decision, reentry_context = self._evaluate_stop_reclaim_reentry(signal_key, signal, setup, snapshot)
             observation_context.update(reentry_context)
             if reentry_decision is not None:
                 entry_decision = reentry_decision
                 forced_early_entry = True
-        if entry_decision.action not in {ENTER_LONG, ENTER_SHORT}:
+        if (
+            not deferred_probe_only
+            and entry_decision.action
+            not in {ENTER_LONG, ENTER_SHORT}
+        ):
             early_decision, early_context = self._evaluate_early_breakout_entry(signal_key, signal, setup, snapshot)
             observation_context.update(early_context)
             if early_decision is not None:
                 entry_decision = early_decision
                 forced_early_entry = True
+        if (
+            deferred_probe_only
+            and entry_decision.action
+            in {ENTER_LONG, ENTER_SHORT}
+        ):
+            observation_context.update(
+                {
+                    "deferred_entry_registered": False,
+                    "deferred_entry_registration_reason": (
+                        "deferred_entry_probe_entry_already_allowed"
+                    ),
+                    "deferred_entry_probe_result": (
+                        "entry_allowed_no_immediate_entry"
+                    ),
+                }
+            )
+            entry_decision = TradeDecision(
+                WATCH,
+                "deferred_entry_probe_entry_already_allowed",
+                "TRADE_WATCH",
+                None,
+            )
+
         # Final side gate: reentry/early overrides must not bypass EXECUTOR_ALLOWED_SIDES.
         if entry_decision.action in {ENTER_LONG, ENTER_SHORT} and not self._executor_side_allowed(str(setup.side)):
             entry_decision = TradeDecision(
@@ -4413,8 +4607,108 @@ class AccumulationRunner:
             )
             return
 
-        watch_decision = TradeDecision(WATCH, entry_decision.reason, "TRADE_WATCH", None)
-        self._store_paper_executor_decision(signal_key, signal, watch_decision, None, snapshot, setup=setup, observation_context=observation_context)
+        deferred_runtime = getattr(
+            self,
+            "deferred_entry_runtime",
+            None,
+        )
+
+        if (
+            deferred_runtime is not None
+            and deferred_runtime.config.enabled
+            and str(entry_decision.reason)
+            != "deferred_entry_probe_entry_already_allowed"
+        ):
+            long_blockers = (
+                self.trade_executor._long_entry_blockers(
+                    setup,
+                    snapshot,
+                )
+                if str(setup.side) == "Buy"
+                else ["entry_blocked_not_buy_side"]
+            )
+
+            structural_blockers = [
+                blocker
+                for blocker in long_blockers
+                if blocker not in TRANSIENT_ENTRY_BLOCK_REASONS
+            ]
+
+            target_guard, _ = self._executor_target_quality_gate(
+                signal,
+                setup,
+                snapshot,
+                confirmed_status,
+            )
+            rr_guard, _ = self._entry_risk_reward_guard(
+                signal,
+                setup,
+                snapshot,
+            )
+            stop_guard, _ = self._entry_stop_loss_guard(
+                setup,
+                snapshot,
+            )
+
+            if target_guard is not None:
+                structural_blockers.append(
+                    str(target_guard.reason)
+                )
+
+            if rr_guard is not None:
+                structural_blockers.append(
+                    str(rr_guard.reason)
+                )
+
+            if stop_guard is not None:
+                structural_blockers.append(
+                    str(stop_guard.reason)
+                )
+
+            if self._executor_symbol_blocked(
+                str(signal.symbol)
+            ):
+                structural_blockers.append(
+                    "entry_blocked_symbol_blocklist"
+                )
+
+            observation_context.update(
+                register_deferred_watch(
+                    runtime=deferred_runtime,
+                    mode=self.trade_executor_mode,
+                    signal_key=signal_key,
+                    signal=signal,
+                    setup=setup,
+                    snapshot=snapshot,
+                    market=market,
+                    block_reason=str(entry_decision.reason),
+                    confirmed_status=confirmed_status,
+                    h4_allowed=bool(
+                        observation_context.get(
+                            "h4_entry_gate_allowed",
+                            False,
+                        )
+                    ),
+                    structural_allowed=not structural_blockers,
+                    structural_blockers=structural_blockers,
+                )
+            )
+
+        watch_decision = TradeDecision(
+            WATCH,
+            entry_decision.reason,
+            "TRADE_WATCH",
+            None,
+        )
+        self._store_paper_executor_decision(
+            signal_key,
+            signal,
+            watch_decision,
+            None,
+            snapshot,
+            setup=setup,
+            observation_context=observation_context,
+        )
 
     async def _emit_signal(self, rest: BybitRestClient, signal, state=None) -> None:
         market = str(

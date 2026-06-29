@@ -173,3 +173,67 @@ def test_non_h1_and_sell_candidates_are_rejected(tmp_path):
         assert store.get(KEY) is None
     finally:
         store.close()
+
+
+def test_early_probe_requires_paper_h1_buy_and_safe_btc(
+    tmp_path,
+):
+    runtime, store = _runtime(tmp_path)
+
+    try:
+        allowed = runtime.probe_early_signal(
+            mode="paper",
+            timeframe="60",
+            side="Buy",
+            signal_kind="PRE_IMPULSE_ZONE",
+            confirmed_status="PRE_IMPULSE",
+            score=12.0,
+            btc_regime="BTC_NEUTRAL",
+        )
+
+        assert allowed.allowed is True
+        assert allowed.reason == (
+            "deferred_entry_probe_allowed"
+        )
+
+        low_tf = runtime.probe_early_signal(
+            mode="paper",
+            timeframe="15",
+            side="Buy",
+            signal_kind="PRE_IMPULSE_ZONE",
+            confirmed_status="PRE_IMPULSE",
+            score=12.0,
+            btc_regime="BTC_NEUTRAL",
+        )
+
+        bearish = runtime.probe_early_signal(
+            mode="paper",
+            timeframe="60",
+            side="Buy",
+            signal_kind="PRE_IMPULSE_ZONE",
+            confirmed_status="PRE_IMPULSE",
+            score=12.0,
+            btc_regime="BTC_BEARISH",
+        )
+
+        testnet = runtime.probe_early_signal(
+            mode="testnet",
+            timeframe="60",
+            side="Buy",
+            signal_kind="PRE_IMPULSE_ZONE",
+            confirmed_status="PRE_IMPULSE",
+            score=12.0,
+            btc_regime="BTC_NEUTRAL",
+        )
+
+        assert low_tf.reason == (
+            "deferred_entry_timeframe_not_h1"
+        )
+        assert bearish.reason == (
+            "deferred_entry_btc_regime_blocked"
+        )
+        assert testnet.reason == (
+            "deferred_entry_mode_not_paper"
+        )
+    finally:
+        store.close()
