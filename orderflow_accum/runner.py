@@ -5665,36 +5665,72 @@ class AccumulationRunner:
                 if blocker not in TRANSIENT_ENTRY_BLOCK_REASONS
             ]
 
-            target_guard, _ = self._executor_target_quality_gate(
+            target_guard, target_quality_context = (
+                self._executor_target_quality_gate(
+                    signal,
+                    setup,
+                    snapshot,
+                    confirmed_status,
+                )
+            )
+            rr_guard, rr_context = self._entry_risk_reward_guard(
                 signal,
                 setup,
                 snapshot,
-                confirmed_status,
             )
-            rr_guard, _ = self._entry_risk_reward_guard(
-                signal,
-                setup,
-                snapshot,
-            )
-            stop_guard, _ = self._entry_stop_loss_guard(
+            stop_guard, stop_context = self._entry_stop_loss_guard(
                 setup,
                 snapshot,
             )
 
-            if target_guard is not None:
-                structural_blockers.append(
-                    str(target_guard.reason)
-                )
+            deferred_observe_soft_reasons = {
+                "entry_blocked_target_quality_micro_tp1",
+                "entry_blocked_bad_rr",
+            }
+            deferred_observe_soft_blockers = []
 
-            if rr_guard is not None:
-                structural_blockers.append(
-                    str(rr_guard.reason)
-                )
+            for guard_name, guard, guard_context in (
+                (
+                    "target_quality",
+                    target_guard,
+                    target_quality_context,
+                ),
+                (
+                    "risk_reward",
+                    rr_guard,
+                    rr_context,
+                ),
+                (
+                    "stop_loss",
+                    stop_guard,
+                    stop_context,
+                ),
+            ):
+                if guard is None:
+                    continue
 
-            if stop_guard is not None:
-                structural_blockers.append(
-                    str(stop_guard.reason)
-                )
+                guard_reason = str(guard.reason or "")
+                guard_details = {
+                    "guard": guard_name,
+                    "reason": guard_reason,
+                    "diagnostics": dict(guard_context or {}),
+                }
+
+                if guard_reason in deferred_observe_soft_reasons:
+                    deferred_observe_soft_blockers.append(
+                        guard_details
+                    )
+                    continue
+
+                structural_blockers.append(guard_reason)
+
+            observation_context.update(
+                {
+                    "deferred_entry_initial_soft_blockers": list(
+                        deferred_observe_soft_blockers
+                    ),
+                }
+            )
 
             if self._executor_symbol_blocked(
                 str(signal.symbol)
@@ -5722,6 +5758,14 @@ class AccumulationRunner:
                     ),
                     structural_allowed=not structural_blockers,
                     structural_blockers=structural_blockers,
+                    admission_diagnostics={
+                        "soft_blockers": list(
+                            deferred_observe_soft_blockers
+                        ),
+                        "structural_blockers": list(
+                            structural_blockers
+                        ),
+                    },
                 )
             )
 

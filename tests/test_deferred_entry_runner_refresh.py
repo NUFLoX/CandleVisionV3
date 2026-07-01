@@ -28,7 +28,6 @@ from orderflow_accum.runner import AccumulationRunner
 from orderflow_accum.trade_executor import OrderflowSnapshot
 
 
-NOW = datetime(2026, 6, 29, 0, 0, tzinfo=timezone.utc)
 KEY = "TESTUSDT|linear|60|PRE_IMPULSE_ZONE|Buy"
 
 
@@ -72,6 +71,8 @@ class FakeRest:
 
 
 def _candidate() -> DeferredEntryCandidate:
+    now = datetime.now(timezone.utc)
+
     return DeferredEntryCandidate(
         signal_key=KEY,
         symbol="TESTUSDT",
@@ -83,8 +84,8 @@ def _candidate() -> DeferredEntryCandidate:
         origin_stop_loss=90.0,
         score=12.0,
         initial_block_reason="entry_blocked_buy_flow",
-        created_at=NOW,
-        expires_at=NOW + timedelta(hours=24),
+        created_at=now,
+        expires_at=now + timedelta(hours=24),
         origin_support=94.0,
         origin_ema20=96.0,
         origin_vwap=96.5,

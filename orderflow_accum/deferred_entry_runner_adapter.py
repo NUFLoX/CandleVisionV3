@@ -20,6 +20,7 @@ def _signal_metadata(
     signal,
     snapshot: OrderflowSnapshot,
     confirmed_status: str | None,
+    admission_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_meta = getattr(signal, "meta", {})
 
@@ -35,7 +36,7 @@ def _signal_metadata(
     else:
         reasons = []
 
-    return {
+    payload = {
         "source": str(
             getattr(signal, "source", "orderflow")
             or "orderflow"
@@ -75,6 +76,13 @@ def _signal_metadata(
         },
     }
 
+    if admission_diagnostics:
+        payload["deferred_entry_initial_admission"] = dict(
+            admission_diagnostics
+        )
+
+    return payload
+
 
 def register_deferred_watch(
     *,
@@ -90,6 +98,7 @@ def register_deferred_watch(
     h4_allowed: bool,
     structural_allowed: bool,
     structural_blockers: list[str],
+    admission_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Safely register one executor WATCH as a deferred paper candidate.
 
@@ -137,6 +146,7 @@ def register_deferred_watch(
                 signal,
                 snapshot,
                 confirmed_status,
+                admission_diagnostics,
             ),
         )
     except Exception as exc:
