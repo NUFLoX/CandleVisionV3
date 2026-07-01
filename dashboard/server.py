@@ -34,6 +34,10 @@ from .schemas import (
 )
 from .signal_outcomes import SignalOutcomeStore, refresh_signal_outcomes
 from .store import DashboardStore
+from .research_ledger import (
+    list_research_runs,
+    read_research_ledger,
+)
 from orderflow_accum.executor_exit_shadow import (
     POLICY_STEP_LOCK_0_5R_BUFFER_AFTER_1R,
     step_lock_0_5r_buffer_floor,
@@ -2675,6 +2679,28 @@ def create_app() -> FastAPI:
     @app.get("/api/executor-ledger")
     async def executor_ledger(limit: Annotated[int, Query(ge=1, le=2000)] = 50):
         return _read_executor_ledger(limit=limit)
+
+
+    @app.get("/api/research-runs")
+    async def research_runs(
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ):
+        return list_research_runs(
+            SIGNALS_DB_PATH,
+            limit=limit,
+        )
+
+
+    @app.get("/api/research-ledger")
+    async def research_ledger(
+        run_id: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=2000)] = 50,
+    ):
+        return read_research_ledger(
+            SIGNALS_DB_PATH,
+            run_id=run_id,
+            limit=limit,
+        )
 
 
     @app.get("/api/learning-effectiveness")

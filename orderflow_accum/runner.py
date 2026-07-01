@@ -26,6 +26,11 @@ from .market_regime import MarketRegimeAnalyzer
 from .chart_render import render_signal_chart
 from .signal_logger import RejectionCsvLogger, SignalCsvLogger
 from .signal_store import SignalStore
+from .research_runs import ResearchRunLedger, research_runs_enabled
+from .research_runner_bridge import (
+    copy_executor_observation,
+    copy_executor_trade,
+)
 from .deferred_entry import (
     DEFERRED_ENTRY_READY,
     DeferredEntryStore,
@@ -133,6 +138,19 @@ class AccumulationRunner:
         self.csv_logger = SignalCsvLogger("accumulation_signals.csv")
         self.rejection_logger = RejectionCsvLogger("rejection_reasons.csv")
         self.signal_store = SignalStore()
+
+        # Off by default. When enabled, this ledger writes only to
+        # isolated research_* tables and never alters legacy executor tables.
+        self.research_ledger = ResearchRunLedger(
+            self.signal_store.conn,
+            enabled=research_runs_enabled(),
+        )
+
+        if self.research_ledger.run_id:
+            self.logger.info(
+                "Research ledger active run_id=%s",
+                self.research_ledger.run_id,
+            )
 
         # Deferred entry must have zero DB/schema side effects while disabled.
         # The feature stays paper-only and off by default.
@@ -3541,6 +3559,14 @@ class AccumulationRunner:
                 )
             self._best_effort_store_executor_trade(signal_key, signal, decision, position, row, previous_row, diagnostics_json)
 
+        copy_executor_observation(
+            self.research_ledger,
+            signal_key=signal_key,
+            signal=signal,
+            row=row,
+            diagnostics_json=diagnostics_json,
+        )
+
         trade_learning = getattr(self, "trade_learning", None)
 
         if trade_learning is not None:
@@ -3991,6 +4017,18 @@ class AccumulationRunner:
                     "updated_at": exit_time,
                 }
             )
+            stored_research_trade = (
+                self.signal_store.get_executor_trade(trade_key)
+            )
+
+            if stored_research_trade is not None:
+                copy_executor_trade(
+                    self.research_ledger,
+                    trade=stored_research_trade,
+                    signal=signal,
+                    diagnostics_json=diagnostics_payload,
+                )
+
             if str(exit_reason) == "exit_stop_loss_hit":
                 self.signal_store.upsert_stop_loss_diagnosis(
                     {
