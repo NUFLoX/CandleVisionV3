@@ -15,6 +15,7 @@ from orderflow_accum.trade_executor import (
     WATCH,
     OrderflowSnapshot,
     SmartTradeExecutor,
+    TradeDecision,
     TradeSetup,
 )
 
@@ -390,5 +391,70 @@ def test_runner_without_deferred_runtime_keeps_standard_watch(
         assert captured[0]["decision"].reason == (
             "entry_blocked_buy_flow"
         )
+    finally:
+        store.close()
+
+
+def test_runner_registers_observe_candidate_with_deferrable_target_and_rr(
+    tmp_path,
+):
+    runner, store, captured = _runner(tmp_path)
+
+    try:
+        runner._paper_executor_snapshot = (
+            lambda signal, state=None: (
+                _snapshot(),
+                False,
+            )
+        )
+        runner._executor_target_quality_gate = (
+            lambda *args, **kwargs: (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_target_quality_micro_tp1",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                {"target_quality_gate": "micro_tp1"},
+            )
+        )
+        runner._entry_risk_reward_guard = (
+            lambda *args, **kwargs: (
+                TradeDecision(
+                    WATCH,
+                    "entry_blocked_bad_rr",
+                    "TRADE_WATCH",
+                    None,
+                ),
+                {"risk_reward_gate": "bad_rr"},
+            )
+        )
+
+        runner._process_paper_executor(
+            _signal(),
+            "linear",
+            "PRE_IMPULSE",
+            h4_entry_context={
+                "h4_entry_gate_allowed": True,
+            },
+        )
+
+        row = store.get(KEY)
+
+        assert row is not None
+        admission = row["metadata_json"][
+            "deferred_entry_initial_admission"
+        ]
+        assert {
+            item["reason"]
+            for item in admission["soft_blockers"]
+        } == {
+            "entry_blocked_target_quality_micro_tp1",
+            "entry_blocked_bad_rr",
+        }
+        assert admission["structural_blockers"] == []
+        assert captured[0]["context"][
+            "deferred_entry_registered"
+        ] is True
     finally:
         store.close()
